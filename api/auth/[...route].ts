@@ -1,0 +1,102 @@
+import { MongoClient } from "mongodb";
+import { MongoAuthService } from "../../packages/api/src/auth.js";
+
+type VercelRequest = {
+  method?: string;
+  query: { route?: string | string[]; code?: string; state?: string };
+  headers: { cookie?: string };
+  body?: unknown;
+};
+type VercelResponse = {
+  status(code: number): VercelResponse;
+  json(value: unknown): void;
+  redirect(code: number, url: string): void;
+  setHeader(name: string, value: string): void;
+};
+
+declare global {
+  // Reuse the client across warm Vercel invocations rather than opening a new
+  // Atlas connection for every sign-in request.
+  // eslint-disable-next-line no-var
+  var smcMongoClientPromise: Promise<MongoClient> | undefined;
+  // eslint-disable-next-line no-var
+  var smcAuthPromise: Promise<MongoAuthService> | undefined;
+}
+
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is not configured.`);
+  return value;
+}
+
+async function auth(): Promise<MongoAuthService> {
+  if (!globalThis.smcAuthPromise) {
+    globalThis.smcAuthPromise = (async () => {
+      const client = await (globalThis.smcMongoClientPromise ??= new MongoClient(required("MONGODB_URI"), { serverSelectionTimeoutMS: 10_000 }).connect());
+      const googleClientId = required("GOOGLE_CLIENT_ID");
+      const service = new MongoAuthService(client.db(process.env.MONGODB_DB ?? "smctrader"), {
+        clientId: googleClientId,
+        clientSecret: required("GOOGLE_CLIENT_SECRET"),
+        redirectUri: required("GOOGLE_REDIRECT_URI"),
+      });
+      await service.initialize();
+      return service;
+    })();
+  }
+  return globalThis.smcAuthPromise;
+}
+
+function token(req: VercelRequest): string | undefined {
+  const cookie = req.headers.cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith("smc_session="));
+  return cookie ? decodeURIComponent(cookie.slice("smc_session=".length)) : undefined;
+}
+
+function cookie(value: string, remove = false): string {
+  const secure = process.env.AUTH_COOKIE_SECURE === "false" ? "" : "; Secure";
+  const maxAge = remove ? 0 : 60 * 60 * 24 * 14;
+  return `smc_session=${remove ? "" : encodeURIComponent(value)}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=Lax${secure}`;
+}
+
+function payload(req: VercelRequest): Record<string, unknown> {
+  if (typeof req.body === "string") {
+    try { return JSON.parse(req.body) as Record<string, unknown>; } catch { return {}; }
+  }
+  return req.body && typeof req.body === "object" ? req.body as Record<string, unknown> : {};
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
+  const route = req.query.route;
+  const parts = Array.isArray(route) ? route : route ? [route] : [];
+  const action = parts[0];
+  const method = (req.method ?? "GET").toUpperCase();
+  try {
+    const service = await auth();
+    if (action === "me" && method === "GET") return res.status(200).json({ user: await service.userForToken(token(req)) ?? null });
+    if ((action === "register" || action === "login") && method === "POST") {
+      const body = payload(req);
+      const email = typeof body.email === "string" ? body.email : "";
+      const password = typeof body.password === "string" ? body.password : "";
+      const name = typeof body.name === "string" ? body.name : undefined;
+      const session = action === "register" ? await service.register(email, password, name) : await service.login(email, password);
+      res.setHeader("Set-Cookie", cookie(session.token));
+      return res.status(200).json({ user: session.user });
+    }
+    if (action === "logout" && method === "POST") {
+      await service.logout(token(req));
+      res.setHeader("Set-Cookie", cookie("", true));
+      return res.status(200).json({ signedOut: true });
+    }
+    if (action === "google" && parts[1] !== "callback" && method === "GET") return res.redirect(302, await service.createGoogleAuthorizationUrl());
+    if (action === "google" && parts[1] === "callback" && method === "GET") {
+      const code = typeof req.query.code === "string" ? req.query.code : "";
+      const state = typeof req.query.state === "string" ? req.query.state : "";
+      const session = await service.loginWithGoogle(code, state);
+      res.setHeader("Set-Cookie", cookie(session.token));
+      return res.redirect(302, required("AUTH_REDIRECT_URL"));
+    }
+    return res.status(404).json({ error: "Authentication route not found." });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Authentication failed.";
+    return res.status(message.includes("not configured") ? 503 : 401).json({ error: message });
+  }
+}

@@ -60,12 +60,13 @@ function App() {
   const refreshConnections = useCallback(async () => { try { const result = await api.connections(); setConnections(result.connections); setExchangeSetupError(result.setupError ?? null); } catch (err) { setExchangeSetupError(err instanceof Error ? err.message : String(err)); } }, []);
   const applyState = useCallback((state: StreamState) => { setStatus(state.status); setAnalysis(state.analysis); setRisk(state.risk); setPositions(state.positions); setJournal(state.journal.entries); setActivity(state.activity.events); setAssets(state.configuredAssets ?? []); }, []);
   useEffect(() => {
+    if (!authReady || !user) return;
     void refresh(); void refreshConnections();
     const disconnect = connectStream({ onState: applyState, onActivity: (event) => setActivity((previous) => [event, ...previous].slice(0, 200)), onSystem: (_level, detail) => setError(detail), onStatus: (connected) => { ws.current = connected; setWsConnected(connected); } });
     const timer = setInterval(() => { if (!ws.current) void refresh(); }, 5000);
     return () => { clearInterval(timer); disconnect(); };
-  }, [refresh, refreshConnections, applyState]);
-  useEffect(() => { void api.auth.me().then((result) => setUser(result.user)).catch(() => setUser(null)).finally(() => setAuthReady(true)); }, []);
+  }, [authReady, user, refresh, refreshConnections, applyState]);
+  useEffect(() => { void api.auth.me().then((result) => setUser(result.user)).catch((err) => { setError(err instanceof Error ? err.message : "Authentication service is unavailable."); setUser(null); }).finally(() => setAuthReady(true)); }, []);
 
   const run = async (key: string, action: () => Promise<unknown>) => { setBusy(key); setError(null); setNotice(null); try { await action(); await refresh(); setNotice("Changes saved successfully."); } catch (err) { setError(err instanceof Error ? err.message : String(err)); } finally { setBusy(null); } };
   const validSetups = analysis?.setups.filter((setup) => setup.status === "VALID") ?? [];

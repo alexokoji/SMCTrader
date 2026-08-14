@@ -1,6 +1,6 @@
 import { MongoClient } from "mongodb";
 import { createHmac } from "node:crypto";
-import { MongoAuthService } from "../../packages/api/src/auth.js";
+import type { MongoAuthService } from "../../packages/api/src/auth.js";
 
 type VercelRequest = {
   method?: string;
@@ -43,6 +43,9 @@ async function auth(): Promise<MongoAuthService> {
       const google = googleClientId && googleClientSecret && googleRedirectUri
         ? { clientId: googleClientId, clientSecret: googleClientSecret, redirectUri: googleRedirectUri }
         : undefined;
+      // Vercel currently emits CommonJS functions. Keep this ESM workspace
+      // module dynamic so Node does not try to require() it at runtime.
+      const { MongoAuthService } = await import("../../packages/api/src/auth.js");
       const service = new MongoAuthService(client.db(process.env.MONGODB_DB ?? "smctrader"), google);
       await service.initialize();
       return service;

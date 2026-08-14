@@ -49,6 +49,19 @@ function baseState(mode: RuntimeMode, assets: string[]) {
 }
 
 export class TradingSession extends DurableObject<Env> {
+  async ensureAnalysisAlarm(): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null) await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
+  }
+
+  async alarm(): Promise<void> {
+    try {
+      await this.runAnalysis();
+    } finally {
+      await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
+    }
+  }
+
   async runAnalysis(symbolOverride?: string): Promise<Record<string, unknown>> {
     const assets = symbolOverride ? [symbolOverride] : await this.getAssets();
     const symbol = assets[0] ?? "BTCUSDT";
@@ -213,6 +226,7 @@ export default {
     const userId = await authenticatedUser(request, env);
     if (!userId) return json(request, env, { error: "Authentication is required." }, 401);
     const session = env.TRADING_SESSION.getByName(`user:${userId}`);
+    await session.ensureAnalysisAlarm();
     const [mode, assets] = await Promise.all([session.getMode(), session.getAssets()]);
     const state = baseState(mode, assets);
 
@@ -257,8 +271,5 @@ export default {
     if (url.pathname === "/api/connections" && request.method === "GET") return json(request, env, { connections: [], available: false, setupError: "Exchange credentials are not enabled in the Cloudflare paper-trading deployment." });
 
     return json(request, env, { error: "Not found" }, 404);
-  },
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(env.TRADING_SESSION.getByName("default").runAnalysis());
   },
 } satisfies ExportedHandler<Env>;

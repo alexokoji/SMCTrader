@@ -5,7 +5,6 @@
   "compatibility_date": "2026-08-14",
   "workers_dev": true,
   "observability": { "enabled": true },
-  "triggers": { "crons": ["*/5 * * * *"] },
   "durable_objects": {
     "bindings": [
       { "name": "TRADING_SESSION", "class_name": "TradingSession" }

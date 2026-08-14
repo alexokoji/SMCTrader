@@ -1,6 +1,6 @@
 {
-  "buildCommand": "npm run build -w @smc/web -- --outDir ../../dist",
-  "outputDirectory": "dist",
+  "buildCommand": "npm run build -w @smc/web",
+  "outputDirectory": "apps/web/dist",
   "framework": null,
   "rewrites": [
     { "source": "/((?!api/).*)", "destination": "/index.html" }

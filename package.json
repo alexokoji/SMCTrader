@@ -1,0 +1,27 @@
+{
+  "name": "smctrader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Automated rules-based Smart Money Concept crypto trading platform",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @smc/core && npm run build -w @smc/api && npm run build -w @smc/web",
+    "test": "npm run test -w @smc/core",
+    "test:all": "npm run test --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "dev:api": "npm run dev -w @smc/api",
+    "dev:web": "npm run dev -w @smc/web"
+    ,"dev:worker": "npm run dev -w @smc/worker"
+    ,"deploy:worker": "npm run deploy -w @smc/worker"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "lightweight-charts": "5.2.1",
+    "vite": "^7.3.1"
+  }
+}

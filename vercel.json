@@ -2,7 +2,7 @@
   "buildCommand": "npm run build -w @smc/web",
   "outputDirectory": "apps/web/dist",
   "framework": null,
-  "rewrites": [
-    { "source": "/((?!api/).*)", "destination": "/index.html" }
-  ]
+  "functions": {
+    "api/auth/[...route].ts": { "runtime": "nodejs22.x" }
+  }
 }

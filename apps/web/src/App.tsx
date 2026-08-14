@@ -3,16 +3,17 @@ import {
   api, connectStream,
   type ActivityEvent, type AnalysisResult, type ApiStatus, type BacktestResult,
   type ExchangeConnection, type JournalEntry, type Position, type RiskConfig,
-  type RiskState, type StreamState, type TradingMode,
+  type RiskState, type StreamState, type TradingMode, type AuthUser,
 } from "./api";
 
-type Page = "dashboard" | "markets" | "positions" | "paper" | "backtest" | "journal" | "settings" | "exchange";
+type Page = "dashboard" | "markets" | "positions" | "paper" | "backtest" | "journal" | "settings" | "exchange" | "account";
 
 const nav: Array<[Page, string, string]> = [
   ["dashboard", "◫", "Overview"], ["markets", "⌁", "Market scanner"], ["positions", "◇", "Positions"],
   ["paper", "◉", "Paper trading"], ["backtest", "↗", "Backtesting"], ["journal", "▤", "Journal"],
   ["settings", "⚙", "Strategy & risk"], ["exchange", "⇄", "Exchanges"],
 ];
+nav.push(["account", "@", "Account"]);
 
 function money(n?: number) { return n == null ? "—" : `$${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}`; }
 function number(n?: number, digits = 2) { return n == null ? "—" : n.toLocaleString("en-US", { maximumFractionDigits: digits }); }
@@ -43,6 +44,8 @@ function App() {
   const [connectionForm, setConnectionForm] = useState({ exchange: "binance", label: "", apiKey: "", apiSecret: "" });
   const [backtestForm, setBacktestForm] = useState({ start: "", end: "", equity: "10000" });
   const [backtest, setBacktest] = useState<BacktestResult | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
 
   const refresh = useCallback(async () => {
     try {
@@ -61,6 +64,7 @@ function App() {
     const timer = setInterval(() => { if (!ws.current) void refresh(); }, 5000);
     return () => { clearInterval(timer); disconnect(); };
   }, [refresh, refreshConnections, applyState]);
+  useEffect(() => { void api.auth.me().then((result) => setUser(result.user)).catch(() => setUser(null)); }, []);
 
   const run = async (key: string, action: () => Promise<unknown>) => { setBusy(key); setError(null); setNotice(null); try { await action(); await refresh(); setNotice("Changes saved successfully."); } catch (err) { setError(err instanceof Error ? err.message : String(err)); } finally { setBusy(null); } };
   const validSetups = analysis?.setups.filter((setup) => setup.status === "VALID") ?? [];
@@ -76,6 +80,7 @@ function App() {
   const saveRisk = () => void run("risk", async () => { await api.updateConfig({ risk: { maxTradesPerDay: Number(riskForm.maxTrades), riskPerTrade: Number(riskForm.riskPct), maxDailyLossPct: Number(riskForm.dailyLoss), maxDrawdownPct: Number(riskForm.drawdown) }, strategy: { minRr: Number(riskForm.minRr) } }); });
   const addConnection = () => void run("connection", async () => { await api.addConnection(connectionForm); setConnectionForm({ exchange: "binance", label: "", apiKey: "", apiSecret: "" }); await refreshConnections(); });
   const runBacktest = () => void run("backtest", async () => { const startTime = Date.parse(backtestForm.start); const endTime = Date.parse(backtestForm.end); if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) throw new Error("Use valid ISO timestamps for the backtest range."); setBacktest(await api.backtest({ startTime, endTime, startingEquity: Number(backtestForm.equity) || 10000 })); });
+  const signIn = (register: boolean) => void run("auth", async () => { const result = register ? await api.auth.register(authForm.email, authForm.password, authForm.name) : await api.auth.login(authForm.email, authForm.password); setUser(result.user); });
   const activeLabel = nav.find(([id]) => id === page)?.[2] ?? "Overview";
 
   const overview = <>
@@ -95,7 +100,8 @@ function App() {
   const settings = <><PageTitle title="Strategy & risk settings" description="These values are validated by the backend and applied to the live strategy engine."/><div className="two-col"><Card title="Risk controls"><div className="form-grid"><label>Max trades / day<input type="number" min={1} max={15} value={riskForm.maxTrades} onChange={(e) => setRiskForm({ ...riskForm, maxTrades: e.target.value })}/></label><label>Risk per trade (%)<input type="number" min={0.1} max={5} step={0.1} value={riskForm.riskPct} onChange={(e) => setRiskForm({ ...riskForm, riskPct: e.target.value })}/></label><label>Daily loss limit (%)<input type="number" min={0.5} max={10} step={0.5} value={riskForm.dailyLoss} onChange={(e) => setRiskForm({ ...riskForm, dailyLoss: e.target.value })}/></label><label>Maximum drawdown (%)<input type="number" min={2} max={50} value={riskForm.drawdown} onChange={(e) => setRiskForm({ ...riskForm, drawdown: e.target.value })}/></label><label>Minimum R:R<input type="number" min={1} step={0.5} value={riskForm.minRr} onChange={(e) => setRiskForm({ ...riskForm, minRr: e.target.value })}/></label></div><button className="primary" onClick={saveRisk} disabled={busy === "risk"}>{busy === "risk" ? "Saving…" : "Save risk settings"}</button><p className="helper">Hard platform ceilings: 15 trades/day, 5% risk/trade, 10% daily loss, 50% drawdown.</p></Card><Card title="Execution safeguards"><div className="guard"><b>Duplicate trade protection</b><span>Enabled</span></div><div className="guard"><b>Correlated exposure limit</b><span>{risk?.limits.maxCorrelatedExposurePct ?? 100}%</span></div><div className="guard"><b>Break-even management</b><span>Strategy controlled</span></div><div className="guard"><b>Emergency safety stop</b><button onClick={() => void run("safe", () => api.enterSafeMode("Triggered in settings"))}>Engage</button></div></Card></div></>;
   const exchange = <><PageTitle title="Exchange connections" description="Credentials are validated server-side and encrypted at rest. Never enable withdrawal permissions."/><div className="two-col"><Card title="Connect an exchange"><div className="form-grid"><label>Exchange<select value={connectionForm.exchange} onChange={(e) => setConnectionForm({ ...connectionForm, exchange: e.target.value })}><option value="binance">Binance</option><option value="bybit">Bybit (coming soon)</option><option value="okx">OKX (coming soon)</option></select></label><label>Account label<input value={connectionForm.label} onChange={(e) => setConnectionForm({ ...connectionForm, label: e.target.value })} placeholder="My trading account"/></label><label>API key<input value={connectionForm.apiKey} onChange={(e) => setConnectionForm({ ...connectionForm, apiKey: e.target.value })} autoComplete="off"/></label><label>API secret<input value={connectionForm.apiSecret} onChange={(e) => setConnectionForm({ ...connectionForm, apiSecret: e.target.value })} type="password" autoComplete="new-password"/></label></div><div className="warning">Use a dedicated trading API key with trading and read-only permissions only. Do not enable withdrawals.</div><button className="primary" onClick={addConnection} disabled={busy === "connection"}>Validate & connect</button></Card><Card title="Connected accounts">{connections.length === 0 ? <div className="empty">No exchange account connected.<p>Paper trading is available without credentials. A connected trading-enabled account is required to switch to live mode.</p></div> : <div className="connection-list">{connections.map((connection) => <div className="connection" key={connection.id}><div><b>{connection.label}</b><span>{connection.exchange} · {connection.apiKeyMasked}</span></div><Badge good={connection.permissions.tradingEnabled}>TRADING {connection.permissions.tradingEnabled ? "READY" : "DISABLED"}</Badge><button className="icon-button" onClick={() => void run("remove-connection", async () => { await api.removeConnection(connection.id); await refreshConnections(); })}>×</button></div>)}</div>}</Card></div></>;
 
-  const content = ({ dashboard: overview, markets, positions: positionPage, paper, backtest: backtesting, journal: journalPage, settings, exchange } as Record<Page, React.ReactNode>)[page];
+  const account = <><PageTitle title="Account" description="Use a private account for this trading workspace."/>{user ? <Card title="Signed in"><div className="empty"><b>{user.name}</b><p>{user.email}</p><button onClick={() => void run("logout", async () => { await api.auth.logout(); setUser(null); })}>Sign out</button></div></Card> : <div className="two-col"><Card title="Email and password"><div className="form-grid"><label>Name (registration)<input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}/></label><label>Email<input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}/></label><label>Password<input type="password" minLength={12} value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}/></label></div><div className="card-actions"><button className="primary" onClick={() => signIn(false)}>Sign in</button><button onClick={() => signIn(true)}>Create account</button></div><p className="helper">Passwords require at least 12 characters.</p></Card><Card title="Google"><p className="helper">Sign in with your verified Google account.</p><button className="primary" onClick={() => api.auth.google()}>Continue with Google</button></Card></div>}</>;
+  const content = ({ dashboard: overview, markets, positions: positionPage, paper, backtest: backtesting, journal: journalPage, settings, exchange, account } as Record<Page, React.ReactNode>)[page];
   return <div className="shell"><aside className="sidebar"><div className="brand"><span>m</span><div><b>Mirage</b><small>SMART MONEY OS</small></div></div><nav>{nav.map(([id, icon, label]) => <button key={id} className={page === id ? "active" : ""} onClick={() => setPage(id)}><i>{icon}</i>{label}</button>)}</nav><div className="sidebar-foot"><Badge good={wsConnected}>{wsConnected ? "SYSTEM ONLINE" : "RECONNECTING"}</Badge><span>v{status?.strategyVersion ?? "1.0.0"}</span></div></aside><main><header className="mobile-head"><button className="brand-mobile" onClick={() => setPage("dashboard")}>m</button><span>{activeLabel}</span><Badge good={wsConnected}>{wsConnected ? "LIVE" : "POLLING"}</Badge></header>{error && <div className="alert error"><b>Action required</b>{error}<button onClick={() => setError(null)}>×</button></div>}{notice && <div className="alert success"><b>Updated</b>{notice}<button onClick={() => setNotice(null)}>×</button></div>}{content}</main></div>;
 }
 

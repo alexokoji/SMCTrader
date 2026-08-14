@@ -34,12 +34,16 @@ async function auth(): Promise<MongoAuthService> {
   if (!globalThis.smcAuthPromise) {
     globalThis.smcAuthPromise = (async () => {
       const client = await (globalThis.smcMongoClientPromise ??= new MongoClient(required("MONGODB_URI"), { serverSelectionTimeoutMS: 10_000 }).connect());
-      const googleClientId = required("GOOGLE_CLIENT_ID");
-      const service = new MongoAuthService(client.db(process.env.MONGODB_DB ?? "smctrader"), {
-        clientId: googleClientId,
-        clientSecret: required("GOOGLE_CLIENT_SECRET"),
-        redirectUri: required("GOOGLE_REDIRECT_URI"),
-      });
+      const googleClientId = process.env.GOOGLE_CLIENT_ID;
+      const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+      const googleRedirectUri = process.env.GOOGLE_REDIRECT_URI;
+      if ((googleClientId || googleClientSecret || googleRedirectUri) && !(googleClientId && googleClientSecret && googleRedirectUri)) {
+        throw new Error("GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI must be set together.");
+      }
+      const google = googleClientId && googleClientSecret && googleRedirectUri
+        ? { clientId: googleClientId, clientSecret: googleClientSecret, redirectUri: googleRedirectUri }
+        : undefined;
+      const service = new MongoAuthService(client.db(process.env.MONGODB_DB ?? "smctrader"), google);
       await service.initialize();
       return service;
     })();

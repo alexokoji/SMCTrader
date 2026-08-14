@@ -1,8 +1,5 @@
 {
   "buildCommand": "npm run build -w @smc/web",
   "outputDirectory": "apps/web/dist",
-  "framework": null,
-  "functions": {
-    "api/auth/[...route].ts": { "runtime": "nodejs22.x" }
-  }
+  "framework": null
 }

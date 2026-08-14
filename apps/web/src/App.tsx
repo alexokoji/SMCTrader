@@ -45,6 +45,7 @@ function App() {
   const [backtestForm, setBacktestForm] = useState({ start: "", end: "", equity: "10000" });
   const [backtest, setBacktest] = useState<BacktestResult | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
 
   const refresh = useCallback(async () => {
@@ -64,7 +65,7 @@ function App() {
     const timer = setInterval(() => { if (!ws.current) void refresh(); }, 5000);
     return () => { clearInterval(timer); disconnect(); };
   }, [refresh, refreshConnections, applyState]);
-  useEffect(() => { void api.auth.me().then((result) => setUser(result.user)).catch(() => setUser(null)); }, []);
+  useEffect(() => { void api.auth.me().then((result) => setUser(result.user)).catch(() => setUser(null)).finally(() => setAuthReady(true)); }, []);
 
   const run = async (key: string, action: () => Promise<unknown>) => { setBusy(key); setError(null); setNotice(null); try { await action(); await refresh(); setNotice("Changes saved successfully."); } catch (err) { setError(err instanceof Error ? err.message : String(err)); } finally { setBusy(null); } };
   const validSetups = analysis?.setups.filter((setup) => setup.status === "VALID") ?? [];
@@ -82,6 +83,9 @@ function App() {
   const runBacktest = () => void run("backtest", async () => { const startTime = Date.parse(backtestForm.start); const endTime = Date.parse(backtestForm.end); if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) throw new Error("Use valid ISO timestamps for the backtest range."); setBacktest(await api.backtest({ startTime, endTime, startingEquity: Number(backtestForm.equity) || 10000 })); });
   const signIn = (register: boolean) => void run("auth", async () => { const result = register ? await api.auth.register(authForm.email, authForm.password, authForm.name) : await api.auth.login(authForm.email, authForm.password); setUser(result.user); });
   const activeLabel = nav.find(([id]) => id === page)?.[2] ?? "Overview";
+
+  if (!authReady) return <div className="shell"><main><div className="empty">Checking secure session…</div></main></div>;
+  if (!user) return <div className="shell"><main><div className="page-title"><div><p className="eyebrow">MIRAGE SMART MONEY OS</p><h1>Sign in to your workspace</h1><p>Your paper account and future exchange connections stay private.</p></div></div><div className="two-col"><Card title="Email and password"><div className="form-grid"><label>Name (registration)<input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}/></label><label>Email<input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}/></label><label>Password<input type="password" minLength={12} value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}/></label></div><div className="card-actions"><button className="primary" disabled={busy === "auth"} onClick={() => signIn(false)}>Sign in</button><button disabled={busy === "auth"} onClick={() => signIn(true)}>Create account</button></div>{error && <p className="helper bad">{error}</p>}<p className="helper">Passwords require at least 12 characters.</p></Card><Card title="Google sign-in"><p className="helper">Use your verified Google account.</p><button className="primary" onClick={() => api.auth.google()}>Continue with Google</button></Card></div></main></div>;
 
   const overview = <>
     <div className="hero"><div><p className="eyebrow">{status?.exchange ?? "EXCHANGE"} · {status?.symbol ?? "BTCUSDT"}</p><h1>Trading command center</h1><p>Rule-based Smart Money analysis, risk controls, and execution in one workspace.</p></div><div className="hero-actions"><button className="primary" onClick={() => void run("refresh", async () => { await refresh(); })}>{busy === "refresh" ? "Refreshing…" : "Refresh data"}</button><button className="danger" onClick={() => void run("stop", () => api.setAutoTrading(false))}>Emergency stop</button></div></div>

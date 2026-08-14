@@ -4,6 +4,7 @@ import type { MongoAuthService } from "../../packages/api/src/auth.js";
 
 type VercelRequest = {
   method?: string;
+  url?: string;
   query: { route?: string | string[]; code?: string; state?: string };
   headers: { cookie?: string };
   body?: unknown;
@@ -80,7 +81,8 @@ function workerToken(userId: string): string {
 
 export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
   const route = req.query.route;
-  const parts = Array.isArray(route) ? route : route ? [route] : [];
+  const routedParts = Array.isArray(route) ? route : route ? [route] : [];
+  const parts = routedParts.length ? routedParts : new URL(req.url ?? "/", "https://vercel.local").pathname.split("/").filter(Boolean).slice(2);
   const action = parts[0];
   const method = (req.method ?? "GET").toUpperCase();
   try {

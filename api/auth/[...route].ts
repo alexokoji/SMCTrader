@@ -87,7 +87,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   const method = (req.method ?? "GET").toUpperCase();
   try {
     const service = await auth();
-    if (action === "me" && method === "GET") return res.status(200).json({ user: await service.userForToken(token(req)) ?? null });
+    if ((action === "me" || action === "session") && method === "GET") return res.status(200).json({ user: await service.userForToken(token(req)) ?? null });
     if (action === "token" && method === "GET") {
       const user = await service.userForToken(token(req));
       if (!user) return res.status(401).json({ error: "Sign in is required." });

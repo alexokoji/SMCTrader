@@ -299,7 +299,7 @@ async function authRequest<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   auth: {
-    me: () => authRequest<{ user: AuthUser | null }>("/me"),
+    me: () => authRequest<{ user: AuthUser | null }>("/session"),
     register: (email: string, password: string, name: string) => authRequest<{ user: AuthUser }>("/register", { method: "POST", body: JSON.stringify({ email, password, name }) }),
     login: (email: string, password: string) => authRequest<{ user: AuthUser }>("/login", { method: "POST", body: JSON.stringify({ email, password }) }),
     logout: () => authRequest<{ signedOut: boolean }>("/logout", { method: "POST" }),

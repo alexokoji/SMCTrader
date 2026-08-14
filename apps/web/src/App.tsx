@@ -25,6 +25,7 @@ function App() {
   const [page, setPage] = useState<Page>("dashboard");
   const [status, setStatus] = useState<ApiStatus | null>(null);
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const [marketAnalyses, setMarketAnalyses] = useState<AnalysisResult[]>([]);
   const [risk, setRisk] = useState<{ state: RiskState; limits: RiskConfig } | null>(null);
   const [positions, setPositions] = useState<{ open: Position[]; all: Position[] }>({ open: [], all: [] });
   const [journal, setJournal] = useState<JournalEntry[]>([]);
@@ -45,8 +46,8 @@ function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [s, a, r, p, j, act, assetRes] = await Promise.all([api.status(), api.analysis(), api.risk(), api.positions(), api.journal(), api.activity(), api.assets()]);
-      setStatus(s); setAnalysis(a); setRisk(r); setPositions(p); setJournal(j.entries); setActivity(act.events); setAssets(assetRes.assets);
+      const [s, a, marketResults, r, p, j, act, assetRes] = await Promise.all([api.status(), api.analysis(), api.markets(), api.risk(), api.positions(), api.journal(), api.activity(), api.assets()]);
+      setStatus(s); setAnalysis(a); setMarketAnalyses(marketResults.analyses); setRisk(r); setPositions(p); setJournal(j.entries); setActivity(act.events); setAssets(assetRes.assets);
       setRiskForm({ maxTrades: String(r.limits.maxTradesPerDay), riskPct: String(r.limits.riskPerTrade), dailyLoss: String(r.limits.maxDailyLossPct), drawdown: String(r.limits.maxDrawdownPct), minRr: "3" });
       setError(null);
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }

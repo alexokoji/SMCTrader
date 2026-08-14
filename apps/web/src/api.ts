@@ -201,6 +201,12 @@ function apiUrl(path: string): string {
  * backoff. Returns a function that disconnects. See stream.ts on the API side.
  */
 export function connectStream(handlers: StreamHandlers): () => void {
+  // The Cloudflare compatibility API is request/response based for now. Do not
+  // repeatedly open a WebSocket against the Vercel static deployment.
+  if (apiBaseUrl && !websocketBaseUrl) {
+    handlers.onStatus(false);
+    return () => undefined;
+  }
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   const url = websocketBaseUrl || `${proto}://${window.location.host}/ws`;
   let ws: WebSocket | null = null;
@@ -296,6 +302,7 @@ export const api = {
     request<{ connection: ExchangeConnection }>("/api/connections", { method: "POST", body: JSON.stringify(input) }),
   removeConnection: (id: string) => request<{ removed: boolean }>(`/api/connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
   analysis: () => request<AnalysisResult>("/api/analysis"),
+  markets: () => request<{ analyses: AnalysisResult[] }>("/api/markets"),
   risk: () => request<{ state: RiskState; limits: RiskConfig }>("/api/risk"),
   positions: () => request<{ open: Position[]; all: Position[] }>("/api/positions"),
   journal: () => request<{ entries: JournalEntry[] }>("/api/journal"),

@@ -5,6 +5,13 @@
   "compatibility_date": "2026-08-14",
   "workers_dev": true,
   "observability": { "enabled": true },
+  "d1_databases": [
+    {
+      "binding": "AUTH_DB",
+      "database_name": "smc-trader-auth",
+      "database_id": "5f4b2113-369c-4aef-9c8b-008340c499e0"
+    }
+  ],
   "triggers": { "crons": ["*/5 * * * *"] },
   "durable_objects": {
     "bindings": [

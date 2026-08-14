@@ -8,6 +8,7 @@ import {
 } from "@smc/core";
 import { ApiApp } from "./app.js";
 import { connectMongo } from "./mongo.js";
+import { MongoAuthService } from "./auth.js";
 
 // Local development follows the repository's .env.example without requiring a
 // runtime dotenv dependency. Deployment environments continue to use env vars.
@@ -35,6 +36,16 @@ const marketData = marketDataMode === "demo"
 
 const mongoUri = process.env.MONGODB_URI;
 const persistence = mongoUri ? await connectMongo(mongoUri, process.env.MONGODB_DB ?? "smctrader") : undefined;
+const googleClientId = process.env.GOOGLE_CLIENT_ID;
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+const googleRedirectUri = process.env.GOOGLE_REDIRECT_URI;
+if (Boolean(googleClientId) !== Boolean(googleClientSecret) || Boolean(googleClientId) !== Boolean(googleRedirectUri)) {
+  throw new Error("GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI must be set together.");
+}
+const auth = persistence ? new MongoAuthService(persistence.database, googleClientId && googleClientSecret && googleRedirectUri
+  ? { clientId: googleClientId, clientSecret: googleClientSecret, redirectUri: googleRedirectUri }
+  : undefined) : undefined;
+await auth?.initialize();
 
 const app = new ApiApp({
   marketData,
@@ -50,6 +61,8 @@ const app = new ApiApp({
   // engines to establish context. Live feeds retain the production default.
   feed: marketDataMode === "demo" ? { historyLimit: 120 } : true,
   exchangeConnections: persistence?.exchangeConnections,
+  auth,
+  authRedirectUrl: process.env.AUTH_REDIRECT_URL,
 });
 
 app.listen(port).then(() => {

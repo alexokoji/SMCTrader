@@ -26,6 +26,7 @@ import {
 } from "./connections.js";
 import type { Collection } from "mongodb";
 import type { StoredExchangeConnection } from "./connections.js";
+import { MongoAuthService } from "./auth.js";
 
 export interface ApiAppOptions {
   marketData: MarketDataProvider;
@@ -44,6 +45,8 @@ export interface ApiAppOptions {
   /** Optional injected exchange credential validator, primarily for testing. */
   credentialValidator?: (exchange: string) => CredentialValidator | undefined;
   exchangeConnections?: Collection<StoredExchangeConnection>;
+  auth?: MongoAuthService;
+  authRedirectUrl?: string;
 }
 
 class HttpError extends Error {
@@ -64,8 +67,12 @@ export class ApiApp {
   server?: Server;
   private vault?: ConnectionVault;
   private vaultError?: string;
+  private auth?: MongoAuthService;
+  private authRedirectUrl: string;
 
   constructor(opts: ApiAppOptions) {
+    this.auth = opts.auth;
+    this.authRedirectUrl = opts.authRedirectUrl ?? "/";
     this.marketData = opts.marketData;
     this.strategyCfg = opts.strategy ?? defaultStrategyConfigFor("BTCUSDT", "binance");
     this.riskCfg = opts.risk ? validateRiskConfig(opts.risk) : DEFAULT_RISK_CONFIG;
@@ -226,6 +233,9 @@ export class ApiApp {
     const resource = seg[0];
 
     switch (resource) {
+      case "auth":
+        return this.dispatchAuth(req, res, seg.slice(1), method, url);
+
       case "config": {
         if (method === "PATCH") {
           return this.updateConfig(req, res);
@@ -444,6 +454,63 @@ export class ApiApp {
     }
   }
 
+  private async dispatchAuth(req: IncomingMessage, res: ServerResponse, seg: string[], method: string, url: URL): Promise<void> {
+    if (!this.auth) throw new HttpError(503, "Authentication is not configured. Set MONGODB_URI to enable it.");
+    const action = seg[0];
+    if (action === "me") {
+      this.requireMethod(res, method, "GET");
+      return this.send(res, 200, { user: await this.auth.userForToken(this.sessionToken(req)) ?? null });
+    }
+    if (action === "register" || action === "login") {
+      this.requireMethod(res, method, "POST");
+      const body = await this.readJson<{ email?: string; password?: string; name?: string }>(req);
+      if (!body.email || !body.password) throw new HttpError(400, "email and password are required.");
+      try {
+        const session = action === "register" ? await this.auth.register(body.email, body.password, body.name) : await this.auth.login(body.email, body.password);
+        return this.send(res, 200, { user: session.user }, { "set-cookie": this.sessionCookie(session.token) });
+      } catch (error) {
+        throw new HttpError(401, error instanceof Error ? error.message : "Sign-in failed.");
+      }
+    }
+    if (action === "logout") {
+      this.requireMethod(res, method, "POST");
+      await this.auth.logout(this.sessionToken(req));
+      return this.send(res, 200, { signedOut: true }, { "set-cookie": "smc_session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax" });
+    }
+    if (action === "google" && seg[1] !== "callback") {
+      this.requireMethod(res, method, "GET");
+      const location = await this.auth.createGoogleAuthorizationUrl();
+      res.writeHead(302, { location, "cache-control": "no-store" });
+      res.end();
+      return;
+    }
+    if (action === "google" && seg[1] === "callback") {
+      this.requireMethod(res, method, "GET");
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+      if (!code || !state) throw new HttpError(400, "Google did not return a valid authorization response.");
+      try {
+        const session = await this.auth.loginWithGoogle(code, state);
+        res.writeHead(302, { location: this.authRedirectUrl, "set-cookie": this.sessionCookie(session.token), "cache-control": "no-store" });
+        res.end();
+        return;
+      } catch (error) {
+        throw new HttpError(401, error instanceof Error ? error.message : "Google sign-in failed.");
+      }
+    }
+    throw new HttpError(404, "Authentication route not found.");
+  }
+
+  private sessionToken(req: IncomingMessage): string | undefined {
+    const cookie = req.headers.cookie?.split(";").map((item) => item.trim()).find((item) => item.startsWith("smc_session="));
+    return cookie ? decodeURIComponent(cookie.slice("smc_session=".length)) : undefined;
+  }
+
+  private sessionCookie(token: string): string {
+    const secure = process.env.AUTH_COOKIE_SECURE === "true" ? "; Secure" : "";
+    return `smc_session=${encodeURIComponent(token)}; HttpOnly; Path=/; Max-Age=${60 * 60 * 24 * 14}; SameSite=Lax${secure}`;
+  }
+
   private async updateConfig(req: IncomingMessage, res: ServerResponse): Promise<void> {
     try {
       const body = await this.readJson<{
@@ -486,11 +553,12 @@ export class ApiApp {
     }
   }
 
-  private send(res: ServerResponse, status: number, data: unknown): void {
+  private send(res: ServerResponse, status: number, data: unknown, extraHeaders: Record<string, string> = {}): void {
     const payload = JSON.stringify(data);
     res.writeHead(status, {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(payload),
+      ...extraHeaders,
     });
     res.end(payload);
   }

@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 interface Env {
   TRADING_SESSION: DurableObjectNamespace<TradingSession>;
   ALLOWED_ORIGIN?: string;
+  WORKER_AUTH_SECRET?: string;
 }
 
 type RuntimeMode = "ANALYSIS_ONLY" | "PAPER" | "LIVE";
@@ -25,6 +26,17 @@ function corsHeaders(request: Request, env: Env): Headers {
 
 function json(request: Request, env: Env, body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: corsHeaders(request, env) });
+}
+
+async function authenticatedUser(request: Request, env: Env): Promise<string | undefined> {
+  const value = request.headers.get("authorization");
+  if (!env.WORKER_AUTH_SECRET || !value?.startsWith("Bearer ")) return undefined;
+  const [payload, signature] = value.slice(7).split(".");
+  if (!payload || !signature) return undefined;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.WORKER_AUTH_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  const valid = await crypto.subtle.verify("HMAC", key, Uint8Array.from(atob(signature.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)), new TextEncoder().encode(payload));
+  if (!valid) return undefined;
+  try { const claims = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))) as { sub?: string; exp?: number }; return typeof claims.sub === "string" && typeof claims.exp === "number" && claims.exp > Date.now() ? claims.sub : undefined; } catch { return undefined; }
 }
 
 function baseState(mode: RuntimeMode, assets: string[]) {
@@ -198,7 +210,9 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/health") return json(request, env, { status: "ok", service: "smc-trader-worker", timestamp: Date.now() });
 
-    const session = env.TRADING_SESSION.getByName("default");
+    const userId = await authenticatedUser(request, env);
+    if (!userId) return json(request, env, { error: "Authentication is required." }, 401);
+    const session = env.TRADING_SESSION.getByName(`user:${userId}`);
     const [mode, assets] = await Promise.all([session.getMode(), session.getAssets()]);
     const state = baseState(mode, assets);
 

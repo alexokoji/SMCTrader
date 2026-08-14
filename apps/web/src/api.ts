@@ -192,6 +192,7 @@ export interface StreamHandlers {
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
 const websocketBaseUrl = (import.meta.env.VITE_WS_BASE_URL ?? "").replace(/\/$/, "");
+let workerToken: { value: string; expiresAt: number } | undefined;
 
 function apiUrl(path: string): string {
   return `${apiBaseUrl}${path}`;
@@ -263,8 +264,14 @@ export function connectStream(handlers: StreamHandlers): () => void {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  if (!workerToken || workerToken.expiresAt < Date.now() + 30_000) {
+    const session = await fetch("/api/auth/token", { credentials: "include" });
+    if (!session.ok) throw new Error("Sign in is required.");
+    const token = await session.json() as { token: string; expiresIn: number };
+    workerToken = { value: token.token, expiresAt: Date.now() + token.expiresIn * 1000 };
+  }
   const res = await fetch(apiUrl(path), {
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${workerToken.value}` },
     ...init,
   });
   if (!res.ok) {

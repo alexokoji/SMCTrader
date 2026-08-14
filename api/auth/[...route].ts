@@ -1,4 +1,5 @@
 import { MongoClient } from "mongodb";
+import { createHmac } from "node:crypto";
 import { MongoAuthService } from "../../packages/api/src/auth.js";
 
 type VercelRequest = {
@@ -64,6 +65,12 @@ function payload(req: VercelRequest): Record<string, unknown> {
   return req.body && typeof req.body === "object" ? req.body as Record<string, unknown> : {};
 }
 
+function workerToken(userId: string): string {
+  const payload = Buffer.from(JSON.stringify({ sub: userId, exp: Date.now() + 5 * 60_000 })).toString("base64url");
+  const signature = createHmac("sha256", required("WORKER_AUTH_SECRET")).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
   const route = req.query.route;
   const parts = Array.isArray(route) ? route : route ? [route] : [];
@@ -72,6 +79,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   try {
     const service = await auth();
     if (action === "me" && method === "GET") return res.status(200).json({ user: await service.userForToken(token(req)) ?? null });
+    if (action === "token" && method === "GET") {
+      const user = await service.userForToken(token(req));
+      if (!user) return res.status(401).json({ error: "Sign in is required." });
+      return res.status(200).json({ token: workerToken(user.id), expiresIn: 300 });
+    }
     if ((action === "register" || action === "login") && method === "POST") {
       const body = payload(req);
       const email = typeof body.email === "string" ? body.email : "";

@@ -1,12 +1,22 @@
 # Deployment
 
-## Vercel (dashboard)
+## Vercel (dashboard and authentication)
 
-Deploy `apps/web` as a Vite project. Configure:
+Deploy the repository root. `vercel.json` builds `apps/web` and exposes
+same-origin MongoDB authentication functions at `/api/auth/*`.
 
-- Build command: `npm run build -w @smc/web`
-- Output directory: `apps/web/dist`
-- `VITE_API_BASE_URL`: your deployed Worker URL, for example `https://smc-trader-api.<account>.workers.dev`
+Set these Vercel variables (Production, Preview, and Development as needed):
+
+- `MONGODB_URI` and `MONGODB_DB=smctrader`
+- `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REDIRECT_URI=https://<vercel-domain>/api/auth/google/callback`
+- `AUTH_REDIRECT_URL=https://<vercel-domain>/`
+- `AUTH_COOKIE_SECURE=true`
+- `VITE_API_BASE_URL`: deployed Cloudflare Worker URL, for example `https://smc-trader-api.<account>.workers.dev`
+
+Do not prefix MongoDB or Google variables with `VITE_`; Vite would expose them
+to every browser. Add the same callback address to Google Cloud's Authorized
+redirect URIs.
 
 ## Cloudflare Worker (API starter)
 

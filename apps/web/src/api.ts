@@ -39,6 +39,7 @@ export interface Health {
   status: string;
   timestamp: number;
 }
+export interface AuthUser { id: string; email: string; name: string; }
 
 export interface TopDown {
   htf: { timeframe: string; trend: string; strength: string; poi?: string; liquidity?: string };
@@ -279,7 +280,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** Same-origin Vercel authentication; trading requests may still target the Worker. */
+async function authRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`/api/auth${path}`, { credentials: "include", headers: { "content-type": "application/json" }, ...init });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as { error?: string };
+    throw new Error(body.error ?? `${res.status} Authentication request failed`);
+  }
+  return res.json() as Promise<T>;
+}
+
 export const api = {
+  auth: {
+    me: () => authRequest<{ user: AuthUser | null }>("/me"),
+    register: (email: string, password: string, name: string) => authRequest<{ user: AuthUser }>("/register", { method: "POST", body: JSON.stringify({ email, password, name }) }),
+    login: (email: string, password: string) => authRequest<{ user: AuthUser }>("/login", { method: "POST", body: JSON.stringify({ email, password }) }),
+    logout: () => authRequest<{ signedOut: boolean }>("/logout", { method: "POST" }),
+    google: () => { window.location.assign("/api/auth/google"); },
+  },
   health: () => request<Health>("/health"),
   status: () => request<ApiStatus>("/api/status"),
   config: () => request<{ strategy: Record<string, unknown>; risk: RiskConfig }>("/api/config"),

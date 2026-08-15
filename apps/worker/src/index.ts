@@ -69,9 +69,30 @@ export class TradingSession extends DurableObject<Env> {
   async alarm(): Promise<void> {
     try {
       await this.runAnalysis();
+      await this.probeProviderHealth();
     } finally {
       await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
     }
+  }
+
+  async probeProviderHealth(): Promise<void> {
+    const probes = [
+      ["binance", "https://api.binance.com/api/v3/time"],
+      ["bybit", "https://api.bybit.com/v5/market/time"],
+      ["coinbase", "https://api.exchange.coinbase.com/time"],
+      ["okx", "https://www.okx.com/api/v5/public/time"],
+      ["bitget", "https://api.bitget.com/api/v2/public/time"],
+      ["kucoin", "https://api.kucoin.com/api/v1/timestamp"],
+    ] as const;
+    const results = await Promise.all(probes.map(async ([provider, url]) => {
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+        return { provider, status: response.ok ? "healthy" : "degraded", code: response.status };
+      } catch {
+        return { provider, status: "unavailable", code: 0 };
+      }
+    }));
+    await this.ctx.storage.put("providerHealth", { checkedAt: Date.now(), providers: results });
   }
 
   async runAnalysis(symbolOverride?: string): Promise<Record<string, unknown>> {

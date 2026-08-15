@@ -49,6 +49,18 @@ function baseState(mode: RuntimeMode, assets: string[]) {
 }
 
 export class TradingSession extends DurableObject<Env> {
+  async allowRequest(limit = 120, windowMs = 60_000): Promise<boolean> {
+    const now = Date.now();
+    const recent = ((await this.ctx.storage.get<number[]>("requestTimestamps")) ?? []).filter((timestamp) => timestamp > now - windowMs);
+    if (recent.length >= limit) {
+      await this.ctx.storage.put("requestTimestamps", recent);
+      return false;
+    }
+    recent.push(now);
+    await this.ctx.storage.put("requestTimestamps", recent);
+    return true;
+  }
+
   async ensureAnalysisAlarm(): Promise<void> {
     const current = await this.ctx.storage.getAlarm();
     if (current === null) await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
@@ -251,6 +263,7 @@ export default {
     const userId = await authenticatedUser(request, env);
     if (!userId) return json(request, env, { error: "Authentication is required." }, 401);
     const session = env.TRADING_SESSION.getByName(`user:${userId}`);
+    if (!(await session.allowRequest())) return json(request, env, { error: "Rate limit exceeded. Please retry in one minute." }, 429);
     await session.ensureAnalysisAlarm();
     const [mode, assets] = await Promise.all([session.getMode(), session.getAssets()]);
     const state = baseState(mode, assets);

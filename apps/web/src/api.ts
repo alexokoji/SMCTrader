@@ -40,6 +40,7 @@ export interface Health {
   timestamp: number;
 }
 export interface AuthUser { id: string; email: string; name: string; }
+export interface StoredTradingAccount { assets: string[]; risk: Partial<RiskConfig>; startingEquity: number; paperEquity: number; mode: string; }
 
 export interface TopDown {
   htf: { timeframe: string; trend: string; strength: string; poi?: string; liquidity?: string };
@@ -312,6 +313,7 @@ async function connectionRequest<T>(init?: RequestInit): Promise<T> {
 export const api = {
   auth: {
     me: () => authRequest<{ user: AuthUser | null }>("/session"),
+    account: () => authRequest<{ account: StoredTradingAccount }>("/account"),
     register: (email: string, password: string, name: string) => authRequest<{ user: AuthUser }>("/register", { method: "POST", body: JSON.stringify({ email, password, name }) }),
     login: (email: string, password: string) => authRequest<{ user: AuthUser }>("/login", { method: "POST", body: JSON.stringify({ email, password }) }),
     logout: () => authRequest<{ signedOut: boolean }>("/logout", { method: "POST" }),

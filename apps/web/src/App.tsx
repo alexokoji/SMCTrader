@@ -67,6 +67,13 @@ function App() {
     return () => { clearInterval(timer); disconnect(); };
   }, [authReady, user, refresh, refreshConnections, applyState]);
   useEffect(() => { void api.auth.me().then((result) => setUser(result.user)).catch((err) => { setError(err instanceof Error ? err.message : "Authentication service is unavailable."); setUser(null); }).finally(() => setAuthReady(true)); }, []);
+  useEffect(() => {
+    if (!user) return;
+    void api.auth.account().then(async ({ account }) => {
+      await api.updateAssets(account.assets);
+      await api.updateConfig({ risk: account.risk });
+    }).catch((err) => setError(err instanceof Error ? err.message : "Could not restore saved account settings."));
+  }, [user]);
 
   const run = async (key: string, action: () => Promise<unknown>) => { setBusy(key); setError(null); setNotice(null); try { await action(); await refresh(); setNotice("Changes saved successfully."); } catch (err) { setError(err instanceof Error ? err.message : String(err)); } finally { setBusy(null); } };
   const validSetups = analysis?.setups.filter((setup) => setup.status === "VALID") ?? [];

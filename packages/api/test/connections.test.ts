@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ConnectionVault } from "../src/connections.js";
 
 const encryptionKey = Buffer.alloc(32, 7).toString("base64");
-const validator = () => ({ validate: async () => ({ valid: true, permissions: { tradingEnabled: true, withdrawalEnabled: false } }) });
+const validator = (exchange: string) => exchange === "binance" ? ({ validate: async () => ({ valid: true, permissions: { tradingEnabled: true, withdrawalEnabled: false } }) }) : undefined;
 
 describe("ConnectionVault", () => {
   it("returns only masked credentials and keeps secrets decryptable internally", async () => {

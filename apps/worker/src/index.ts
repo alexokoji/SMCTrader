@@ -169,6 +169,7 @@ export class TradingSession extends DurableObject<Env> {
       const setup = { id: `${symbol}-${Date.now()}`, direction, timeframe: "1h", entryModel: "SMA momentum + structure", entry: price, stopLoss, takeProfits: [takeProfitOne, takeProfit], rr: [1, 2], score, status: score >= 65 ? "QUALIFIED" : "WATCHING", reasons: [`20-period MA ${fast.toFixed(2)} is ${direction === "LONG" ? "above" : "below"} 50-period MA ${slow.toFixed(2)}`, "Public market candles refreshed"], rejectionReasons: [], createdAt: Date.now() };
       const analysis = { symbol, exchange, bias: trend, status: "ANALYZED", updatedAt: Date.now(), topDown: { htf: { timeframe: "4h", trend, strength: "CONFIRMED" }, mtf: { timeframe: "1h", trend, strength: "CONFIRMED" }, ltf: { timeframe: "15m", trend, confirmation: "WAITING" } }, setups: [setup], events: [{ type: "MARKET_ANALYSIS", description: `${symbol} ${trend} analysis refreshed at ${price}`, timestamp: Date.now() }] };
       await this.ctx.storage.put({ analysis, lastPrice: price, lastPollAt: Date.now(), lastError: null, providerHealth: { provider: exchange, status: "healthy", checkedAt: Date.now(), symbol } });
+      console.log(JSON.stringify({ event: "analysis_completed", symbol, provider: exchange, bias: trend, timestamp: Date.now() }));
       const existingPositions = (await this.ctx.storage.get<Record<string, unknown>[]>("positions")) ?? [];
       const journal = (await this.ctx.storage.get<Record<string, unknown>[]>("journal")) ?? [];
       const closeFeePct = ((await this.ctx.storage.get<Record<string, number>>("risk"))?.feePct ?? DEFAULT_RISK.feePct) / 100;
@@ -209,6 +210,7 @@ export class TradingSession extends DurableObject<Env> {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Market data request failed";
       await this.ctx.storage.put({ lastError: message, lastPollAt: Date.now(), providerHealth: { provider: "unavailable", status: "error", checkedAt: Date.now(), symbol, error: message } });
+      console.error(JSON.stringify({ event: "analysis_failed", symbol, message, timestamp: Date.now() }));
       return (await this.ctx.storage.get<Record<string, unknown>>("analysis")) ?? { symbol, exchange: "binance", bias: "NEUTRAL", status: "MARKET_DATA_UNAVAILABLE", updatedAt: Date.now(), topDown: { htf: { timeframe: "4h", trend: "NEUTRAL", strength: "WAITING" }, mtf: { timeframe: "1h", trend: "NEUTRAL", strength: "WAITING" }, ltf: { timeframe: "15m", trend: "NEUTRAL" } }, setups: [], events: [] };
     }
   }
@@ -279,7 +281,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders(request, env) });
     const url = new URL(request.url);
-    if (url.pathname === "/health") return json(request, env, { status: "ok", service: "smc-trader-worker", timestamp: Date.now() });
+    if (url.pathname === "/health") return json(request, env, { status: "ok", service: "smc-trader-worker", authRequired: true, durableObjectBinding: Boolean(env.TRADING_SESSION), timestamp: Date.now() });
 
     const userId = await authenticatedUser(request, env);
     if (!userId) return json(request, env, { error: "Authentication is required." }, 401);

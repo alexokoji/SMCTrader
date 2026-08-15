@@ -28,6 +28,22 @@ interface OAuthStateDocument {
   expiresAt: Date;
 }
 
+interface TradingAccountDocument {
+  userId: string;
+  startingEquity: number;
+  paperEquity: number;
+  mode: "PAPER" | "ANALYSIS_ONLY" | "LIVE";
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface TradingAccount {
+  userId: string;
+  startingEquity: number;
+  paperEquity: number;
+  mode: "PAPER" | "ANALYSIS_ONLY" | "LIVE";
+}
+
 export interface AuthUser {
   id: string;
   email: string;
@@ -44,11 +60,13 @@ export class MongoAuthService {
   private readonly users: Collection<UserDocument>;
   private readonly sessions: Collection<SessionDocument>;
   private readonly oauthStates: Collection<OAuthStateDocument>;
+  private readonly tradingAccounts: Collection<TradingAccountDocument>;
 
   constructor(database: Db, readonly google?: GoogleOAuthConfig) {
     this.users = database.collection<UserDocument>("users");
     this.sessions = database.collection<SessionDocument>("sessions");
     this.oauthStates = database.collection<OAuthStateDocument>("oauth_states");
+    this.tradingAccounts = database.collection<TradingAccountDocument>("trading_accounts");
   }
 
   async initialize(): Promise<void> {
@@ -58,6 +76,7 @@ export class MongoAuthService {
       this.sessions.createIndex({ tokenHash: 1 }, { unique: true }),
       this.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.oauthStates.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
+      this.tradingAccounts.createIndex({ userId: 1 }, { unique: true }),
     ]);
   }
 
@@ -74,6 +93,7 @@ export class MongoAuthService {
       if (isDuplicateKey(error)) throw new Error("An account already exists for this email.");
       throw error;
     }
+    await this.ensureTradingAccount(user.id);
     return { user: publicUser(user), token: await this.createSession(user.id) };
   }
 
@@ -82,6 +102,7 @@ export class MongoAuthService {
     if (!user?.passwordHash || !(await verifyPassword(password, user.passwordHash))) {
       throw new Error("Invalid email or password.");
     }
+    await this.ensureTradingAccount(user.id);
     return { user: publicUser(user), token: await this.createSession(user.id) };
   }
 
@@ -90,7 +111,9 @@ export class MongoAuthService {
     const session = await this.sessions.findOne({ tokenHash: sha256(token), expiresAt: { $gt: new Date() } });
     if (!session) return undefined;
     const user = await this.users.findOne({ id: session.userId });
-    return user ? publicUser(user) : undefined;
+    if (!user) return undefined;
+    await this.ensureTradingAccount(user.id);
+    return publicUser(user);
   }
 
   async logout(token: string | undefined): Promise<void> {
@@ -129,7 +152,24 @@ export class MongoAuthService {
       await this.users.updateOne({ id: user.id }, { $set: { googleSubject: profile.sub, updatedAt: new Date() } });
       user.googleSubject = profile.sub;
     }
+    await this.ensureTradingAccount(user.id);
     return { user: publicUser(user), token: await this.createSession(user.id) };
+  }
+
+  async getTradingAccount(userId: string): Promise<TradingAccount> {
+    await this.ensureTradingAccount(userId);
+    const account = await this.tradingAccounts.findOne({ userId });
+    if (!account) throw new Error("Trading account could not be created.");
+    return { userId: account.userId, startingEquity: account.startingEquity, paperEquity: account.paperEquity, mode: account.mode };
+  }
+
+  private async ensureTradingAccount(userId: string): Promise<void> {
+    const now = new Date();
+    await this.tradingAccounts.updateOne(
+      { userId },
+      { $setOnInsert: { userId, startingEquity: 10_000, paperEquity: 10_000, mode: "PAPER", createdAt: now, updatedAt: now } },
+      { upsert: true },
+    );
   }
 
   private async createSession(userId: string): Promise<string> {

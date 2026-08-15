@@ -75,7 +75,7 @@ export class BinanceExecutionAdapter implements ExchangeAdapter {
     this.apiKey = opts.apiKey;
     this.apiSecret = opts.apiSecret;
     this.baseUrl = opts.baseUrl ?? "https://api.binance.com";
-    this.fetchFn = opts.fetchFn ?? (async (...args) => fetch(...args));
+    this.fetchFn = opts.fetchFn ?? fetch;
   }
 
   async connect(): Promise<ConnectionStatus> {

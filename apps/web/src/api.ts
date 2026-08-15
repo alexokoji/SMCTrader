@@ -300,6 +300,15 @@ async function authRequest<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function connectionRequest<T>(init?: RequestInit): Promise<T> {
+  const res = await fetch("/api/connections", { credentials: "include", headers: { "content-type": "application/json" }, ...init });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as { error?: string };
+    throw new Error(body.error ?? "Connection request failed.");
+  }
+  return res.json() as Promise<T>;
+}
+
 export const api = {
   auth: {
     me: () => authRequest<{ user: AuthUser | null }>("/session"),
@@ -325,10 +334,10 @@ export const api = {
     method: "PUT",
     body: JSON.stringify({ assets }),
   }),
-  connections: () => request<{ connections: ExchangeConnection[]; available?: boolean; setupError?: string }>("/api/connections"),
+  connections: () => connectionRequest<{ connections: ExchangeConnection[]; available?: boolean; setupError?: string }>(),
   addConnection: (input: { exchange: string; label: string; apiKey: string; apiSecret: string }) =>
-    request<{ connection: ExchangeConnection }>("/api/connections", { method: "POST", body: JSON.stringify(input) }),
-  removeConnection: (id: string) => request<{ removed: boolean }>(`/api/connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    connectionRequest<{ connection: ExchangeConnection }>({ method: "POST", body: JSON.stringify(input) }),
+  removeConnection: (id: string) => connectionRequest<{ removed: boolean }>({ method: "DELETE", body: JSON.stringify({ id }), headers: { "content-type": "application/json", "x-connection-id": id } }),
   analysis: () => request<AnalysisResult>("/api/analysis"),
   markets: () => request<{ analyses: AnalysisResult[] }>("/api/markets"),
   risk: () => request<{ state: RiskState; limits: RiskConfig }>("/api/risk"),

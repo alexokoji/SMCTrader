@@ -2,7 +2,7 @@ import { MongoClient } from "mongodb";
 import type { MongoAuthService } from "../packages/api/src/auth.js";
 import type { ConnectionVault, ConnectionInput } from "../packages/api/src/connections.js";
 
-type RequestLike = { method?: string; headers: { cookie?: string }; body?: unknown };
+type RequestLike = { method?: string; headers: { cookie?: string }; body?: unknown; query?: { id?: string } };
 type ResponseLike = { status(code: number): ResponseLike; json(data: unknown): void };
 
 declare global {
@@ -44,7 +44,14 @@ export default async function handler(req: RequestLike, res: ResponseLike): Prom
       const connection = await vault.add(input as ConnectionInput);
       return res.status(201).json({ connection });
     }
-    return res.status(405).json({ error: "Use GET or POST." });
+    if (req.method === "DELETE") {
+      const requestBody = body(req);
+      const id = req.query?.id ?? (typeof requestBody.id === "string" ? requestBody.id : undefined);
+      if (!id) return res.status(400).json({ error: "Connection id is required." });
+      if (!(await vault.remove(id))) return res.status(404).json({ error: "Connection not found." });
+      return res.status(200).json({ removed: true });
+    }
+    return res.status(405).json({ error: "Use GET, POST, or DELETE." });
   } catch (error) {
     return res.status(400).json({ error: error instanceof Error ? error.message : "Connection request failed." });
   }

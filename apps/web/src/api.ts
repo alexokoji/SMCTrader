@@ -315,6 +315,7 @@ export const api = {
   auth: {
     me: () => authRequest<{ user: AuthUser | null }>("/session"),
     account: () => authRequest<{ account: StoredTradingAccount }>("/account"),
+    audit: () => authRequest<{ events: { action: string; detail: string; createdAt: number }[] }>("/audit"),
     savePaperState: (state: { positions: unknown[]; journal: unknown[]; activity: unknown[]; equity: number }) => authRequest<{ state: unknown }>("/paper-state", { method: "PUT", body: JSON.stringify(state) }),
     register: (email: string, password: string, name: string) => authRequest<{ user: AuthUser }>("/register", { method: "POST", body: JSON.stringify({ email, password, name }) }),
     login: (email: string, password: string) => authRequest<{ user: AuthUser }>("/login", { method: "POST", body: JSON.stringify({ email, password }) }),

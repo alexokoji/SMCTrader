@@ -156,7 +156,7 @@ export class MongoAuthService {
 
   async createGoogleAuthorizationUrl(): Promise<string> {
     if (!this.google) throw new Error("Google sign-in is not configured.");
-    const state = randomBytes(32).toString("base64url");
+    const state = bytesToBase64Url(randomBytes(32));
     await this.oauthStates.insertOne({ stateHash: sha256(state), expiresAt: new Date(Date.now() + OAUTH_STATE_TTL_MS) });
     const params = new URLSearchParams({ client_id: this.google.clientId, redirect_uri: this.google.redirectUri, response_type: "code", scope: "openid email profile", state, prompt: "select_account" });
     return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
@@ -243,7 +243,7 @@ export class MongoAuthService {
   }
 
   private async createSession(userId: string): Promise<string> {
-    const token = randomBytes(32).toString("base64url");
+    const token = bytesToBase64Url(randomBytes(32));
     await this.sessions.insertOne({ tokenHash: sha256(token), userId, createdAt: new Date(), expiresAt: new Date(Date.now() + SESSION_TTL_MS) });
     return token;
   }
@@ -255,9 +255,10 @@ function normalizeEmail(value: string): string {
   return email;
 }
 function normalizedName(name: string | undefined, email: string): string { return name?.trim().slice(0, 100) || email.split("@")[0]; }
-function cryptoId(): string { return randomBytes(18).toString("base64url"); }
+function cryptoId(): string { return bytesToBase64Url(randomBytes(18)); }
 function sha256(value: string): string { return createHash("sha256").update(value).digest("hex"); }
-async function hashPassword(password: string): Promise<string> { const salt = randomBytes(16).toString("base64url"); const key = await scrypt(password, salt, 64) as Buffer; return `${salt}:${key.toString("base64url")}`; }
+function bytesToBase64Url(bytes: Uint8Array): string { let binary = ""; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
+async function hashPassword(password: string): Promise<string> { const salt = bytesToBase64Url(randomBytes(16)); const key = await scrypt(password, salt, 64) as Buffer; return `${salt}:${bytesToBase64Url(key)}`; }
 async function verifyPassword(password: string, stored: string): Promise<boolean> { const [salt, hash] = stored.split(":"); if (!salt || !hash) return false; const expected = Buffer.from(hash, "base64url"); const actual = await scrypt(password, salt, expected.length) as Buffer; return expected.length === actual.length && timingSafeEqual(expected, actual); }
 function isPasswordValid(password: string): boolean { return typeof password === "string" && password.length >= 12 && password.length <= 256; }
 function publicUser(user: UserDocument): AuthUser { return { id: user.id, email: user.email, name: user.name }; }

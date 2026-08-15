@@ -244,7 +244,7 @@ export class ConnectionVault {
     const cipher = createCipheriv("aes-256-gcm", this.key, iv);
     const data = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
     const tag = cipher.getAuthTag();
-    return { iv: iv.toString("hex"), data: Buffer.concat([data, tag]).toString("hex") };
+    return { iv: bytesToHex(iv), data: bytesToHex(Buffer.concat([data, tag])) };
   }
 
   private decrypt(ivHex: string, dataHex: string): string {
@@ -254,9 +254,11 @@ export class ConnectionVault {
     const tag = raw.subarray(raw.length - 16);
     const decipher = createDecipheriv("aes-256-gcm", this.key, iv);
     decipher.setAuthTag(tag);
-    return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
+    return new TextDecoder().decode(Buffer.concat([decipher.update(data), decipher.final()]));
   }
 }
+
+function bytesToHex(bytes: Uint8Array): string { return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""); }
 
 export function maskKey(key: string): string {
   if (key.length <= 8) return `${"*".repeat(key.length)}`;

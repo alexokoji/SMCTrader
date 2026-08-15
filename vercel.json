@@ -1,5 +1,8 @@
 {
   "buildCommand": "npm run build -w @smc/web",
   "outputDirectory": "apps/web/dist",
-  "framework": null
+  "framework": null,
+  "rewrites": [
+    { "source": "/api/health", "destination": "/api/auth/session?health=1" }
+  ]
 }

@@ -5,7 +5,7 @@ import type { MongoAuthService } from "../../packages/api/src/auth.js";
 type VercelRequest = {
   method?: string;
   url?: string;
-  query: { route?: string | string[]; code?: string; state?: string };
+  query: { route?: string | string[]; code?: string; state?: string; health?: string };
   headers: { cookie?: string };
   body?: unknown;
 };
@@ -87,6 +87,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   const method = (req.method ?? "GET").toUpperCase();
   try {
     const service = await auth();
+    if (action === "session" && req.query.health === "1" && method === "GET") return res.status(200).json({ status: "ok", checks: { mongodb: "ok", authentication: "ok" }, timestamp: Date.now() });
     if ((action === "me" || action === "session") && method === "GET") return res.status(200).json({ user: await service.userForToken(token(req)) ?? null });
     if (action === "account" && (method === "GET" || method === "PATCH")) {
       const user = await service.userForToken(token(req));

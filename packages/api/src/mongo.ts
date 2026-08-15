@@ -14,6 +14,9 @@ export async function connectMongo(uri: string, databaseName = "smctrader"): Pro
   await client.connect();
   const database = client.db(databaseName);
   const exchangeConnections = database.collection<StoredExchangeConnection>("exchange_connections");
-  await exchangeConnections.createIndex({ id: 1 }, { unique: true });
+  await Promise.all([
+    exchangeConnections.createIndex({ id: 1 }, { unique: true }),
+    exchangeConnections.createIndex({ userId: 1, createdAt: -1 }),
+  ]);
   return { client, database, exchangeConnections, close: () => client.close() };
 }

@@ -41,6 +41,7 @@ export interface CredentialValidator {
 
 export interface StoredExchangeConnection {
   id: string;
+  userId?: string;
   exchange: string;
   label: string;
   apiKeyMasked: string;
@@ -73,6 +74,8 @@ export class ConnectionVault {
     validator?: (exchange: string) => CredentialValidator | undefined;
     encryptionKey?: string;
     collection?: Collection<StoredExchangeConnection>;
+    /** Scope this vault to one authenticated account when persistence is shared. */
+    userId?: string;
     onAudit?: ConnectionVault["onAudit"];
   }) {
     const raw =
@@ -97,14 +100,16 @@ export class ConnectionVault {
       });
     this.onAudit = opts.onAudit;
     this.collection = opts.collection;
+    this.userId = opts.userId;
   }
 
   private readonly collection?: Collection<StoredExchangeConnection>;
+  private readonly userId?: string;
 
   /** Restores encrypted credentials into the in-process lookup cache at startup. */
   async hydrate(): Promise<void> {
     if (!this.collection) return;
-    const records = await this.collection.find({}).toArray();
+    const records = await this.collection.find(this.userId ? { userId: this.userId } : {}).toArray();
     this.store = new Map(records.map((record) => [record.id, record]));
   }
 
@@ -165,6 +170,7 @@ export class ConnectionVault {
     const secretEnc = this.encrypt(input.apiSecret);
     const rec: StoredExchangeConnection = {
       id,
+      ...(this.userId ? { userId: this.userId } : {}),
       exchange,
       label: input.label,
       apiKeyMasked: masked,
@@ -196,7 +202,7 @@ export class ConnectionVault {
     const rec = this.store.get(id);
     if (!rec) return false;
     this.store.delete(id);
-    if (this.collection) await this.collection.deleteOne({ id });
+    if (this.collection) await this.collection.deleteOne(this.userId ? { id, userId: this.userId } : { id });
     this.onAudit?.({
       action: "CONNECTION_REMOVED",
       exchange: rec.exchange,

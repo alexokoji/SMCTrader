@@ -266,7 +266,10 @@ export function connectStream(handlers: StreamHandlers): () => void {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!workerToken || workerToken.expiresAt < Date.now() + 30_000) {
     const session = await fetch("/api/auth/token", { credentials: "include" });
-    if (!session.ok) throw new Error("Sign in is required.");
+    if (!session.ok) {
+      const body = await session.json().catch(() => ({})) as { error?: string };
+      throw new Error(body.error ?? `Unable to establish a trading session (${session.status}).`);
+    }
     const token = await session.json() as { token: string; expiresIn: number };
     workerToken = { value: token.token, expiresAt: Date.now() + token.expiresIn * 1000 };
   }

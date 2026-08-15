@@ -320,20 +320,27 @@ export const api = {
   health: () => request<Health>("/health"),
   status: () => request<ApiStatus>("/api/status"),
   config: () => request<{ strategy: Record<string, unknown>; risk: RiskConfig }>("/api/config"),
-  updateConfig: (patch: { strategy?: Record<string, unknown>; risk?: Partial<RiskConfig> }) =>
-    request<{ strategy: Record<string, unknown>; risk: RiskConfig }>("/api/config", {
+  updateConfig: async (patch: { strategy?: Record<string, unknown>; risk?: Partial<RiskConfig> }) => {
+    const result = await request<{ strategy: Record<string, unknown>; risk: RiskConfig }>("/api/config", {
       method: "PATCH",
       body: JSON.stringify(patch),
-    }),
+    });
+    if (patch.risk) await authRequest<{ account: unknown }>("/account", { method: "PATCH", body: JSON.stringify({ risk: patch.risk }) });
+    return result;
+  },
   setMode: (mode: TradingMode) => request<{ mode: TradingMode }>("/api/mode", {
     method: "POST",
     body: JSON.stringify({ mode }),
   }),
   assets: () => request<{ assets: string[] }>("/api/assets"),
-  updateAssets: (assets: string[]) => request<{ assets: string[] }>("/api/assets", {
-    method: "PUT",
-    body: JSON.stringify({ assets }),
-  }),
+  updateAssets: async (assets: string[]) => {
+    const result = await request<{ assets: string[] }>("/api/assets", {
+      method: "PUT",
+      body: JSON.stringify({ assets }),
+    });
+    await authRequest<{ account: unknown }>("/account", { method: "PATCH", body: JSON.stringify({ assets }) });
+    return result;
+  },
   connections: () => connectionRequest<{ connections: ExchangeConnection[]; available?: boolean; setupError?: string }>(),
   addConnection: (input: { exchange: string; label: string; apiKey: string; apiSecret: string }) =>
     connectionRequest<{ connection: ExchangeConnection }>({ method: "POST", body: JSON.stringify(input) }),

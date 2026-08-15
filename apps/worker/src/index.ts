@@ -265,6 +265,19 @@ export class TradingSession extends DurableObject<Env> {
     return { mode };
   }
 
+  async getLiveTradingReadiness(): Promise<Record<string, unknown>> {
+    return {
+      ready: false,
+      executionEnabled: false,
+      blockers: [
+        "Real exchange order adapters are not enabled.",
+        "Order idempotency and status reconciliation are required.",
+        "A trading-enabled, validated exchange connection is required.",
+        "An explicit live-trading approval gate is required.",
+      ],
+    };
+  }
+
   async getAssets(): Promise<string[]> {
     return (await this.ctx.storage.get<string[]>("assets")) ?? DEFAULT_ASSETS;
   }
@@ -309,6 +322,7 @@ export default {
     }
 
     if (url.pathname === "/api/analysis" && request.method === "GET") return json(request, env, await session.getAnalysis());
+    if (url.pathname === "/api/live-readiness" && request.method === "GET") return json(request, env, await session.getLiveTradingReadiness());
     if (url.pathname === "/api/markets" && request.method === "GET") return json(request, env, { analyses: await session.getMarketAnalyses() });
     if (url.pathname === "/api/risk" && request.method === "GET") return json(request, env, await session.getRisk());
     if (url.pathname === "/api/equity-history" && request.method === "GET") return json(request, env, { points: await session.getEquityHistory() });

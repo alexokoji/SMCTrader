@@ -46,6 +46,17 @@ interface AuditEventDocument {
   createdAt: Date;
 }
 
+interface PaperStateDocument {
+  userId: string;
+  positions: unknown[];
+  journal: unknown[];
+  activity: unknown[];
+  equity: number;
+  updatedAt: Date;
+}
+
+export interface PaperState { positions: unknown[]; journal: unknown[]; activity: unknown[]; equity: number; updatedAt: number; }
+
 export interface AuditEvent { action: string; detail: string; createdAt: number; }
 
 export interface TradingAccount {
@@ -75,6 +86,7 @@ export class MongoAuthService {
   private readonly oauthStates: Collection<OAuthStateDocument>;
   private readonly tradingAccounts: Collection<TradingAccountDocument>;
   private readonly auditEvents: Collection<AuditEventDocument>;
+  private readonly paperStates: Collection<PaperStateDocument>;
 
   constructor(database: Db, readonly google?: GoogleOAuthConfig) {
     this.users = database.collection<UserDocument>("users");
@@ -82,6 +94,7 @@ export class MongoAuthService {
     this.oauthStates = database.collection<OAuthStateDocument>("oauth_states");
     this.tradingAccounts = database.collection<TradingAccountDocument>("trading_accounts");
     this.auditEvents = database.collection<AuditEventDocument>("audit_events");
+    this.paperStates = database.collection<PaperStateDocument>("paper_states");
   }
 
   async initialize(): Promise<void> {
@@ -93,6 +106,7 @@ export class MongoAuthService {
       this.oauthStates.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.tradingAccounts.createIndex({ userId: 1 }, { unique: true }),
       this.auditEvents.createIndex({ userId: 1, createdAt: -1 }),
+      this.paperStates.createIndex({ userId: 1 }, { unique: true }),
     ]);
   }
 
@@ -191,6 +205,17 @@ export class MongoAuthService {
   async listAudit(userId: string, limit = 100): Promise<AuditEvent[]> {
     const events = await this.auditEvents.find({ userId }).sort({ createdAt: -1 }).limit(Math.min(Math.max(limit, 1), 200)).toArray();
     return events.map((event) => ({ action: event.action, detail: event.detail, createdAt: event.createdAt.getTime() }));
+  }
+
+  async savePaperState(userId: string, state: Omit<PaperState, "updatedAt">): Promise<PaperState> {
+    const updatedAt = new Date();
+    await this.paperStates.updateOne({ userId }, { $set: { userId, positions: state.positions.slice(0, 500), journal: state.journal.slice(0, 500), activity: state.activity.slice(0, 500), equity: state.equity, updatedAt } }, { upsert: true });
+    return { ...state, updatedAt: updatedAt.getTime() };
+  }
+
+  async getPaperState(userId: string): Promise<PaperState | undefined> {
+    const state = await this.paperStates.findOne({ userId });
+    return state ? { positions: state.positions, journal: state.journal, activity: state.activity, equity: state.equity, updatedAt: state.updatedAt.getTime() } : undefined;
   }
 
   async updateTradingAccount(userId: string, patch: { assets?: string[]; risk?: Record<string, number> }): Promise<TradingAccount> {

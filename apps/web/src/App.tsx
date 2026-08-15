@@ -53,6 +53,7 @@ function App() {
       const [s, a, marketResults, r, p, j, act, assetRes] = await Promise.all([api.status(), api.analysis(), api.markets(), api.risk(), api.positions(), api.journal(), api.activity(), api.assets()]);
       setStatus(s); setAnalysis(a); setMarketAnalyses(marketResults.analyses); setRisk(r); setPositions(p); setJournal(j.entries); setActivity(act.events); setAssets(assetRes.assets);
       setRiskForm({ maxTrades: String(r.limits.maxTradesPerDay), riskPct: String(r.limits.riskPerTrade), dailyLoss: String(r.limits.maxDailyLossPct), drawdown: String(r.limits.maxDrawdownPct), minRr: "3" });
+      void api.auth.savePaperState({ positions: p.all, journal: j.entries, activity: act.events, equity: r.state.equity });
       setError(null);
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
   }, []);

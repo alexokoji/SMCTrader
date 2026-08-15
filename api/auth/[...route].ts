@@ -104,6 +104,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
       if (!user) return res.status(401).json({ error: "Sign in is required." });
       return res.status(200).json({ events: await service.listAudit(user.id) });
     }
+    if (action === "paper-state" && (method === "GET" || method === "PUT")) {
+      const user = await service.userForToken(token(req));
+      if (!user) return res.status(401).json({ error: "Sign in is required." });
+      if (method === "GET") return res.status(200).json({ state: await service.getPaperState(user.id) ?? null });
+      const state = payload(req);
+      if (!Array.isArray(state.positions) || !Array.isArray(state.journal) || !Array.isArray(state.activity) || !Number.isFinite(state.equity)) return res.status(400).json({ error: "Invalid paper state." });
+      return res.status(200).json({ state: await service.savePaperState(user.id, { positions: state.positions, journal: state.journal, activity: state.activity, equity: state.equity as number }) });
+    }
     if (action === "token" && method === "GET") {
       const user = await service.userForToken(token(req));
       if (!user) return res.status(401).json({ error: "Sign in is required." });

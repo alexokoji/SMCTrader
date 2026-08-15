@@ -88,9 +88,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
   try {
     const service = await auth();
     if ((action === "me" || action === "session") && method === "GET") return res.status(200).json({ user: await service.userForToken(token(req)) ?? null });
-    if (action === "account" && method === "GET") {
+    if (action === "account" && (method === "GET" || method === "PATCH")) {
       const user = await service.userForToken(token(req));
       if (!user) return res.status(401).json({ error: "Sign in is required." });
+      if (method === "PATCH") {
+        const body = payload(req);
+        const assets = Array.isArray(body.assets) && body.assets.every((asset) => typeof asset === "string") ? body.assets as string[] : undefined;
+        const risk = body.risk && typeof body.risk === "object" ? body.risk as Record<string, number> : undefined;
+        return res.status(200).json({ account: await service.updateTradingAccount(user.id, { assets, risk }) });
+      }
       return res.status(200).json({ account: await service.getTradingAccount(user.id) });
     }
     if (action === "token" && method === "GET") {

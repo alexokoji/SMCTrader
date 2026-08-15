@@ -33,6 +33,8 @@ interface TradingAccountDocument {
   startingEquity: number;
   paperEquity: number;
   mode: "PAPER" | "ANALYSIS_ONLY" | "LIVE";
+  assets: string[];
+  risk: Record<string, number>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -42,6 +44,8 @@ export interface TradingAccount {
   startingEquity: number;
   paperEquity: number;
   mode: "PAPER" | "ANALYSIS_ONLY" | "LIVE";
+  assets: string[];
+  risk: Record<string, number>;
 }
 
 export interface AuthUser {
@@ -160,14 +164,29 @@ export class MongoAuthService {
     await this.ensureTradingAccount(userId);
     const account = await this.tradingAccounts.findOne({ userId });
     if (!account) throw new Error("Trading account could not be created.");
-    return { userId: account.userId, startingEquity: account.startingEquity, paperEquity: account.paperEquity, mode: account.mode };
+    return { userId: account.userId, startingEquity: account.startingEquity, paperEquity: account.paperEquity, mode: account.mode, assets: account.assets, risk: account.risk };
+  }
+
+  async updateTradingAccount(userId: string, patch: { assets?: string[]; risk?: Record<string, number> }): Promise<TradingAccount> {
+    const update: Partial<Pick<TradingAccountDocument, "assets" | "risk">> = {};
+    if (patch.assets) {
+      const assets = [...new Set(patch.assets.map((asset) => asset.trim().toUpperCase()).filter(Boolean))];
+      if (!assets.length || assets.length > 30 || assets.some((asset) => !/^[A-Z0-9]{3,30}(?:\/[A-Z0-9]{3,12})?$/.test(asset))) throw new Error("Provide 1–30 market pairs such as BTCUSDT.");
+      update.assets = assets;
+    }
+    if (patch.risk) {
+      if (Object.values(patch.risk).some((value) => !Number.isFinite(value))) throw new Error("Risk settings must be numeric.");
+      update.risk = patch.risk;
+    }
+    await this.tradingAccounts.updateOne({ userId }, { $set: { ...update, updatedAt: new Date() } });
+    return this.getTradingAccount(userId);
   }
 
   private async ensureTradingAccount(userId: string): Promise<void> {
     const now = new Date();
     await this.tradingAccounts.updateOne(
       { userId },
-      { $setOnInsert: { userId, startingEquity: 10_000, paperEquity: 10_000, mode: "PAPER", createdAt: now, updatedAt: now } },
+      { $setOnInsert: { userId, startingEquity: 10_000, paperEquity: 10_000, mode: "PAPER", assets: ["BTCUSDT", "ETHUSDT", "SOLUSDT"], risk: { riskPerTrade: 1, maxDailyLossPct: 3, maxDrawdownPct: 8 }, createdAt: now, updatedAt: now } },
       { upsert: true },
     );
   }

@@ -88,10 +88,35 @@ export class TradingSession extends DurableObject<Env> {
             exchange = "bybit";
           } catch {
             const pair = symbol.replace(/USDT$/, "-USD");
-            const response = await fetch(`https://api.exchange.coinbase.com/products/${encodeURIComponent(pair)}/candles?granularity=3600`, { signal: AbortSignal.timeout(8_000) });
-            if (!response.ok) throw new Error(`All market data providers failed; Coinbase returned ${response.status}`);
-            closes = ((await response.json()) as unknown[][]).reverse().map((row) => Number(row[4])).filter(Number.isFinite);
-            exchange = "coinbase";
+            try {
+              const response = await fetch(`https://api.exchange.coinbase.com/products/${encodeURIComponent(pair)}/candles?granularity=3600`, { signal: AbortSignal.timeout(8_000) });
+              if (!response.ok) throw new Error(`Coinbase returned ${response.status}`);
+              closes = ((await response.json()) as unknown[][]).reverse().map((row) => Number(row[4])).filter(Number.isFinite);
+              exchange = "coinbase";
+            } catch {
+              const instId = symbol.replace(/USDT$/, "-USDT");
+              try {
+                const response = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=1H&limit=60`, { signal: AbortSignal.timeout(8_000) });
+                const body = await response.json() as { code?: string; data?: string[][] };
+                if (!response.ok || body.code !== "0" || !body.data) throw new Error("OKX returned no candles");
+                closes = body.data.reverse().map((row) => Number(row[4])).filter(Number.isFinite);
+                exchange = "okx";
+              } catch {
+                try {
+                  const response = await fetch(`https://api.bitget.com/api/v2/spot/market/candles?symbol=${encodeURIComponent(symbol)}&granularity=1h&limit=60`, { signal: AbortSignal.timeout(8_000) });
+                  const body = await response.json() as { code?: string; data?: string[][] };
+                  if (!response.ok || body.code !== "00000" || !body.data) throw new Error("Bitget returned no candles");
+                  closes = body.data.reverse().map((row) => Number(row[4])).filter(Number.isFinite);
+                  exchange = "bitget";
+                } catch {
+                  const response = await fetch(`https://api.kucoin.com/api/v1/market/candles?symbol=${encodeURIComponent(instId)}&type=1hour`, { signal: AbortSignal.timeout(8_000) });
+                  const body = await response.json() as { code?: string; data?: string[][] };
+                  if (!response.ok || body.code !== "200000" || !body.data) throw new Error("All market data providers failed, including KuCoin.");
+                  closes = body.data.reverse().slice(-60).map((row) => Number(row[2])).filter(Number.isFinite);
+                  exchange = "kucoin";
+                }
+              }
+            }
           }
         }
       }

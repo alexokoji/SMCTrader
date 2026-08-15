@@ -39,6 +39,7 @@ export interface Health {
   status: string;
   timestamp: number;
 }
+export interface ProviderHealth { checkedAt?: number; providers?: { provider: string; status: "healthy" | "degraded" | "unavailable"; code: number }[]; provider?: string; status?: string; }
 export interface AuthUser { id: string; email: string; name: string; }
 export interface StoredTradingAccount { assets: string[]; risk: Partial<RiskConfig>; startingEquity: number; paperEquity: number; mode: string; }
 
@@ -321,6 +322,7 @@ export const api = {
     google: () => { window.location.assign("/api/auth/google"); },
   },
   health: () => request<Health>("/health"),
+  providerHealth: () => request<ProviderHealth>("/api/provider-health"),
   status: () => request<ApiStatus>("/api/status"),
   config: () => request<{ strategy: Record<string, unknown>; risk: RiskConfig }>("/api/config"),
   updateConfig: async (patch: { strategy?: Record<string, unknown>; risk?: Partial<RiskConfig> }) => {

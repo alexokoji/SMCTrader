@@ -3,7 +3,7 @@ import {
   api, connectStream,
   type ActivityEvent, type AnalysisResult, type ApiStatus, type BacktestResult,
   type ExchangeConnection, type JournalEntry, type Position, type RiskConfig,
-  type RiskState, type StreamState, type TradingMode, type AuthUser,
+  type RiskState, type StreamState, type TradingMode, type AuthUser, type ProviderHealth,
 } from "./api";
 
 type Page = "dashboard" | "markets" | "positions" | "paper" | "backtest" | "journal" | "settings" | "exchange" | "account";
@@ -44,15 +44,17 @@ function App() {
   const [connectionForm, setConnectionForm] = useState({ exchange: "binance", label: "", apiKey: "", apiSecret: "" });
   const [backtestForm, setBacktestForm] = useState({ start: "", end: "", equity: "10000" });
   const [backtest, setBacktest] = useState<BacktestResult | null>(null);
+  const [providerHealth, setProviderHealth] = useState<ProviderHealth | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
 
   const refresh = useCallback(async () => {
     try {
-      const [s, a, marketResults, r, p, j, act, assetRes] = await Promise.all([api.status(), api.analysis(), api.markets(), api.risk(), api.positions(), api.journal(), api.activity(), api.assets()]);
+      const [s, a, marketResults, r, p, j, act, assetRes, health] = await Promise.all([api.status(), api.analysis(), api.markets(), api.risk(), api.positions(), api.journal(), api.activity(), api.assets(), api.providerHealth()]);
       setStatus(s); setAnalysis(a); setMarketAnalyses(marketResults.analyses); setRisk(r); setPositions(p); setJournal(j.entries); setActivity(act.events); setAssets(assetRes.assets);
       setRiskForm({ maxTrades: String(r.limits.maxTradesPerDay), riskPct: String(r.limits.riskPerTrade), dailyLoss: String(r.limits.maxDailyLossPct), drawdown: String(r.limits.maxDrawdownPct), minRr: "3" });
+      setProviderHealth(health);
       void api.auth.savePaperState({ positions: p.all, journal: j.entries, activity: act.events, equity: r.state.equity });
       setError(null);
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
@@ -96,7 +98,7 @@ function App() {
   if (!authReady) return <div className="auth-shell"><main><div className="empty">Checking secure session…</div></main></div>;
   if (!user) return <div className="auth-shell"><main><div className="page-title"><div><p className="eyebrow">MIRAGE SMART MONEY OS</p><h1>Sign in to your workspace</h1><p>Your paper account and future exchange connections stay private.</p></div></div><div className="two-col"><Card title="Email and password"><div className="form-grid"><label>Name (registration)<input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}/></label><label>Email<input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}/></label><label>Password<input type="password" minLength={12} value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}/></label></div><div className="card-actions"><button className="primary" disabled={busy === "auth"} onClick={() => signIn(false)}>Sign in</button><button disabled={busy === "auth"} onClick={() => signIn(true)}>Create account</button></div>{error && <p className="helper bad">{error}</p>}<p className="helper">Passwords require at least 12 characters.</p></Card><Card title="Google sign-in"><p className="helper">Use your verified Google account.</p><button className="primary" onClick={() => api.auth.google()}>Continue with Google</button></Card></div></main></div>;
 
-  const overview = <>
+  const overview = <>{providerHealth?.providers && <div className="alert success"><b>Exchange data</b>{providerHealth.providers.filter((provider) => provider.status === "healthy").length}/{providerHealth.providers.length} public data providers healthy.<span>Updated {time(providerHealth.checkedAt)}</span></div>}
     <div className="hero"><div><p className="eyebrow">{status?.exchange ?? "EXCHANGE"} · {status?.symbol ?? "BTCUSDT"}</p><h1>Trading command center</h1><p>Rule-based Smart Money analysis, risk controls, and execution in one workspace.</p></div><div className="hero-actions"><button className="primary" onClick={() => void run("refresh", async () => { await refresh(); })}>{busy === "refresh" ? "Refreshing…" : "Refresh data"}</button><button className="danger" onClick={() => void run("stop", () => api.setAutoTrading(false))}>Emergency stop</button></div></div>
     <div className="metrics"><Metric label="Account equity" value={money(risk?.state.equity)} hint="Paper account"/><Metric label="Today P&L" value={money(risk?.state.realizedPnlToday)} tone={(risk?.state.realizedPnlToday ?? 0) >= 0 ? "good" : "bad"} hint={`${risk?.state.tradesToday ?? 0}/${risk?.limits.maxTradesPerDay ?? 10} trades used`}/><Metric label="Open positions" value={positions.open.length} hint={`Limit ${risk?.limits.maxOpenPositions ?? 5}`}/><Metric label="Market bias" value={analysis?.bias ?? "UNCLEAR"} tone={analysis?.bias === "BULLISH" ? "good" : analysis?.bias === "BEARISH" ? "bad" : undefined} hint={analysis?.status ?? "Waiting for analysis"}/></div>
     <div className="workspace-grid"><Card title="Automated trading" action={<Badge good={status?.autoTrading}>{status?.autoTrading ? "AUTOMATION ON" : "PAUSED"}</Badge>}><div className="mode-control">{(["ANALYSIS_ONLY", "PAPER", "LIVE"] as TradingMode[]).map((item) => <button key={item} className={mode === item ? "selected" : ""} onClick={() => changeMode(item)} disabled={busy === "mode"}>{item === "ANALYSIS_ONLY" ? "Analysis" : item === "PAPER" ? "Paper" : "Live"}</button>)}</div><p className="helper">Live mode requires a connected, trading-enabled exchange account. Paper mode uses the same strategy and risk engine without placing real orders.</p><div className="control-row"><span>Safety state</span><Badge good={safetyOk}>{safetyOk ? "CLEAR" : "SAFE MODE"}</Badge></div><div className="control-row"><span>Data connection</span><Badge good={!status?.feed?.lastError}>{status?.feed?.lastError ? "DEGRADED" : "HEALTHY"}</Badge></div><div className="card-actions"><button onClick={() => void run("auto", () => api.setAutoTrading(!status?.autoTrading))}>{status?.autoTrading ? "Pause automation" : "Enable automation"}</button><button onClick={() => void run("safe", () => status?.safetyBlocked ? api.exitSafeMode() : api.enterSafeMode("Manual safety stop"))}>{status?.safetyBlocked ? "Exit safe mode" : "Enter safe mode"}</button></div></Card>

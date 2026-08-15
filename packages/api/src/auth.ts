@@ -39,6 +39,15 @@ interface TradingAccountDocument {
   updatedAt: Date;
 }
 
+interface AuditEventDocument {
+  userId: string;
+  action: string;
+  detail: string;
+  createdAt: Date;
+}
+
+export interface AuditEvent { action: string; detail: string; createdAt: number; }
+
 export interface TradingAccount {
   userId: string;
   startingEquity: number;
@@ -65,12 +74,14 @@ export class MongoAuthService {
   private readonly sessions: Collection<SessionDocument>;
   private readonly oauthStates: Collection<OAuthStateDocument>;
   private readonly tradingAccounts: Collection<TradingAccountDocument>;
+  private readonly auditEvents: Collection<AuditEventDocument>;
 
   constructor(database: Db, readonly google?: GoogleOAuthConfig) {
     this.users = database.collection<UserDocument>("users");
     this.sessions = database.collection<SessionDocument>("sessions");
     this.oauthStates = database.collection<OAuthStateDocument>("oauth_states");
     this.tradingAccounts = database.collection<TradingAccountDocument>("trading_accounts");
+    this.auditEvents = database.collection<AuditEventDocument>("audit_events");
   }
 
   async initialize(): Promise<void> {
@@ -81,6 +92,7 @@ export class MongoAuthService {
       this.sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.oauthStates.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       this.tradingAccounts.createIndex({ userId: 1 }, { unique: true }),
+      this.auditEvents.createIndex({ userId: 1, createdAt: -1 }),
     ]);
   }
 
@@ -98,6 +110,7 @@ export class MongoAuthService {
       throw error;
     }
     await this.ensureTradingAccount(user.id);
+    await this.recordAudit(user.id, "ACCOUNT_REGISTERED", "Password account created.");
     return { user: publicUser(user), token: await this.createSession(user.id) };
   }
 
@@ -107,6 +120,7 @@ export class MongoAuthService {
       throw new Error("Invalid email or password.");
     }
     await this.ensureTradingAccount(user.id);
+    await this.recordAudit(user.id, "SIGNED_IN", "Password sign-in completed.");
     return { user: publicUser(user), token: await this.createSession(user.id) };
   }
 
@@ -121,7 +135,9 @@ export class MongoAuthService {
   }
 
   async logout(token: string | undefined): Promise<void> {
-    if (token) await this.sessions.deleteOne({ tokenHash: sha256(token) });
+    if (!token) return;
+    const session = await this.sessions.findOneAndDelete({ tokenHash: sha256(token) });
+    if (session) await this.recordAudit(session.userId, "SIGNED_OUT", "Session ended.");
   }
 
   async createGoogleAuthorizationUrl(): Promise<string> {
@@ -157,6 +173,7 @@ export class MongoAuthService {
       user.googleSubject = profile.sub;
     }
     await this.ensureTradingAccount(user.id);
+    await this.recordAudit(user.id, "GOOGLE_SIGNED_IN", "Google sign-in completed.");
     return { user: publicUser(user), token: await this.createSession(user.id) };
   }
 
@@ -165,6 +182,15 @@ export class MongoAuthService {
     const account = await this.tradingAccounts.findOne({ userId });
     if (!account) throw new Error("Trading account could not be created.");
     return { userId: account.userId, startingEquity: account.startingEquity, paperEquity: account.paperEquity, mode: account.mode, assets: account.assets, risk: account.risk };
+  }
+
+  async recordAudit(userId: string, action: string, detail: string): Promise<void> {
+    await this.auditEvents.insertOne({ userId, action, detail: detail.slice(0, 500), createdAt: new Date() });
+  }
+
+  async listAudit(userId: string, limit = 100): Promise<AuditEvent[]> {
+    const events = await this.auditEvents.find({ userId }).sort({ createdAt: -1 }).limit(Math.min(Math.max(limit, 1), 200)).toArray();
+    return events.map((event) => ({ action: event.action, detail: event.detail, createdAt: event.createdAt.getTime() }));
   }
 
   async updateTradingAccount(userId: string, patch: { assets?: string[]; risk?: Record<string, number> }): Promise<TradingAccount> {

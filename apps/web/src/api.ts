@@ -42,6 +42,7 @@ export interface Health {
 export interface ProviderHealth { checkedAt?: number; providers?: { provider: string; status: "healthy" | "degraded" | "unavailable"; code: number }[]; provider?: string; status?: string; }
 export interface AuthUser { id: string; email: string; name: string; }
 export interface StoredTradingAccount { assets: string[]; risk: Partial<RiskConfig>; startingEquity: number; paperEquity: number; mode: string; }
+export interface PaperStateSnapshot { positions: unknown[]; journal: unknown[]; activity: unknown[]; equity: number; updatedAt: number; }
 
 export interface TopDown {
   htf: { timeframe: string; trend: string; strength: string; poi?: string; liquidity?: string };
@@ -205,20 +206,25 @@ function apiUrl(path: string): string {
  * backoff. Returns a function that disconnects. See stream.ts on the API side.
  */
 export function connectStream(handlers: StreamHandlers): () => void {
-  // The Cloudflare compatibility API is request/response based for now. Do not
-  // repeatedly open a WebSocket against the Vercel static deployment.
-  if (apiBaseUrl && !websocketBaseUrl) {
-    handlers.onStatus(false);
-    return () => undefined;
-  }
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
-  const url = websocketBaseUrl || `${proto}://${window.location.host}/ws`;
+  const derivedWorkerUrl = apiBaseUrl ? `${apiBaseUrl.replace(/^http/, "ws")}/api/events` : `${proto}://${window.location.host}/ws`;
+  const configuredWebSocketUrl = websocketBaseUrl.replace(/^http/, "ws");
+  const url = configuredWebSocketUrl ? (configuredWebSocketUrl.endsWith("/api/events") ? configuredWebSocketUrl : `${configuredWebSocketUrl}/api/events`) : derivedWorkerUrl;
   let ws: WebSocket | null = null;
   let closed = false;
   let retry = 0;
 
-  function open(): void {
-    ws = new WebSocket(url);
+  async function open(): Promise<void> {
+    try {
+      const token = await ensureWorkerToken();
+      if (closed) return;
+      ws = new WebSocket(url, ["smc-v1", token]);
+    } catch (error) {
+      handlers.onStatus(false);
+      handlers.onSystem("error", error instanceof Error ? error.message : "Unable to authenticate the live event stream.");
+      if (!closed) setTimeout(() => void open(), Math.min(1000 * 2 ** ++retry, 15000));
+      return;
+    }
     ws.onopen = () => {
       retry = 0;
       handlers.onStatus(true);
@@ -243,7 +249,7 @@ export function connectStream(handlers: StreamHandlers): () => void {
       handlers.onStatus(false);
       if (closed) return;
       retry += 1;
-      setTimeout(open, Math.min(1000 * 2 ** retry, 15000));
+      setTimeout(() => void open(), Math.min(1000 * 2 ** retry, 15000));
     };
     ws.onerror = () => {
       try {
@@ -254,7 +260,7 @@ export function connectStream(handlers: StreamHandlers): () => void {
     };
   }
 
-  open();
+  void open();
   return () => {
     closed = true;
     try {
@@ -265,7 +271,7 @@ export function connectStream(handlers: StreamHandlers): () => void {
   };
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function ensureWorkerToken(): Promise<string> {
   if (!workerToken || workerToken.expiresAt < Date.now() + 30_000) {
     const session = await fetch("/api/auth/token", { credentials: "include" });
     if (!session.ok) {
@@ -275,8 +281,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const token = await session.json() as { token: string; expiresIn: number };
     workerToken = { value: token.token, expiresAt: Date.now() + token.expiresIn * 1000 };
   }
+  return workerToken.value;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = await ensureWorkerToken();
   const res = await fetch(apiUrl(path), {
-    headers: { "content-type": "application/json", authorization: `Bearer ${workerToken.value}` },
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     ...init,
   });
   if (!res.ok) {
@@ -316,6 +327,7 @@ export const api = {
     me: () => authRequest<{ user: AuthUser | null }>("/session"),
     account: () => authRequest<{ account: StoredTradingAccount }>("/account"),
     audit: () => authRequest<{ events: { action: string; detail: string; createdAt: number }[] }>("/audit"),
+    paperState: () => authRequest<{ state: PaperStateSnapshot | null }>("/paper-state"),
     savePaperState: (state: { positions: unknown[]; journal: unknown[]; activity: unknown[]; equity: number }) => authRequest<{ state: unknown }>("/paper-state", { method: "PUT", body: JSON.stringify(state) }),
     register: (email: string, password: string, name: string) => authRequest<{ user: AuthUser }>("/register", { method: "POST", body: JSON.stringify({ email, password, name }) }),
     login: (email: string, password: string) => authRequest<{ user: AuthUser }>("/login", { method: "POST", body: JSON.stringify({ email, password }) }),
@@ -354,6 +366,8 @@ export const api = {
   analysis: () => request<AnalysisResult>("/api/analysis"),
   markets: () => request<{ analyses: AnalysisResult[] }>("/api/markets"),
   risk: () => request<{ state: RiskState; limits: RiskConfig }>("/api/risk"),
+  equityHistory: () => request<{ points: { timestamp: number; equity: number }[] }>("/api/equity-history"),
+  restorePaperState: (state: PaperStateSnapshot) => request<{ restored: boolean; reason?: string }>("/api/paper-state/restore", { method: "PUT", body: JSON.stringify(state) }),
   positions: () => request<{ open: Position[]; all: Position[] }>("/api/positions"),
   journal: () => request<{ entries: JournalEntry[] }>("/api/journal"),
   activity: () => request<{ events: ActivityEvent[] }>("/api/activity"),

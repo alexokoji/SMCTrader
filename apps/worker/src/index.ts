@@ -29,7 +29,12 @@ function json(request: Request, env: Env, body: unknown, status = 200): Response
 }
 
 async function authenticatedUser(request: Request, env: Env): Promise<string | undefined> {
-  const value = request.headers.get("authorization");
+  let value = request.headers.get("authorization");
+  if (!value) {
+    const protocols = request.headers.get("sec-websocket-protocol")?.split(",").map((item) => item.trim()) ?? [];
+    const protocolToken = protocols.find((item) => item.includes("."));
+    if (protocolToken) value = `Bearer ${protocolToken}`;
+  }
   if (!env.WORKER_AUTH_SECRET || !value?.startsWith("Bearer ")) return undefined;
   const [payload, signature] = value.slice(7).split(".");
   if (!payload || !signature) return undefined;
@@ -49,6 +54,34 @@ function baseState(mode: RuntimeMode, assets: string[]) {
 }
 
 export class TradingSession extends DurableObject<Env> {
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("WebSocket upgrade required", { status: 426 });
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.ctx.acceptWebSocket(server);
+    server.send(JSON.stringify({ type: "state", payload: await this.getStreamState() }));
+    return new Response(null, { status: 101, webSocket: client, headers: { "sec-websocket-protocol": "smc-v1" } });
+  }
+
+  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (message === "ping") socket.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
+  }
+
+  async getStreamState(): Promise<Record<string, unknown>> {
+    const [mode, assets, positions, risk, journal, activity, config, autoTrading, safetyBlocked] = await Promise.all([
+      this.getMode(), this.getAssets(), this.getPositions(), this.getRisk(), this.getJournal(), this.getActivity(), this.getConfig(), this.isAutoTrading(), this.isSafetyBlocked(),
+    ]);
+    const analysis = (await this.ctx.storage.get<Record<string, unknown>>("analysis")) ?? { symbol: assets[0] ?? "BTCUSDT", bias: "NEUTRAL", status: "WAITING", setups: [], events: [] };
+    const status = { ...baseState(mode, assets), autoTrading, safetyBlocked };
+    return { status, analysis, risk, positions: { open: positions.filter((position) => position.status === "OPEN"), all: positions }, journal: { entries: journal }, activity: { events: activity }, config, configuredAssets: assets, timestamp: Date.now() };
+  }
+
+  async broadcastState(): Promise<void> {
+    const sockets = this.ctx.getWebSockets();
+    if (!sockets.length) return;
+    const frame = JSON.stringify({ type: "state", payload: await this.getStreamState() });
+    for (const socket of sockets) { try { socket.send(frame); } catch { /* stale sockets are cleaned up by the runtime */ } }
+  }
   async allowRequest(limit = 120, windowMs = 60_000): Promise<boolean> {
     const now = Date.now();
     const recent = ((await this.ctx.storage.get<number[]>("requestTimestamps")) ?? []).filter((timestamp) => timestamp > now - windowMs);
@@ -187,7 +220,7 @@ export class TradingSession extends DurableObject<Env> {
         if (!hitStop && !hitTarget) return { ...position, currentPrice: price, unrealizedPnl: pnl };
         const reason = hitStop ? "STOP_LOSS" : "TAKE_PROFIT";
         journal.unshift({ timestamp: Date.now(), symbol, category: "PAPER_TRADE", title: `Paper position closed: ${reason}`, body: `Realized P&L: ${pnl.toFixed(2)}`, data: { pnl, reason } });
-        return { ...position, currentPrice: price, unrealizedPnl: 0, realizedPnl: pnl, exitFee, status: "CLOSED", closedAt: Date.now(), closeReason: reason };
+        return { ...position, currentPrice: price, unrealizedPnl: 0, realizedPnl: Number(position.realizedPnl ?? 0) + pnl, exitFee, status: "CLOSED", closedAt: Date.now(), closeReason: reason };
       });
       await this.ctx.storage.put({ positions: markedPositions, journal: journal.slice(0, 200) });
       const autoTrading = (await this.ctx.storage.get<boolean>("autoTrading")) ?? false;
@@ -196,9 +229,13 @@ export class TradingSession extends DurableObject<Env> {
       if (autoTrading && !safetyBlocked && mode === "PAPER" && score >= 65) {
         const open = markedPositions;
         if (!open.some((position) => position.symbol === symbol && position.status === "OPEN")) {
-          const feePct = ((await this.ctx.storage.get<Record<string, number>>("risk"))?.feePct ?? DEFAULT_RISK.feePct) / 100;
-          const position = { symbol, direction, setupId: setup.id, entry: price, currentPrice: price, positionSize: 0.01, notional: price * 0.01, entryFee: price * 0.01 * feePct, stopLoss, takeProfits: [takeProfitOne, takeProfit], unrealizedPnl: 0, status: "OPEN", openedAt: Date.now() };
-          await this.ctx.storage.put({ positions: [...open, position], activity: [{ kind: "PAPER_ENTRY", symbol, detail: `Paper ${direction} opened from qualified analysis`, level: "info", timestamp: Date.now() }], journal: [{ timestamp: Date.now(), symbol, category: "PAPER_TRADE", title: `Paper ${direction} opened`, body: `Entry ${price}`, data: { entry: price, stopLoss, takeProfit } }, ...journal].slice(0, 200) });
+          const configuredRisk = (await this.ctx.storage.get<Record<string, number>>("risk")) ?? {};
+          const feePct = (configuredRisk.feePct ?? DEFAULT_RISK.feePct) / 100;
+          const slippagePct = (configuredRisk.slippagePct ?? DEFAULT_RISK.slippagePct) / 100;
+          const fillPrice = direction === "LONG" ? price * (1 + slippagePct) : price * (1 - slippagePct);
+          const position = { symbol, direction, setupId: setup.id, signalPrice: price, entry: fillPrice, currentPrice: price, positionSize: 0.01, notional: fillPrice * 0.01, entryFee: fillPrice * 0.01 * feePct, entrySlippage: Math.abs(fillPrice - price) * 0.01, stopLoss, takeProfits: [takeProfitOne, takeProfit], realizedPnl: 0, unrealizedPnl: 0, status: "OPEN", openedAt: Date.now() };
+          const previousActivity = (await this.ctx.storage.get<Record<string, unknown>[]>("activity")) ?? [];
+          await this.ctx.storage.put({ positions: [...open, position], activity: [{ kind: "PAPER_ENTRY", symbol, detail: `Paper ${direction} opened from qualified analysis at ${fillPrice.toFixed(2)} including slippage`, level: "info", timestamp: Date.now() }, ...previousActivity].slice(0, 200), journal: [{ timestamp: Date.now(), symbol, category: "PAPER_TRADE", title: `Paper ${direction} opened`, body: `Signal ${price}; simulated fill ${fillPrice}`, data: { signalPrice: price, fillPrice, stopLoss, takeProfit } }, ...journal].slice(0, 200) });
         }
       }
       if (!symbolOverride && assets.length > 1) {
@@ -206,6 +243,7 @@ export class TradingSession extends DurableObject<Env> {
         for (const asset of assets.slice(1)) scans.push(await this.runAnalysis(asset));
         await this.ctx.storage.put({ analysis, marketAnalyses: scans });
       }
+      if (!symbolOverride) await this.broadcastState();
       return analysis;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Market data request failed";
@@ -223,7 +261,7 @@ export class TradingSession extends DurableObject<Env> {
   async getRisk(): Promise<Record<string, unknown>> {
     const positions = await this.getPositions();
     const open = positions.filter((position) => position.status === "OPEN");
-    const realized = positions.filter((position) => position.status === "CLOSED").reduce((sum, position) => sum + Number(position.realizedPnl ?? 0), 0);
+    const realized = positions.reduce((sum, position) => sum + Number(position.realizedPnl ?? 0), 0);
     const unrealized = open.reduce((sum, position) => sum + Number(position.unrealizedPnl ?? 0), 0);
     const equity = 10_000 + realized + unrealized;
     const exposure = open.reduce((sum, position) => sum + Number(position.notional ?? 0), 0);
@@ -234,6 +272,23 @@ export class TradingSession extends DurableObject<Env> {
     return { state: { equity, equityDayStart: 10_000, peakEquity: Math.max(10_000, equity), tradesToday: positions.length, realizedPnlToday: realized, openPositions: open, usedExposure: exposure, usedCorrelatedExposure: exposure, dailyLossReached: realized <= -(10_000 * limits.maxDailyLossPct / 100), drawdownReached: equity <= 10_000 * (1 - limits.maxDrawdownPct / 100) }, limits };
   }
   async getEquityHistory(): Promise<{ timestamp: number; equity: number }[]> { return (await this.ctx.storage.get<{ timestamp: number; equity: number }[]>("equityHistory")) ?? []; }
+  async restorePaperState(state: { positions?: unknown[]; journal?: unknown[]; activity?: unknown[]; equity?: number; updatedAt?: number }): Promise<{ restored: boolean; reason?: string }> {
+    const existing = await this.getPositions();
+    const existingJournal = await this.getJournal();
+    if (existing.length || existingJournal.length) return { restored: false, reason: "The active Worker session already contains paper state." };
+    if (!Array.isArray(state.positions) || !Array.isArray(state.journal) || !Array.isArray(state.activity) || !Number.isFinite(state.equity)) {
+      throw new Error("A valid MongoDB paper-state snapshot is required.");
+    }
+    const timestamp = Number.isFinite(state.updatedAt) ? Number(state.updatedAt) : Date.now();
+    await this.ctx.storage.put({
+      positions: state.positions.slice(0, 500) as Record<string, unknown>[],
+      journal: state.journal.slice(0, 500) as Record<string, unknown>[],
+      activity: state.activity.slice(0, 500) as Record<string, unknown>[],
+      equityHistory: [{ timestamp, equity: Number(state.equity) }],
+      restoredAt: Date.now(),
+    });
+    return { restored: true };
+  }
   async getProviderHealth(): Promise<Record<string, unknown>> { return (await this.ctx.storage.get<Record<string, unknown>>("providerHealth")) ?? { provider: "unknown", status: "pending" }; }
   async getConfig(): Promise<Record<string, unknown>> { return { strategy: (await this.ctx.storage.get<Record<string, unknown>>("strategy")) ?? { version: "cloudflare-paper-v1" }, risk: { ...DEFAULT_RISK, ...((await this.ctx.storage.get<Record<string, number>>("risk")) ?? {}) } }; }
   async updateConfig(patch: { strategy?: Record<string, unknown>; risk?: Record<string, number> }): Promise<Record<string, unknown>> { const current = await this.getConfig(); const risk = { ...(current.risk as Record<string, number>), ...(patch.risk ?? {}) }; await this.ctx.storage.put({ risk, strategy: { ...(current.strategy as Record<string, unknown>), ...(patch.strategy ?? {}) } }); return this.getConfig(); }
@@ -304,6 +359,8 @@ export default {
     const [mode, assets] = await Promise.all([session.getMode(), session.getAssets()]);
     const state = baseState(mode, assets);
 
+    if (url.pathname === "/api/events" && request.headers.get("upgrade")?.toLowerCase() === "websocket") return session.fetch(request);
+
     if (url.pathname === "/api/status" && request.method === "GET") {
       const [analysis, positions, autoTrading, safetyBlocked] = await Promise.all([session.getAnalysis(), session.getPositions(), session.isAutoTrading(), session.isSafetyBlocked()]);
       return json(request, env, { ...state, autoTrading, safetyBlocked, analysis, positions, feed: { ...state.feed, running: true, candlesFed: 60, cyclesProcessed: 1 } });
@@ -326,13 +383,17 @@ export default {
     if (url.pathname === "/api/markets" && request.method === "GET") return json(request, env, { analyses: await session.getMarketAnalyses() });
     if (url.pathname === "/api/risk" && request.method === "GET") return json(request, env, await session.getRisk());
     if (url.pathname === "/api/equity-history" && request.method === "GET") return json(request, env, { points: await session.getEquityHistory() });
+    if (url.pathname === "/api/paper-state/restore" && request.method === "PUT") {
+      const body = (await request.json().catch(() => ({}))) as { positions?: unknown[]; journal?: unknown[]; activity?: unknown[]; equity?: number; updatedAt?: number };
+      try { return json(request, env, await session.restorePaperState(body)); } catch (error) { return json(request, env, { error: error instanceof Error ? error.message : "Paper state restoration failed." }, 400); }
+    }
     if (url.pathname === "/api/provider-health" && request.method === "GET") return json(request, env, await session.getProviderHealth());
     if (url.pathname === "/api/config") {
       if (request.method === "GET") return json(request, env, await session.getConfig());
       if (request.method === "PATCH") { const body = (await request.json().catch(() => ({}))) as { strategy?: Record<string, unknown>; risk?: Record<string, number> }; return json(request, env, await session.updateConfig(body)); }
     }
     if (url.pathname === "/api/backtest" && request.method === "POST") { const body = (await request.json().catch(() => ({}))) as { startTime?: number; endTime?: number; startingEquity?: number }; if (!Number.isFinite(body.startTime) || !Number.isFinite(body.endTime) || body.endTime! <= body.startTime!) return json(request, env, { error: "A valid start and end time are required." }, 400); try { return json(request, env, await session.runBacktest(body.startTime!, body.endTime!, body.startingEquity)); } catch (error) { return json(request, env, { error: error instanceof Error ? error.message : "Backtest failed" }, 400); } }
-    if (url.pathname === "/api/positions" && request.method === "GET") { const positions = await session.getPositions(); return json(request, env, { open: positions, all: positions }); }
+    if (url.pathname === "/api/positions" && request.method === "GET") { const positions = await session.getPositions() as unknown as Record<string, unknown>[]; return json(request, env, { open: positions.filter((position) => position.status === "OPEN"), all: positions }); }
     if (url.pathname === "/api/journal" && request.method === "GET") return json(request, env, { entries: await session.getJournal() });
     if (url.pathname === "/api/activity" && request.method === "GET") return json(request, env, { events: await session.getActivity() });
     if (url.pathname === "/api/autotrading" && request.method === "POST") {

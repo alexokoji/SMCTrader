@@ -42,6 +42,7 @@ export default async function handler(req: RequestLike, res: ResponseLike): Prom
       const input = body(req) as Partial<ConnectionInput>;
       if (input.exchange !== "binance") return res.status(400).json({ error: "Only Binance credential validation is available today. Other exchanges remain market-data only." });
       const connection = await vault.add(input as ConnectionInput);
+      await service.recordAudit(user.id, "EXCHANGE_CONNECTED", `${connection.exchange} connection "${connection.label}" validated and stored encrypted.`);
       return res.status(201).json({ connection });
     }
     if (req.method === "DELETE") {
@@ -49,6 +50,7 @@ export default async function handler(req: RequestLike, res: ResponseLike): Prom
       const id = req.query?.id ?? (typeof requestBody.id === "string" ? requestBody.id : undefined);
       if (!id) return res.status(400).json({ error: "Connection id is required." });
       if (!(await vault.remove(id))) return res.status(404).json({ error: "Connection not found." });
+      await service.recordAudit(user.id, "EXCHANGE_DISCONNECTED", "Encrypted exchange connection removed.");
       return res.status(200).json({ removed: true });
     }
     return res.status(405).json({ error: "Use GET, POST, or DELETE." });

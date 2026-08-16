@@ -16,7 +16,10 @@ export class MultiExchangeMarketData implements MarketDataProvider {
 
   constructor(opts: { exchanges?: PublicExchange[]; fetchFn?: typeof fetch; timeoutMs?: number } = {}) {
     this.exchanges = opts.exchanges?.length ? opts.exchanges : ["binance", "bybit", "bitget", "okx", "kucoin"];
-    this.fetchFn = opts.fetchFn ?? fetch;
+    // The global fetch must keep its original receiver. Storing it bare and
+    // calling it as `this.fetchFn(...)` makes `this` the provider instance,
+    // which the Cloudflare Workers runtime rejects with "Illegal invocation".
+    this.fetchFn = opts.fetchFn ?? ((input, init) => globalThis.fetch(input, init));
     this.timeoutMs = Math.max(1_000, opts.timeoutMs ?? 8_000);
   }
 

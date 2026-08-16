@@ -50,7 +50,8 @@ export class BinanceMarketData implements MarketDataProvider {
       "https://api3.binance.com",
       "https://data-api.binance.vision",
     ].map((url) => url.replace(/\/$/, "")))];
-    this.fetchFn = opts.fetchFn ?? fetch;
+    // Preserve the global fetch's receiver; see MultiExchangeMarketData.
+    this.fetchFn = opts.fetchFn ?? ((input, init) => globalThis.fetch(input, init));
     this.timeoutMs = Math.max(1_000, opts.timeoutMs ?? 12_000);
   }
 

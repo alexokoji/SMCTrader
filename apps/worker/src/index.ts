@@ -293,6 +293,22 @@ export class TradingSession extends DurableObject<Env> {
     }
   }
 
+  // ---- session registry -------------------------------------------------
+  // A dedicated instance of this class (named "registry") tracks which accounts
+  // have an analysis loop, so the cron can re-arm them. Sessions are per user
+  // and a cron invocation has no user context of its own.
+
+  async registerSession(userId: string): Promise<void> {
+    const users = (await this.ctx.storage.get<string[]>("knownUsers")) ?? [];
+    if (!users.includes(userId)) {
+      await this.ctx.storage.put("knownUsers", [...users, userId].slice(-1_000));
+    }
+  }
+
+  async listSessions(): Promise<string[]> {
+    return (await this.ctx.storage.get<string[]>("knownUsers")) ?? [];
+  }
+
   /**
    * Ship whatever is new since the last successful write to MongoDB. Watermarks
    * are only advanced when the write succeeds, so a failed or skipped batch is
@@ -579,6 +595,32 @@ export class TradingSession extends DurableObject<Env> {
 }
 
 export default {
+  /**
+   * Cron watchdog. Analysis itself runs in each account's Durable Object alarm,
+   * which self-reschedules and gets its own CPU budget per invocation. This
+   * handler only re-arms alarms that have stopped, so the engine recovers
+   * without waiting for someone to open the dashboard. Doing the analysis here
+   * instead would put every account into a single invocation's CPU budget.
+   */
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil((async () => {
+      const registry = env.TRADING_SESSION.getByName("registry");
+      const users = await registry.listSessions();
+      for (const userId of users) {
+        try {
+          await env.TRADING_SESSION.getByName(`user:${userId}`).ensureAnalysisAlarm();
+        } catch (error) {
+          console.error(JSON.stringify({
+            event: "alarm_rearm_failed",
+            message: error instanceof Error ? error.message : String(error),
+            timestamp: Date.now(),
+          }));
+        }
+      }
+      console.log(JSON.stringify({ event: "cron_rearm", sessions: users.length, timestamp: Date.now() }));
+    })());
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders(request, env) });
     const url = new URL(request.url);
@@ -592,6 +634,8 @@ export default {
     // belongs to in order to scope its durable writes.
     await session.setUserId(userId);
     await session.ensureAnalysisAlarm();
+    // Let the cron watchdog find this account if its alarm ever stops.
+    await env.TRADING_SESSION.getByName("registry").registerSession(userId);
     const [mode, assets] = await Promise.all([session.getMode(), session.getAssets()]);
     const state = baseState(mode, assets);
 

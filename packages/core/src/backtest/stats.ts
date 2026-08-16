@@ -42,7 +42,10 @@ export function computeStats(
   const wins = trades.filter((t) => t.pnl > 0);
   const losses = trades.filter((t) => t.pnl <= 0);
   const grossProfit = wins.reduce((a, t) => a + t.pnl, 0);
-  const grossLoss = losses.reduce((a, t) => a + t.pnl, 0);
+  // Losing trades carry non-positive pnl, so the gross loss is summed and then
+  // taken as a magnitude. Comparing the raw (negative) sum against zero would
+  // never hold and would report every profitable run as an infinite factor.
+  const grossLoss = Math.abs(losses.reduce((a, t) => a + t.pnl, 0));
   const netPnl = trades.reduce((a, t) => a + t.pnl, 0);
 
   let maxConsecutiveWins = 0;
@@ -120,7 +123,7 @@ export function computeStats(
     winRate: trades.length ? (wins.length / trades.length) * 100 : 0,
     netPnl,
     grossProfit,
-    grossLoss: Math.abs(grossLoss),
+    grossLoss,
     profitFactor: grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0,
     expectancy: trades.length ? netPnl / trades.length : 0,
     avgTrade: trades.length ? netPnl / trades.length : 0,

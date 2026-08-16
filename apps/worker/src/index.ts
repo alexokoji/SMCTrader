@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DEFAULT_RISK_CONFIG } from "@smc/core";
+import { DEFAULT_RISK_CONFIG, computePerformance, type ManagedPosition, type Setup } from "@smc/core";
 import { TradingRuntime, type AnalysisTick, type RuntimeStorage } from "./runtime.js";
 
 interface Env {
@@ -366,6 +366,65 @@ export class TradingSession extends DurableObject<Env> {
     };
   }
   async getEquityHistory(): Promise<{ timestamp: number; equity: number }[]> { return (await this.ctx.storage.get<{ timestamp: number; equity: number }[]>("equityHistory")) ?? []; }
+
+  /**
+   * §60 analytics, measured by the same code the backtester uses so paper,
+   * live and historical results are directly comparable.
+   */
+  async getAnalytics(): Promise<Record<string, unknown>> {
+    const [positions, equityCurve, marketAnalyses, analysis] = await Promise.all([
+      this.getPositions() as unknown as Promise<ManagedPosition[]>,
+      this.getEquityHistory(),
+      this.ctx.storage.get<Record<string, unknown>[]>("marketAnalyses"),
+      this.ctx.storage.get<Record<string, unknown>>("analysis"),
+    ]);
+
+    const sources = marketAnalyses?.length ? marketAnalyses : analysis ? [analysis] : [];
+    const setups = sources.flatMap((result) => {
+      const symbol = String(result.symbol ?? "");
+      return ((result.setups as Setup[] | undefined) ?? []).map((setup) => ({ ...setup, symbol: setup.symbol ?? symbol }));
+    });
+
+    return {
+      ...computePerformance({
+        positions,
+        setups,
+        equityCurve,
+        startingEquity: STARTING_EQUITY,
+      }),
+      equityCurve,
+      updatedAt: Date.now(),
+    };
+  }
+
+  /** §53 — one position with its full management timeline and originating setup. */
+  async getTrade(positionId: string): Promise<Record<string, unknown>> {
+    const positions = (await this.getPositions()) as unknown as ManagedPosition[];
+    const position = positions.find((item) => item.id === positionId || item.setupId === positionId);
+    if (!position) return { found: false, reason: "No position with that identifier." };
+
+    const [marketAnalyses, analysis, journal] = await Promise.all([
+      this.ctx.storage.get<Record<string, unknown>[]>("marketAnalyses"),
+      this.ctx.storage.get<Record<string, unknown>>("analysis"),
+      this.getJournal(),
+    ]);
+    const sources = marketAnalyses?.length ? marketAnalyses : analysis ? [analysis] : [];
+    const setup = sources
+      .flatMap((result) => (result.setups as Setup[] | undefined) ?? [])
+      .find((item) => item.id === position.setupId);
+
+    return {
+      found: true,
+      position,
+      // The originating setup may have aged out of the current analysis window.
+      setup: setup ?? null,
+      events: position.events ?? [],
+      journal: journal.filter((entry) => {
+        const data = entry.data as { setupId?: string; positionId?: string } | undefined;
+        return data?.setupId === position.setupId || data?.positionId === position.id;
+      }),
+    };
+  }
   async restorePaperState(state: { positions?: unknown[]; journal?: unknown[]; activity?: unknown[]; equity?: number; updatedAt?: number }): Promise<{ restored: boolean; reason?: string }> {
     const existing = await this.getPositions();
     const existingJournal = await this.getJournal();
@@ -473,6 +532,12 @@ export default {
     }
 
     if (url.pathname === "/api/analysis" && request.method === "GET") return json(request, env, await session.getAnalysis());
+    if (url.pathname === "/api/analytics" && request.method === "GET") return json(request, env, await session.getAnalytics());
+    if (url.pathname === "/api/trade" && request.method === "GET") {
+      const id = url.searchParams.get("id");
+      if (!id) return json(request, env, { error: "A position or setup id is required." }, 400);
+      return json(request, env, await session.getTrade(id));
+    }
     if (url.pathname === "/api/chart" && request.method === "GET") {
       const symbol = url.searchParams.get("symbol") ?? assets[0] ?? "BTCUSDT";
       return json(request, env, await session.getChart(symbol, url.searchParams.get("timeframe") ?? undefined));

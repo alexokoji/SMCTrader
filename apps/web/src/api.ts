@@ -125,6 +125,85 @@ export interface AnalysisResult {
   updatedAt: number;
 }
 
+export interface PerformanceStats {
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  netPnl: number;
+  grossProfit: number;
+  grossLoss: number;
+  profitFactor: number;
+  expectancy: number;
+  avgTrade: number;
+  avgWin: number;
+  avgLoss: number;
+  largestWin: number;
+  largestLoss: number;
+  maxConsecutiveWins: number;
+  maxConsecutiveLosses: number;
+  avgRr: number;
+  avgDurationMs: number;
+  maxDrawdown: number;
+  maxDrawdownPct: number;
+  finalEquity: number;
+  totalReturnPct: number;
+  sharpe: number;
+  byMonth: Record<string, number>;
+  bySetupType: Record<string, { trades: number; pnl: number; winRate: number }>;
+  byAsset: Record<string, { trades: number; pnl: number; winRate: number }>;
+}
+
+export interface Analytics {
+  stats: PerformanceStats;
+  funnel: { seen: number; valid: number; executed: number; rejected: number; executionRate: number };
+  rejectionReasons: { reason: string; count: number }[];
+  openPositions: number;
+  closedPositions: number;
+  startingEquity: number;
+  equityCurve: { timestamp: number; equity: number }[];
+  updatedAt: number;
+}
+
+export interface PositionEvent {
+  type: string;
+  timestamp: number;
+  detail: string;
+  positionId: string;
+  price?: number;
+  qtyClosed?: number;
+  realizedPnl?: number;
+}
+
+export interface ManagedPositionDetail extends Position {
+  id: string;
+  entryModel?: string;
+  plannedRr?: number[];
+  openedAt: number;
+  closedAt?: number;
+  closeReason?: string;
+  finalPnl?: number;
+  realizedPnl: number;
+  entryFee: number;
+  quantityRemaining: number;
+  closedQuantity: number;
+  notional: number;
+  mae: number;
+  mfe: number;
+  sl: number;
+  events: PositionEvent[];
+  strategyVersion: string;
+}
+
+export interface TradeDetail {
+  found: boolean;
+  reason?: string;
+  position?: ManagedPositionDetail;
+  setup?: Setup | null;
+  events?: PositionEvent[];
+  journal?: JournalEntry[];
+}
+
 export interface ChartCandle {
   timestamp: number;
   open: number;
@@ -460,6 +539,8 @@ export const api = {
     connectionRequest<{ connection: ExchangeConnection }>({ method: "POST", body: JSON.stringify(input) }),
   removeConnection: (id: string) => connectionRequest<{ removed: boolean }>({ method: "DELETE", body: JSON.stringify({ id }), headers: { "content-type": "application/json", "x-connection-id": id } }),
   analysis: () => request<AnalysisResult>("/api/analysis"),
+  analytics: () => request<Analytics>("/api/analytics"),
+  trade: (id: string) => request<TradeDetail>(`/api/trade?id=${encodeURIComponent(id)}`),
   chart: (symbol: string, timeframe?: string) =>
     request<ChartPayload>(`/api/chart?symbol=${encodeURIComponent(symbol)}${timeframe ? `&timeframe=${encodeURIComponent(timeframe)}` : ""}`),
   markets: () => request<{ analyses: AnalysisResult[] }>("/api/markets"),

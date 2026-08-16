@@ -54,3 +54,6 @@ export * from "./marketdata/inmemory.js";
 // ---- backtest ----
 export * from "./backtest/engine.js";
 export * from "./backtest/stats.js";
+
+// ---- analytics ----
+export * from "./analytics/performance.js";

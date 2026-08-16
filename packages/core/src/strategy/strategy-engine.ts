@@ -654,6 +654,8 @@ export class StrategyEngine {
           direction: setup.direction,
           setupId: setup.id,
           strategyVersion: setup.strategyVersion,
+          entryModel: setup.entryModel,
+          plannedRr: setup.rr,
           entry: result.filledPrice,
           positionSize: result.filledQuantity,
           notional,

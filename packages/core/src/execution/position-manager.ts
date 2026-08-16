@@ -28,6 +28,12 @@ export interface PositionEvent {
 }
 
 export interface ManagedPosition extends PortfolioPosition {
+  /** Entry model of the originating setup, for performance attribution. */
+  entryModel?: string;
+  /** Projected reward-to-risk at entry, per take-profit target. */
+  plannedRr?: number[];
+  /** Set when the position fully closes. */
+  closedAt?: number;
   sl: number;
   quantityRemaining: number;
   closedQuantity: number;
@@ -77,6 +83,8 @@ export class PositionManager {
     partialPlan?: PartialClosePlanItem[];
     openedAt: number;
     feePct?: number;
+    entryModel?: string;
+    plannedRr?: number[];
   }): ManagedPosition {
     const id = `POS-${hashString(
       `${input.symbol}:${input.direction}:${input.setupId}:${input.openedAt}`,
@@ -92,6 +100,8 @@ export class PositionManager {
       direction: input.direction,
       setupId: input.setupId,
       strategyVersion: input.strategyVersion,
+      entryModel: input.entryModel,
+      plannedRr: input.plannedRr,
       entry: input.entry,
       positionSize: input.positionSize,
       notional: input.notional,
@@ -250,6 +260,7 @@ export class PositionManager {
     if (pos.quantityRemaining <= 0) {
       pos.status = "CLOSED";
       pos.closeReason = reason;
+      pos.closedAt = timestamp;
       pos.finalPnl = pos.realizedPnl - pos.entryFee;
       pos.events.push({
         type: "CLOSED",

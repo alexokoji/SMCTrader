@@ -22,12 +22,19 @@
 - [x] Dashboard: chart with toggleable SMC overlays, deterministic analysis panel,
       full setup cards (hard rules, confluence, SL/TP reasoning), rejected-setups page.
 - [x] Vercel deployment fits the Hobby function limit (13 serverless functions -> 2).
+- [x] Trade detail (§53): management timeline, execution/risk figures, originating
+      setup reasoning and the related journal entries, reached by selecting a position.
+- [x] Analytics (§60): win rate, profit factor, expectancy, realised RR, drawdown,
+      equity curve, breakdowns by entry model and asset, and a ranked list of why
+      setups were declined. Live results reuse the backtester's `computeStats`.
+- [x] Fixed profit factor, which compared a negative gross loss against zero and so
+      always reported `Infinity` or `0`.
 
 ## Next
 
 - [ ] Persist candle history, analysis runs and setup decisions in MongoDB, not only
       in Durable Object storage.
-- [ ] Trade detail page (§53) and analytics dashboards (§60).
+- [ ] Analytics by market regime and session (§60) — needs the crypto context layer (§39).
 - [ ] Notifications: browser, email, Telegram (§64).
 - [ ] Admin panel (§85), replay engine (§89) and strategy debug mode (§90).
 - [ ] Exchange adapters beyond market data for Bybit, Bitget, OKX, KuCoin, including

@@ -9,8 +9,8 @@
   ],
   "scripts": {
     "build": "npm run build -w @smc/core && npm run build -w @smc/api && npm run build -w @smc/web",
-    "test": "npm run test -w @smc/core",
-    "test:all": "npm run test --workspaces",
+    "test": "npm run test --workspaces --if-present",
+    "test:core": "npm run test -w @smc/core",
     "typecheck": "npm run typecheck --workspaces",
     "dev:api": "npm run dev -w @smc/api",
     "dev:web": "npm run dev -w @smc/web"

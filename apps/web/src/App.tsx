@@ -2,14 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api, connectStream,
   type ActivityEvent, type AnalysisResult, type ApiStatus, type BacktestResult,
+  type ChartPayload,
   type ExchangeConnection, type JournalEntry, type Position, type RiskConfig,
   type RiskState, type StreamState, type TradingMode, type AuthUser, type ProviderHealth,
 } from "./api";
+import { SmcChart } from "./components/SmcChart";
+import { AnalysisExplanation, RejectedSetups, SetupCard } from "./components/SetupViews";
 
-type Page = "dashboard" | "markets" | "positions" | "paper" | "backtest" | "journal" | "settings" | "exchange" | "account";
+type Page = "dashboard" | "markets" | "chart" | "positions" | "rejected" | "paper" | "backtest" | "journal" | "settings" | "exchange" | "account";
 
 const nav: Array<[Page, string, string]> = [
-  ["dashboard", "◫", "Overview"], ["markets", "⌁", "Market scanner"], ["positions", "◇", "Positions"],
+  ["dashboard", "◫", "Overview"], ["markets", "⌁", "Market scanner"], ["chart", "◧", "Chart & analysis"],
+  ["positions", "◇", "Positions"], ["rejected", "⊘", "Rejected setups"],
   ["paper", "◉", "Paper trading"], ["backtest", "↗", "Backtesting"], ["journal", "▤", "Journal"],
   ["settings", "⚙", "Strategy & risk"], ["exchange", "⇄", "Exchanges"],
 ];
@@ -46,6 +50,10 @@ function App() {
   const [backtest, setBacktest] = useState<BacktestResult | null>(null);
   const [providerHealth, setProviderHealth] = useState<ProviderHealth | null>(null);
   const [equityHistory, setEquityHistory] = useState<{ timestamp: number; equity: number }[]>([]);
+  const [chart, setChart] = useState<ChartPayload | null>(null);
+  const [chartSymbol, setChartSymbol] = useState<string>("");
+  const [chartTf, setChartTf] = useState<string>("");
+  const [chartLoading, setChartLoading] = useState(false);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [auditEvents, setAuditEvents] = useState<{ action: string; detail: string; createdAt: number }[]>([]);
   const [authReady, setAuthReady] = useState(false);
@@ -100,6 +108,87 @@ function App() {
   const addConnection = () => void run("connection", async () => { await api.addConnection(connectionForm); setConnectionForm({ exchange: "binance", label: "", apiKey: "", apiSecret: "" }); await refreshConnections(); });
   const runBacktest = () => void run("backtest", async () => { const startTime = Date.parse(backtestForm.start); const endTime = Date.parse(backtestForm.end); if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) throw new Error("Use valid ISO timestamps for the backtest range."); setBacktest(await api.backtest({ startTime, endTime, startingEquity: Number(backtestForm.equity) || 10000 })); });
   const signIn = (register: boolean) => void run("auth", async () => { const result = register ? await api.auth.register(authForm.email, authForm.password, authForm.name) : await api.auth.login(authForm.email, authForm.password); setUser(result.user); });
+  // Timeframe labels come from the engine's own top-down block so the chart
+  // always requests a timeframe the analysis engine actually tracks.
+  const chartTimeframes = [analysis?.topDown?.htf.timeframe, analysis?.topDown?.mtf.timeframe, analysis?.topDown?.ltf.timeframe]
+    .filter((tf): tf is string => Boolean(tf));
+  const activeChartSymbol = chartSymbol || analysis?.symbol || assets[0] || "BTCUSDT";
+  const activeChartTf = chartTf || chartTimeframes.at(-1) || "";
+
+  const loadChart = useCallback(async (symbol: string, tf?: string) => {
+    setChartLoading(true);
+    try {
+      setChart(await api.chart(symbol, tf || undefined));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setChartLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (page !== "chart" || !user) return;
+    void loadChart(activeChartSymbol, activeChartTf);
+  }, [page, user, activeChartSymbol, activeChartTf, loadChart]);
+
+  // Every setup the engine produced across all scanned markets, tagged with its
+  // market so the rejected view can show where each one came from.
+  const allSetups = useMemo(() => {
+    const sources = marketAnalyses.length ? marketAnalyses : analysis ? [analysis] : [];
+    return sources.flatMap((result) =>
+      result.setups.map((setup) => ({ ...setup, symbol: setup.symbol ?? result.symbol })),
+    );
+  }, [marketAnalyses, analysis]);
+
+  const chartPage = <>
+    <PageTitle
+      title="Chart & analysis"
+      description="Candles with the structure, liquidity and points of interest the engine is actually using. Every overlay can be toggled."
+      action={<div className="inline-form">
+        <select value={activeChartSymbol} onChange={(e) => { setChartSymbol(e.target.value); setChart(null); }}>
+          {(assets.length ? assets : [activeChartSymbol]).map((asset) => (
+            <option key={asset} value={asset.replace("/", "")}>{asset}</option>
+          ))}
+        </select>
+      </div>}
+    />
+    <div className="chart-layout">
+      <Card title={`${activeChartSymbol} · ${activeChartTf || "chart"}`}>
+        <SmcChart
+          data={chart}
+          loading={chartLoading}
+          timeframe={activeChartTf}
+          timeframes={chartTimeframes}
+          onTimeframeChange={(tf) => { setChartTf(tf); setChart(null); }}
+        />
+      </Card>
+      <Card title="Current analysis">
+        <AnalysisExplanation analysis={analysis} />
+      </Card>
+    </div>
+    <Card title={`Setups on ${activeChartSymbol} (${chart?.setups?.length ?? 0})`}>
+      {chart?.setups?.length
+        ? <div className="setup-cards">{chart.setups.map((setup) => <SetupCard key={setup.id} setup={setup} />)}</div>
+        : <div className="empty">No setups on this market right now.<p>The engine reports zero setups as a valid outcome rather than forcing a trade.</p></div>}
+    </Card>
+  </>;
+
+  const rejectedPage = <>
+    <PageTitle
+      title="Rejected setups"
+      description="Opportunities the engine identified and declined, with the exact reason each one was not traded."
+    />
+    <div className="metrics">
+      <Metric label="Setups seen" value={allSetups.length} hint="Across all scanned markets"/>
+      <Metric label="Valid" value={allSetups.filter((s) => s.status === "VALID").length} tone="good"/>
+      <Metric label="Executed" value={allSetups.filter((s) => s.status === "EXECUTED").length}/>
+      <Metric label="Rejected" value={allSetups.filter((s) => ["REJECTED", "INVALIDATED", "STALE"].includes(s.status)).length} tone="bad"/>
+    </div>
+    <Card title="Declined opportunities">
+      <RejectedSetups setups={allSetups}/>
+    </Card>
+  </>;
+
   const activeLabel = nav.find(([id]) => id === page)?.[2] ?? "Overview";
 
   if (!authReady) return <div className="auth-shell"><main><div className="empty">Checking secure session…</div></main></div>;
@@ -123,7 +212,7 @@ function App() {
   const exchange = <><PageTitle title="Exchange connections" description="Credentials are validated server-side and encrypted at rest. Never enable withdrawal permissions."/><div className="two-col"><Card title="Connect an exchange"><div className="form-grid"><label>Exchange<select value={connectionForm.exchange} onChange={(e) => setConnectionForm({ ...connectionForm, exchange: e.target.value })}><option value="binance">Binance · private validation</option><option value="bybit">Bybit · market data</option><option value="bitget">Bitget · market data</option><option value="okx">OKX · market data</option><option value="kucoin">KuCoin · market data</option></select></label><label>Account label<input value={connectionForm.label} onChange={(e) => setConnectionForm({ ...connectionForm, label: e.target.value })} placeholder="My trading account"/></label><label>API key<input value={connectionForm.apiKey} onChange={(e) => setConnectionForm({ ...connectionForm, apiKey: e.target.value })} autoComplete="off"/></label><label>API secret<input value={connectionForm.apiSecret} onChange={(e) => setConnectionForm({ ...connectionForm, apiSecret: e.target.value })} type="password" autoComplete="new-password"/></label></div><div className="warning">Public analysis uses Binance, Bybit, Coinbase, OKX, Bitget, and KuCoin automatically. Private credential validation is currently enabled only for Binance; unsupported credentials are rejected and never stored.</div><button className="primary" onClick={addConnection} disabled={busy === "connection"}>Validate & connect</button></Card><Card title="Connected accounts">{connections.length === 0 ? <div className="empty">No exchange account connected.<p>Paper trading is available without credentials. Live order placement remains locked until a supported, trading-enabled account and execution adapter pass every approval gate.</p></div> : <div className="connection-list">{connections.map((connection) => <div className="connection" key={connection.id}><div><b>{connection.label}</b><span>{connection.exchange} · {connection.apiKeyMasked}</span></div><Badge good={connection.permissions.tradingEnabled}>TRADING {connection.permissions.tradingEnabled ? "READY" : "DISABLED"}</Badge><button className="icon-button" onClick={() => void run("remove-connection", async () => { await api.removeConnection(connection.id); await refreshConnections(); })}>×</button></div>)}</div>}</Card></div></>;
 
   const account = <><PageTitle title="Account" description="Use a private account for this trading workspace."/>{user ? <><Card title="Signed in"><div className="empty"><b>{user.name}</b><p>{user.email}</p><button onClick={() => void run("logout", async () => { await api.auth.logout(); setUser(null); })}>Sign out</button></div></Card><Card title="Security activity"><div className="timeline">{auditEvents.map((event, index) => <div className="timeline-item" key={`${event.createdAt}-${index}`}><span></span><div><b>{event.action}</b><p>{event.detail}</p><small>{time(event.createdAt)}</small></div></div>)}</div></Card></> : <div className="two-col"><Card title="Email and password"><div className="form-grid"><label>Name (registration)<input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}/></label><label>Email<input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}/></label><label>Password<input type="password" minLength={12} value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}/></label></div><div className="card-actions"><button className="primary" onClick={() => signIn(false)}>Sign in</button><button onClick={() => signIn(true)}>Create account</button></div><p className="helper">Passwords require at least 12 characters.</p></Card><Card title="Google"><p className="helper">Sign in with your verified Google account.</p><button className="primary" onClick={() => api.auth.google()}>Continue with Google</button></Card></div>}</>;
-  const content = ({ dashboard: overview, markets, positions: positionPage, paper, backtest: backtesting, journal: journalPage, settings, exchange, account } as Record<Page, React.ReactNode>)[page];
+  const content = ({ dashboard: overview, markets, chart: chartPage, positions: positionPage, rejected: rejectedPage, paper, backtest: backtesting, journal: journalPage, settings, exchange, account } as Record<Page, React.ReactNode>)[page];
   return <div className="shell"><aside className="sidebar"><div className="brand"><span>m</span><div><b>Mirage</b><small>SMART MONEY OS</small></div></div><nav>{nav.map(([id, icon, label]) => <button key={id} className={page === id ? "active" : ""} onClick={() => setPage(id)}><i>{icon}</i>{label}</button>)}</nav><div className="sidebar-foot"><Badge good={wsConnected}>{wsConnected ? "SYSTEM ONLINE" : "RECONNECTING"}</Badge><span>v{status?.strategyVersion ?? "1.0.0"}</span></div></aside><main><header className="mobile-head"><button className="brand-mobile" onClick={() => setPage("dashboard")}>m</button><span>{activeLabel}</span><Badge good={wsConnected}>{wsConnected ? "LIVE" : "POLLING"}</Badge></header>{error && <div className="alert error"><b>Action required</b>{error}<button onClick={() => setError(null)}>×</button></div>}{notice && <div className="alert success"><b>Updated</b>{notice}<button onClick={() => setNotice(null)}>×</button></div>}{content}</main></div>;
 }
 

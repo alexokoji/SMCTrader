@@ -37,6 +37,17 @@ export class Journal {
     return [...this.entries].reverse();
   }
 
+  /**
+   * Replace the journal with a persisted snapshot. Entries are stored newest
+   * first by `getAll`, so the snapshot is reversed back into insertion order.
+   */
+  restore(entries: JournalEntry[]): void {
+    this.entries = [...entries]
+      .filter((e) => Number.isFinite(e.timestamp))
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .slice(-20000);
+  }
+
   filter(fn: (e: JournalEntry) => boolean): JournalEntry[] {
     return [...this.entries].reverse().filter(fn);
   }
@@ -76,6 +87,14 @@ export class ActivityFeed {
 
   getAll(): ActivityEvent[] {
     return [...this.events].reverse();
+  }
+
+  /** Replace the feed with a persisted snapshot without notifying listeners. */
+  restore(events: ActivityEvent[]): void {
+    this.events = [...events]
+      .filter((e) => Number.isFinite(e.timestamp))
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .slice(-5000);
   }
 
   clear(): void {

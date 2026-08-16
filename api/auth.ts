@@ -1,6 +1,6 @@
 import { MongoClient } from "mongodb";
 import { createHmac } from "node:crypto";
-import type { MongoAuthService } from "../../packages/api/src/auth.js";
+import type { MongoAuthService } from "../packages/api/src/auth.js";
 
 type VercelRequest = {
   method?: string;
@@ -46,7 +46,7 @@ async function auth(): Promise<MongoAuthService> {
         : undefined;
       // Vercel currently emits CommonJS functions. Keep this ESM workspace
       // module dynamic so Node does not try to require() it at runtime.
-      const { MongoAuthService } = await import("../../packages/api/src/auth.js");
+      const { MongoAuthService } = await import("../packages/api/src/auth.js");
       const service = new MongoAuthService(client.db(process.env.MONGODB_DB ?? "smctrader"), google);
       await service.initialize();
       return service;
@@ -80,9 +80,16 @@ function workerToken(userId: string): string {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
+  // Vercel's Hobby plan caps a deployment at 12 serverless functions, so every
+  // /api/auth/* address is rewritten onto this single function with the original
+  // sub-path carried in `route` (for example "google/callback").
   const route = req.query.route;
-  const routedParts = Array.isArray(route) ? route : route ? [route] : [];
-  const parts = routedParts.length ? routedParts : new URL(req.url ?? "/", "https://vercel.local").pathname.split("/").filter(Boolean).slice(2);
+  const routedParts = (Array.isArray(route) ? route : route ? [route] : [])
+    .flatMap((part) => part.split("/"))
+    .filter(Boolean);
+  const parts = routedParts.length
+    ? routedParts
+    : new URL(req.url ?? "/", "https://vercel.local").pathname.split("/").filter(Boolean).slice(2);
   const action = parts[0];
   const method = (req.method ?? "GET").toUpperCase();
   try {

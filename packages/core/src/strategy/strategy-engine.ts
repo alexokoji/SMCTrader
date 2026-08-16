@@ -7,7 +7,8 @@ import { PaperExecutionAdapter } from "../execution/paper.js";
 import { PositionManager } from "../execution/position-manager.js";
 import type { TradeDecision } from "../types/contracts.js";
 import type { Setup } from "../types/setup.js";
-import { ActivityFeed, Journal } from "../journal/journal.js";
+import { ActivityFeed, Journal, type ActivityEvent, type JournalEntry } from "../journal/journal.js";
+import type { ManagedPosition } from "../execution/position-manager.js";
 import { RiskEngine } from "../risk/risk-engine.js";
 import { round } from "../util.js";
 import { explainCycle, type CycleExplanation } from "../explain/explanation.js";
@@ -25,6 +26,34 @@ export interface StrategyCycleResult {
   validSetups: Setup[];
   message?: string;
   explanation: CycleExplanation;
+}
+
+/**
+ * Serializable engine state. The analysis engine is intentionally excluded: it
+ * is rebuilt deterministically by replaying stored candles, so only the
+ * execution and risk state that cannot be re-derived is captured here.
+ */
+export interface StrategyEngineSnapshot {
+  version: 1;
+  positions: ManagedPosition[];
+  journal: JournalEntry[];
+  activity: ActivityEvent[];
+  risk: {
+    equity: number;
+    equityDayStart: number;
+    peakEquity: number;
+    tradesToday: number;
+    realizedPnlToday: number;
+    usedExposure: number;
+    usedCorrelatedExposure: number;
+    dailyLossReached: boolean;
+    drawdownReached: boolean;
+  };
+  executedFingerprints: [string, number][];
+  dailyCounter: { dayKey: string; count: number };
+  lastSeenTs: number;
+  autoTrading: boolean;
+  safetyBlocked: boolean;
 }
 
 export interface StrategyEngineOptions {
@@ -234,6 +263,68 @@ export class StrategyEngine {
 
   isSafetyBlocked(): boolean {
     return this.safetyBlocked;
+  }
+
+  /**
+   * Capture execution and risk state so a host that cannot keep the engine in
+   * memory (an evicted Durable Object, a restarted worker) can resume without
+   * losing open positions, the audit trail, or duplicate-trade protection.
+   */
+  serialize(): StrategyEngineSnapshot {
+    const risk = this.riskEngine.getState();
+    return {
+      version: 1,
+      positions: this.positionManager.getAll(),
+      journal: this.journal.getAll(),
+      activity: this.activity.getAll(),
+      risk: {
+        equity: risk.equity,
+        equityDayStart: risk.equityDayStart,
+        peakEquity: risk.peakEquity,
+        tradesToday: risk.tradesToday,
+        realizedPnlToday: risk.realizedPnlToday,
+        usedExposure: risk.usedExposure,
+        usedCorrelatedExposure: risk.usedCorrelatedExposure,
+        dailyLossReached: risk.dailyLossReached,
+        drawdownReached: risk.drawdownReached,
+      },
+      executedFingerprints: [...this.executedFingerprints.entries()],
+      dailyCounter: { ...this.dailyCounter },
+      lastSeenTs: this.lastSeenTs,
+      autoTrading: this.autoTrading,
+      safetyBlocked: this.safetyBlocked,
+    };
+  }
+
+  /**
+   * Restore a snapshot produced by {@link serialize}. Restoring never opens or
+   * closes a position; it only reinstates state the engine had already decided.
+   */
+  restore(snapshot: StrategyEngineSnapshot): void {
+    if (snapshot?.version !== 1) {
+      throw new Error("Unsupported strategy engine snapshot version.");
+    }
+    this.positionManager.restore(snapshot.positions ?? []);
+    this.journal.restore(snapshot.journal ?? []);
+    this.activity.restore(snapshot.activity ?? []);
+    const openPositions = this.positionManager.getOpenPositions();
+    this.riskEngine = new RiskEngine(this.riskCfg, {
+      equity: snapshot.risk.equity,
+      equityDayStart: snapshot.risk.equityDayStart,
+      peakEquity: snapshot.risk.peakEquity,
+      tradesToday: snapshot.risk.tradesToday,
+      realizedPnlToday: snapshot.risk.realizedPnlToday,
+      openPositions,
+      usedExposure: snapshot.risk.usedExposure,
+      usedCorrelatedExposure: snapshot.risk.usedCorrelatedExposure,
+      dailyLossReached: snapshot.risk.dailyLossReached,
+      drawdownReached: snapshot.risk.drawdownReached,
+    });
+    this.executedFingerprints = new Map(snapshot.executedFingerprints ?? []);
+    this.dailyCounter = { ...snapshot.dailyCounter };
+    this.lastSeenTs = snapshot.lastSeenTs ?? 0;
+    this.autoTrading = snapshot.autoTrading;
+    this.safetyBlocked = snapshot.safetyBlocked;
   }
 
   /** Feed a closed candle and run the full decision pipeline. */

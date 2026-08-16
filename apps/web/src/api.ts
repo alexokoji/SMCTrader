@@ -51,17 +51,53 @@ export interface TopDown {
   conflict?: string;
 }
 
+/** A single pass/fail condition the engine evaluated for a setup. */
+export interface ConfluenceFactor {
+  name: string;
+  status: "PASS" | "FAIL" | "NEUTRAL";
+  detail: string;
+}
+
+export interface SetupComponents {
+  poi?: { kind: string; id: string; top: number; bottom: number; strength: number; status: string };
+  liquidity?: { id: string; type: "BSL" | "SSL"; level: number; status: string };
+  sweepEvent?: { timestamp: number; level: number; type: string; detail?: string };
+  chochEvent?: { timestamp: number; level: number; direction: string };
+  fvgId?: string;
+  orderBlockId?: string;
+  supplyDemandId?: string;
+  premiumDiscount?: { position: "PREMIUM" | "DISCOUNT" | "EQUILIBRIUM"; ratio: number };
+  momentum?: { label: string; score: number };
+  inducement?: { detected: boolean; detail: string };
+  targetLiquidity?: { type: "BSL" | "SSL"; level: number };
+}
+
 export interface Setup {
   id: string;
+  symbol?: string;
   direction: "LONG" | "SHORT";
   timeframe: string;
   entryModel: string;
   entry: number;
   stopLoss: number;
+  /** Why the stop sits where it does, in the engine's own words. */
+  stopLossReason?: string;
   takeProfits: number[];
+  takeProfitReasons?: string[];
   rr: number[];
+  riskPct?: number;
+  positionSize?: number;
   score: number;
   status: string;
+  /** Conditions that must pass for the setup to be tradeable at all. */
+  hardRules?: ConfluenceFactor[];
+  /** Conditions that only rank an already-valid setup. */
+  qualityFactors?: ConfluenceFactor[];
+  factors?: ConfluenceFactor[];
+  components?: SetupComponents;
+  timeframeAnalysis?: TopDown;
+  counterTrend?: boolean;
+  strategyVersion?: string;
   reasons: string[];
   rejectionReasons: string[];
   createdAt: number;
@@ -78,12 +114,72 @@ export interface Setup {
 export interface AnalysisResult {
   symbol: string;
   exchange: string;
-  bias: "BULLISH" | "BEARISH" | "RANGING" | "NEUTRAL";
+  bias: "BULLISH" | "BEARISH" | "RANGING" | "NEUTRAL" | "UNCLEAR";
   topDown: TopDown;
   setups: Setup[];
   events: { type: string; description: string; timestamp: number }[];
   status: string;
+  /** True while the engine is still replaying stored history after a restart. */
+  warming?: boolean;
+  message?: string | null;
   updatedAt: number;
+}
+
+export interface ChartCandle {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface ChartZone {
+  id: string;
+  top: number;
+  bottom: number;
+  createdAt: number;
+  status?: string;
+  direction?: string;
+  strength?: number;
+  mitigated?: boolean;
+  touches?: number;
+}
+
+export interface ChartLevel {
+  id?: string;
+  type?: string;
+  level?: number;
+  price?: number;
+  timestamp?: number;
+  direction?: string;
+  status?: string;
+  detail?: string;
+}
+
+/**
+ * Chart geometry for one symbol/timeframe. Served separately from `/api/analysis`
+ * because candle buffers and zone geometry are far larger than the summary.
+ */
+export interface ChartPayload {
+  symbol: string;
+  exchange?: string;
+  timeframe: string;
+  available: boolean;
+  reason?: string;
+  updatedAt?: number;
+  candles?: ChartCandle[];
+  structure?: { trend?: string; swings?: { type: string; price: number; timestamp: number }[] };
+  bos?: ChartLevel[];
+  choch?: ChartLevel[];
+  sweeps?: ChartLevel[];
+  liquidityZones?: ChartLevel[];
+  fvgs?: ChartZone[];
+  orderBlocks?: ChartZone[];
+  supplyDemand?: ChartZone[];
+  momentum?: string;
+  setups?: Setup[];
+  positions?: Position[];
 }
 
 export interface RiskLimit {
@@ -364,6 +460,8 @@ export const api = {
     connectionRequest<{ connection: ExchangeConnection }>({ method: "POST", body: JSON.stringify(input) }),
   removeConnection: (id: string) => connectionRequest<{ removed: boolean }>({ method: "DELETE", body: JSON.stringify({ id }), headers: { "content-type": "application/json", "x-connection-id": id } }),
   analysis: () => request<AnalysisResult>("/api/analysis"),
+  chart: (symbol: string, timeframe?: string) =>
+    request<ChartPayload>(`/api/chart?symbol=${encodeURIComponent(symbol)}${timeframe ? `&timeframe=${encodeURIComponent(timeframe)}` : ""}`),
   markets: () => request<{ analyses: AnalysisResult[] }>("/api/markets"),
   risk: () => request<{ state: RiskState; limits: RiskConfig }>("/api/risk"),
   equityHistory: () => request<{ points: { timestamp: number; equity: number }[] }>("/api/equity-history"),

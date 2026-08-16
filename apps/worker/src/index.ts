@@ -1,4 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
+import { DEFAULT_RISK_CONFIG } from "@smc/core";
+import { TradingRuntime, type AnalysisTick, type RuntimeStorage } from "./runtime.js";
 
 interface Env {
   TRADING_SESSION: DurableObjectNamespace<TradingSession>;
@@ -10,7 +12,10 @@ type RuntimeMode = "ANALYSIS_ONLY" | "PAPER" | "LIVE";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8" };
 const DEFAULT_ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
-const DEFAULT_RISK = { riskPerTrade: 1, maxDailyLossPct: 3, maxDrawdownPct: 8, maxOpenPositions: 3, maxTradesPerDay: 5, maxLeverage: 1, maxPortfolioExposurePct: 20, maxSymbolExposurePct: 10, maxCorrelatedExposurePct: 15, feePct: 0.1, slippagePct: 0.05 };
+// Risk defaults are owned by the engine so the Worker cannot drift from the
+// limits the strategy and tests are written against.
+const { correlationGroups: _correlationGroups, ...DEFAULT_RISK } = DEFAULT_RISK_CONFIG;
+const STARTING_EQUITY = 10_000;
 
 function corsHeaders(request: Request, env: Env): Headers {
   const headers = new Headers(JSON_HEADERS);
@@ -53,7 +58,59 @@ function baseState(mode: RuntimeMode, assets: string[]) {
   };
 }
 
+/**
+ * Reshape a runtime tick into the API's analysis contract. Per-timeframe
+ * snapshots are deliberately omitted: they carry candle buffers and zone
+ * geometry, and are served separately by `/api/chart`.
+ */
+function serializeAnalysis(tick: AnalysisTick): Record<string, unknown> {
+  const { analysis } = tick;
+  return {
+    symbol: analysis.symbol,
+    exchange: tick.exchange,
+    bias: analysis.bias,
+    status: tick.status,
+    warming: tick.warming,
+    message: tick.message ?? null,
+    topDown: analysis.topDown,
+    setups: analysis.setups,
+    events: analysis.events.map((event) => ({
+      type: event.type,
+      description: event.detail,
+      timestamp: event.timestamp,
+    })),
+    updatedAt: analysis.updatedAt,
+  };
+}
+
+function lastCloseOf(tick: AnalysisTick): number | null {
+  const timeframes = Object.values(tick.analysis.snapshots);
+  for (const snapshot of timeframes.reverse()) {
+    const close = snapshot?.candles.at(-1)?.close;
+    if (Number.isFinite(close)) return close as number;
+  }
+  return null;
+}
+
 export class TradingSession extends DurableObject<Env> {
+  private runtimeInstance?: TradingRuntime;
+
+  /**
+   * The runtime is held on the Durable Object instance so engines stay warm
+   * between ticks. After an eviction it rebuilds itself from stored candles and
+   * the persisted engine snapshot.
+   */
+  private runtime(): TradingRuntime {
+    if (!this.runtimeInstance) {
+      const storage: RuntimeStorage = {
+        get: <T,>(key: string) => this.ctx.storage.get<T>(key),
+        put: (entries: Record<string, unknown>) => this.ctx.storage.put(entries),
+      };
+      this.runtimeInstance = new TradingRuntime(storage);
+    }
+    return this.runtimeInstance;
+  }
+
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("WebSocket upgrade required", { status: 426 });
     const pair = new WebSocketPair();
@@ -128,116 +185,70 @@ export class TradingSession extends DurableObject<Env> {
     await this.ctx.storage.put("providerHealth", { checkedAt: Date.now(), providers: results });
   }
 
+  /**
+   * Run the deterministic Smart Money engine for a symbol and publish the
+   * result. Every field below is produced by `@smc/core`; nothing here invents
+   * a bias, a setup or a fill.
+   */
   async runAnalysis(symbolOverride?: string): Promise<Record<string, unknown>> {
     const assets = symbolOverride ? [symbolOverride] : await this.getAssets();
-    const symbol = assets[0] ?? "BTCUSDT";
+    const symbol = symbolOverride ?? assets[0] ?? "BTCUSDT";
     try {
-      let closes: number[] | undefined;
-      let exchange = "binance";
-      try {
-        const response = await fetch(`https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=60`, { signal: AbortSignal.timeout(8_000) });
-        if (!response.ok) throw new Error(`Binance returned ${response.status}`);
-        closes = ((await response.json()) as unknown[][]).map((row) => Number(row[4])).filter(Number.isFinite);
-      } catch {
-        try {
-          const response = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=60`, { signal: AbortSignal.timeout(8_000) });
-          if (!response.ok) throw new Error(`Binance Vision returned ${response.status}`);
-          closes = ((await response.json()) as unknown[][]).map((row) => Number(row[4])).filter(Number.isFinite);
-          exchange = "binance-vision";
-        } catch {
-          try {
-            const response = await fetch(`https://api.bybit.com/v5/market/kline?category=spot&symbol=${encodeURIComponent(symbol)}&interval=60&limit=60`, { signal: AbortSignal.timeout(8_000) });
-            if (!response.ok) throw new Error(`Bybit returned ${response.status}`);
-            const body = (await response.json()) as { retCode?: number; result?: { list?: string[][] } };
-            if (body.retCode !== 0 || !body.result?.list) throw new Error("Bybit returned no candles");
-            closes = body.result.list.reverse().map((row) => Number(row[4])).filter(Number.isFinite);
-            exchange = "bybit";
-          } catch {
-            const pair = symbol.replace(/USDT$/, "-USD");
-            try {
-              const response = await fetch(`https://api.exchange.coinbase.com/products/${encodeURIComponent(pair)}/candles?granularity=3600`, { signal: AbortSignal.timeout(8_000) });
-              if (!response.ok) throw new Error(`Coinbase returned ${response.status}`);
-              closes = ((await response.json()) as unknown[][]).reverse().map((row) => Number(row[4])).filter(Number.isFinite);
-              exchange = "coinbase";
-            } catch {
-              const instId = symbol.replace(/USDT$/, "-USDT");
-              try {
-                const response = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(instId)}&bar=1H&limit=60`, { signal: AbortSignal.timeout(8_000) });
-                const body = await response.json() as { code?: string; data?: string[][] };
-                if (!response.ok || body.code !== "0" || !body.data) throw new Error("OKX returned no candles");
-                closes = body.data.reverse().map((row) => Number(row[4])).filter(Number.isFinite);
-                exchange = "okx";
-              } catch {
-                try {
-                  const response = await fetch(`https://api.bitget.com/api/v2/spot/market/candles?symbol=${encodeURIComponent(symbol)}&granularity=1h&limit=60`, { signal: AbortSignal.timeout(8_000) });
-                  const body = await response.json() as { code?: string; data?: string[][] };
-                  if (!response.ok || body.code !== "00000" || !body.data) throw new Error("Bitget returned no candles");
-                  closes = body.data.reverse().map((row) => Number(row[4])).filter(Number.isFinite);
-                  exchange = "bitget";
-                } catch {
-                  const response = await fetch(`https://api.kucoin.com/api/v1/market/candles?symbol=${encodeURIComponent(instId)}&type=1hour`, { signal: AbortSignal.timeout(8_000) });
-                  const body = await response.json() as { code?: string; data?: string[][] };
-                  if (!response.ok || body.code !== "200000" || !body.data) throw new Error("All market data providers failed, including KuCoin.");
-                  closes = body.data.reverse().slice(-60).map((row) => Number(row[2])).filter(Number.isFinite);
-                  exchange = "kucoin";
-                }
-              }
-            }
-          }
-        }
-      }
-      if (closes.length < 50) throw new Error("Insufficient market candles");
-      const average = (values: number[]) => values.reduce((sum, value) => sum + value, 0) / values.length;
-      const price = closes.at(-1)!;
-      const fast = average(closes.slice(-20));
-      const slow = average(closes.slice(-50));
-      const direction = fast >= slow ? "LONG" : "SHORT";
-      const trend = direction === "LONG" ? "BULLISH" : "BEARISH";
-      const swing = direction === "LONG" ? Math.min(...closes.slice(-12)) : Math.max(...closes.slice(-12));
-      const stopLoss = direction === "LONG" ? Math.min(swing, price * 0.99) : Math.max(swing, price * 1.01);
-      const risk = Math.abs(price - stopLoss);
-      const takeProfitOne = direction === "LONG" ? price + risk : price - risk;
-      const takeProfit = direction === "LONG" ? price + risk * 2 : price - risk * 2;
-      const score = Math.min(95, Math.round(60 + (Math.abs(fast - slow) / price) * 10_000));
-      const setup = { id: `${symbol}-${Date.now()}`, direction, timeframe: "1h", entryModel: "SMA momentum + structure", entry: price, stopLoss, takeProfits: [takeProfitOne, takeProfit], rr: [1, 2], score, status: score >= 65 ? "QUALIFIED" : "WATCHING", reasons: [`20-period MA ${fast.toFixed(2)} is ${direction === "LONG" ? "above" : "below"} 50-period MA ${slow.toFixed(2)}`, "Public market candles refreshed"], rejectionReasons: [], createdAt: Date.now() };
-      const analysis = { symbol, exchange, bias: trend, status: "ANALYZED", updatedAt: Date.now(), topDown: { htf: { timeframe: "4h", trend, strength: "CONFIRMED" }, mtf: { timeframe: "1h", trend, strength: "CONFIRMED" }, ltf: { timeframe: "15m", trend, confirmation: "WAITING" } }, setups: [setup], events: [{ type: "MARKET_ANALYSIS", description: `${symbol} ${trend} analysis refreshed at ${price}`, timestamp: Date.now() }] };
-      await this.ctx.storage.put({ analysis, lastPrice: price, lastPollAt: Date.now(), lastError: null, providerHealth: { provider: exchange, status: "healthy", checkedAt: Date.now(), symbol } });
-      console.log(JSON.stringify({ event: "analysis_completed", symbol, provider: exchange, bias: trend, timestamp: Date.now() }));
-      const existingPositions = (await this.ctx.storage.get<Record<string, unknown>[]>("positions")) ?? [];
-      const journal = (await this.ctx.storage.get<Record<string, unknown>[]>("journal")) ?? [];
-      const closeFeePct = ((await this.ctx.storage.get<Record<string, number>>("risk"))?.feePct ?? DEFAULT_RISK.feePct) / 100;
-      const markedPositions = existingPositions.map((position) => {
-        if (position.status !== "OPEN" || position.symbol !== symbol) return position;
-        const entry = Number(position.entry); const size = Number(position.positionSize); const isLong = position.direction === "LONG";
-        const grossPnl = (isLong ? price - entry : entry - price) * size;
-        const exitFee = price * size * closeFeePct;
-        const pnl = grossPnl - Number(position.entryFee ?? 0) - exitFee;
-        const hitStop = isLong ? price <= Number(position.stopLoss) : price >= Number(position.stopLoss);
-        const targets = position.takeProfits as number[];
-        const hitFirstTarget = isLong ? price >= Number(targets[0]) : price <= Number(targets[0]);
-        if (!position.tp1Taken && hitFirstTarget && targets.length > 1) { const partialSize = size / 2; const allocatedEntryFee = Number(position.entryFee ?? 0) * (partialSize / size); const partialPnl = ((isLong ? price - entry : entry - price) * partialSize) - allocatedEntryFee - price * partialSize * closeFeePct; journal.unshift({ timestamp: Date.now(), symbol, category: "PAPER_TRADE", title: "Partial take-profit", body: `Half position closed for ${partialPnl.toFixed(2)}`, data: { pnl: partialPnl, entryFee: allocatedEntryFee } }); return { ...position, positionSize: partialSize, notional: price * partialSize, currentPrice: price, entryFee: Number(position.entryFee ?? 0) - allocatedEntryFee, realizedPnl: Number(position.realizedPnl ?? 0) + partialPnl, tp1Taken: true, takeProfits: targets.slice(1) }; }
-        const hitTarget = isLong ? price >= Number(targets.at(-1)) : price <= Number(targets.at(-1));
-        if (!hitStop && !hitTarget) return { ...position, currentPrice: price, unrealizedPnl: pnl };
-        const reason = hitStop ? "STOP_LOSS" : "TAKE_PROFIT";
-        journal.unshift({ timestamp: Date.now(), symbol, category: "PAPER_TRADE", title: `Paper position closed: ${reason}`, body: `Realized P&L: ${pnl.toFixed(2)}`, data: { pnl, reason } });
-        return { ...position, currentPrice: price, unrealizedPnl: 0, realizedPnl: Number(position.realizedPnl ?? 0) + pnl, exitFee, status: "CLOSED", closedAt: Date.now(), closeReason: reason };
+      const [mode, storedRisk, storedStrategy, autoTrading, safetyBlocked] = await Promise.all([
+        this.getMode(),
+        this.ctx.storage.get<Record<string, number>>("risk"),
+        this.ctx.storage.get<Record<string, unknown>>("strategy"),
+        this.isAutoTrading(),
+        this.isSafetyBlocked(),
+      ]);
+
+      const tick = await this.runtime().tick(symbol, {
+        mode,
+        risk: { ...DEFAULT_RISK, ...(storedRisk ?? {}) },
+        strategy: storedStrategy as Record<string, never> | undefined,
+        autoTrading,
+        safetyBlocked,
       });
-      await this.ctx.storage.put({ positions: markedPositions, journal: journal.slice(0, 200) });
-      const autoTrading = (await this.ctx.storage.get<boolean>("autoTrading")) ?? false;
-      const mode = await this.getMode();
-      const safetyBlocked = (await this.ctx.storage.get<boolean>("safetyBlocked")) ?? false;
-      if (autoTrading && !safetyBlocked && mode === "PAPER" && score >= 65) {
-        const open = markedPositions;
-        if (!open.some((position) => position.symbol === symbol && position.status === "OPEN")) {
-          const configuredRisk = (await this.ctx.storage.get<Record<string, number>>("risk")) ?? {};
-          const feePct = (configuredRisk.feePct ?? DEFAULT_RISK.feePct) / 100;
-          const slippagePct = (configuredRisk.slippagePct ?? DEFAULT_RISK.slippagePct) / 100;
-          const fillPrice = direction === "LONG" ? price * (1 + slippagePct) : price * (1 - slippagePct);
-          const position = { symbol, direction, setupId: setup.id, signalPrice: price, entry: fillPrice, currentPrice: price, positionSize: 0.01, notional: fillPrice * 0.01, entryFee: fillPrice * 0.01 * feePct, entrySlippage: Math.abs(fillPrice - price) * 0.01, stopLoss, takeProfits: [takeProfitOne, takeProfit], realizedPnl: 0, unrealizedPnl: 0, status: "OPEN", openedAt: Date.now() };
-          const previousActivity = (await this.ctx.storage.get<Record<string, unknown>[]>("activity")) ?? [];
-          await this.ctx.storage.put({ positions: [...open, position], activity: [{ kind: "PAPER_ENTRY", symbol, detail: `Paper ${direction} opened from qualified analysis at ${fillPrice.toFixed(2)} including slippage`, level: "info", timestamp: Date.now() }, ...previousActivity].slice(0, 200), journal: [{ timestamp: Date.now(), symbol, category: "PAPER_TRADE", title: `Paper ${direction} opened`, body: `Signal ${price}; simulated fill ${fillPrice}`, data: { signalPrice: price, fillPrice, stopLoss, takeProfit } }, ...journal].slice(0, 200) });
-        }
+
+      const engine = this.runtime().engineFor(symbol)!;
+      const analysis = serializeAnalysis(tick);
+
+      await this.ctx.storage.put({
+        analysis,
+        lastPrice: lastCloseOf(tick),
+        lastPollAt: Date.now(),
+        lastError: null,
+        providerHealth: { provider: tick.exchange, status: "healthy", checkedAt: Date.now(), symbol },
+      });
+
+      // Positions, journal and activity are the engine's, not the Worker's.
+      if (!symbolOverride) {
+        const positions = engine.getPositions();
+        const equity = engine.getRiskState().equity;
+        const equityHistory = (await this.ctx.storage.get<{ timestamp: number; equity: number }[]>("equityHistory")) ?? [];
+        const last = equityHistory.at(-1);
+        await this.ctx.storage.put({
+          positions,
+          journal: engine.getJournal().getAll().slice(0, 200),
+          activity: engine.getActivity().getAll().slice(0, 200),
+          ...(!last || Date.now() - last.timestamp >= 60_000
+            ? { equityHistory: [...equityHistory, { timestamp: Date.now(), equity }].slice(-2_000) }
+            : {}),
+        });
       }
+
+      console.log(JSON.stringify({
+        event: "analysis_completed",
+        symbol,
+        provider: tick.exchange,
+        bias: tick.analysis.bias,
+        status: tick.status,
+        warming: tick.warming,
+        executed: tick.executed,
+        rejected: tick.rejected,
+        timestamp: Date.now(),
+      }));
+
       if (!symbolOverride && assets.length > 1) {
         const scans: Record<string, unknown>[] = [analysis];
         for (const asset of assets.slice(1)) scans.push(await this.runAnalysis(asset));
@@ -247,29 +258,112 @@ export class TradingSession extends DurableObject<Env> {
       return analysis;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Market data request failed";
-      await this.ctx.storage.put({ lastError: message, lastPollAt: Date.now(), providerHealth: { provider: "unavailable", status: "error", checkedAt: Date.now(), symbol, error: message } });
+      await this.ctx.storage.put({
+        lastError: message,
+        lastPollAt: Date.now(),
+        providerHealth: { provider: "unavailable", status: "error", checkedAt: Date.now(), symbol, error: message },
+      });
       console.error(JSON.stringify({ event: "analysis_failed", symbol, message, timestamp: Date.now() }));
-      return (await this.ctx.storage.get<Record<string, unknown>>("analysis")) ?? { symbol, exchange: "binance", bias: "NEUTRAL", status: "MARKET_DATA_UNAVAILABLE", updatedAt: Date.now(), topDown: { htf: { timeframe: "4h", trend: "NEUTRAL", strength: "WAITING" }, mtf: { timeframe: "1h", trend: "NEUTRAL", strength: "WAITING" }, ltf: { timeframe: "15m", trend: "NEUTRAL" } }, setups: [], events: [] };
+      return (await this.ctx.storage.get<Record<string, unknown>>("analysis")) ?? {
+        symbol,
+        exchange: "multi-exchange",
+        bias: "UNCLEAR",
+        status: "MARKET_DATA_UNAVAILABLE",
+        updatedAt: Date.now(),
+        topDown: {
+          htf: { timeframe: "4H", trend: "NEUTRAL", strength: "WEAK" },
+          mtf: { timeframe: "1H", trend: "NEUTRAL", strength: "WEAK" },
+          ltf: { timeframe: "15M", trend: "NEUTRAL" },
+        },
+        setups: [],
+        events: [],
+      };
     }
   }
 
+  /**
+   * Chart payload for one symbol/timeframe. Kept out of `/api/analysis` and the
+   * WebSocket state frame because candle buffers and zone geometry are far
+   * larger than the summary those carry.
+   */
+  async getChart(symbol: string, timeframe?: string): Promise<Record<string, unknown>> {
+    const engine = this.runtime().engineFor(symbol);
+    if (!engine) return { symbol, timeframe: timeframe ?? null, available: false, reason: "This market has not been analysed yet." };
+    const analysis = engine.analysis.analyze();
+    const tf = (timeframe ?? engine.strategyConfig.timeframes.ltf) as keyof typeof analysis.snapshots;
+    const snapshot = analysis.snapshots[tf];
+    if (!snapshot) return { symbol, timeframe: tf, available: false, reason: "No candles for this timeframe yet." };
+    return {
+      symbol,
+      exchange: analysis.exchange,
+      timeframe: tf,
+      available: true,
+      updatedAt: analysis.updatedAt,
+      candles: snapshot.candles,
+      structure: snapshot.structure,
+      bos: snapshot.bos,
+      choch: snapshot.choch,
+      sweeps: snapshot.sweeps,
+      liquidityZones: snapshot.liquidityZones,
+      fvgs: snapshot.fvgs,
+      orderBlocks: snapshot.orderBlocks,
+      supplyDemand: snapshot.supplyDemand,
+      momentum: snapshot.momentum,
+      setups: analysis.setups,
+      positions: engine.getOpenPositions().filter((p) => p.symbol === symbol),
+    };
+  }
   async getAnalysis(): Promise<Record<string, unknown>> { return this.runAnalysis(); }
   async getMarketAnalyses(): Promise<Record<string, unknown>[]> { await this.runAnalysis(); return (await this.ctx.storage.get<Record<string, unknown>[]>("marketAnalyses")) ?? [await this.getAnalysis()]; }
   async getPositions(): Promise<Record<string, unknown>[]> { return (await this.ctx.storage.get<Record<string, unknown>[]>("positions")) ?? []; }
   async getActivity(): Promise<Record<string, unknown>[]> { return (await this.ctx.storage.get<Record<string, unknown>[]>("activity")) ?? []; }
   async getJournal(): Promise<Record<string, unknown>[]> { return (await this.ctx.storage.get<Record<string, unknown>[]>("journal")) ?? []; }
+  /**
+   * Risk state comes from the engine's own risk engine whenever a warm engine
+   * exists, so the dashboard reports the numbers that actually gated trades.
+   * The persisted snapshot is used only before the first tick of a cold start.
+   */
   async getRisk(): Promise<Record<string, unknown>> {
-    const positions = await this.getPositions();
-    const open = positions.filter((position) => position.status === "OPEN");
-    const realized = positions.reduce((sum, position) => sum + Number(position.realizedPnl ?? 0), 0);
-    const unrealized = open.reduce((sum, position) => sum + Number(position.unrealizedPnl ?? 0), 0);
-    const equity = 10_000 + realized + unrealized;
-    const exposure = open.reduce((sum, position) => sum + Number(position.notional ?? 0), 0);
+    const assets = await this.getAssets();
     const limits = { ...DEFAULT_RISK, ...((await this.ctx.storage.get<Record<string, number>>("risk")) ?? {}) };
-    const equityHistory = (await this.ctx.storage.get<{ timestamp: number; equity: number }[]>("equityHistory")) ?? [];
-    const last = equityHistory.at(-1);
-    if (!last || Date.now() - last.timestamp >= 60_000) await this.ctx.storage.put("equityHistory", [...equityHistory, { timestamp: Date.now(), equity }].slice(-2_000));
-    return { state: { equity, equityDayStart: 10_000, peakEquity: Math.max(10_000, equity), tradesToday: positions.length, realizedPnlToday: realized, openPositions: open, usedExposure: exposure, usedCorrelatedExposure: exposure, dailyLossReached: realized <= -(10_000 * limits.maxDailyLossPct / 100), drawdownReached: equity <= 10_000 * (1 - limits.maxDrawdownPct / 100) }, limits };
+    const engine = this.runtime().engineFor(assets[0] ?? "BTCUSDT");
+
+    if (engine) {
+      const state = engine.getRiskState();
+      return {
+        state: {
+          equity: state.equity,
+          equityDayStart: state.equityDayStart,
+          peakEquity: state.peakEquity,
+          tradesToday: state.tradesToday,
+          realizedPnlToday: state.realizedPnlToday,
+          openPositions: engine.getOpenPositions(),
+          usedExposure: state.usedExposure,
+          usedCorrelatedExposure: state.usedCorrelatedExposure,
+          dailyLossReached: state.dailyLossReached,
+          drawdownReached: state.drawdownReached,
+        },
+        limits,
+      };
+    }
+
+    const snapshot = await this.ctx.storage.get<{ risk?: Record<string, number>; positions?: unknown[] }>(`engine:${assets[0] ?? "BTCUSDT"}`);
+    const risk = snapshot?.risk;
+    return {
+      state: {
+        equity: risk?.equity ?? STARTING_EQUITY,
+        equityDayStart: risk?.equityDayStart ?? STARTING_EQUITY,
+        peakEquity: risk?.peakEquity ?? STARTING_EQUITY,
+        tradesToday: risk?.tradesToday ?? 0,
+        realizedPnlToday: risk?.realizedPnlToday ?? 0,
+        openPositions: (await this.getPositions()).filter((position) => position.status === "OPEN"),
+        usedExposure: risk?.usedExposure ?? 0,
+        usedCorrelatedExposure: risk?.usedCorrelatedExposure ?? 0,
+        dailyLossReached: Boolean(risk?.dailyLossReached),
+        drawdownReached: Boolean(risk?.drawdownReached),
+      },
+      limits,
+    };
   }
   async getEquityHistory(): Promise<{ timestamp: number; equity: number }[]> { return (await this.ctx.storage.get<{ timestamp: number; equity: number }[]>("equityHistory")) ?? []; }
   async restorePaperState(state: { positions?: unknown[]; journal?: unknown[]; activity?: unknown[]; equity?: number; updatedAt?: number }): Promise<{ restored: boolean; reason?: string }> {
@@ -379,6 +473,10 @@ export default {
     }
 
     if (url.pathname === "/api/analysis" && request.method === "GET") return json(request, env, await session.getAnalysis());
+    if (url.pathname === "/api/chart" && request.method === "GET") {
+      const symbol = url.searchParams.get("symbol") ?? assets[0] ?? "BTCUSDT";
+      return json(request, env, await session.getChart(symbol, url.searchParams.get("timeframe") ?? undefined));
+    }
     if (url.pathname === "/api/live-readiness" && request.method === "GET") return json(request, env, await session.getLiveTradingReadiness());
     if (url.pathname === "/api/markets" && request.method === "GET") return json(request, env, { analyses: await session.getMarketAnalyses() });
     if (url.pathname === "/api/risk" && request.method === "GET") return json(request, env, await session.getRisk());

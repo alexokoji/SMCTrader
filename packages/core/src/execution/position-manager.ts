@@ -285,6 +285,19 @@ export class PositionManager {
     return [...this.positions.values()];
   }
 
+  /**
+   * Replace tracked positions with a persisted snapshot. Used when a host that
+   * cannot hold the manager in memory indefinitely (such as an evicted Durable
+   * Object) rebuilds the engine from storage.
+   */
+  restore(positions: ManagedPosition[]): void {
+    this.positions = new Map(
+      positions
+        .filter((p) => typeof p?.id === "string")
+        .map((p) => [p.id, { ...p, events: [...(p.events ?? [])] }]),
+    );
+  }
+
   updateSl(symbol: string, id: string, newSl: number, timestamp: number, reason: string): void {
     const pos = this.positions.get(id);
     if (!pos || pos.symbol !== symbol || pos.status !== "OPEN") return;

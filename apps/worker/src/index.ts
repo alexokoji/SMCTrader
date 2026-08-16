@@ -1,11 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_RISK_CONFIG, computePerformance, type ManagedPosition, type Setup } from "@smc/core";
 import { TradingRuntime, type AnalysisTick, type RuntimeStorage } from "./runtime.js";
+import { sendIngest } from "./ingest.js";
 
 interface Env {
   TRADING_SESSION: DurableObjectNamespace<TradingSession>;
   ALLOWED_ORIGIN?: string;
   WORKER_AUTH_SECRET?: string;
+  /** Origin of the platform API that owns the MongoDB connection. */
+  PLATFORM_API_URL?: string;
 }
 
 type RuntimeMode = "ANALYSIS_ONLY" | "PAPER" | "LIVE";
@@ -249,6 +252,8 @@ export class TradingSession extends DurableObject<Env> {
         timestamp: Date.now(),
       }));
 
+      await this.persistDurably(tick);
+
       if (!symbolOverride && assets.length > 1) {
         const scans: Record<string, unknown>[] = [analysis];
         for (const asset of assets.slice(1)) scans.push(await this.runAnalysis(asset));
@@ -279,6 +284,81 @@ export class TradingSession extends DurableObject<Env> {
         events: [],
       };
     }
+  }
+
+  /** Remember which account this session belongs to, for durable writes. */
+  async setUserId(userId: string): Promise<void> {
+    if ((await this.ctx.storage.get<string>("userId")) !== userId) {
+      await this.ctx.storage.put("userId", userId);
+    }
+  }
+
+  /**
+   * Ship whatever is new since the last successful write to MongoDB. Watermarks
+   * are only advanced when the write succeeds, so a failed or skipped batch is
+   * retried on the next tick rather than silently lost.
+   */
+  private async persistDurably(tick: AnalysisTick): Promise<void> {
+    const userId = await this.ctx.storage.get<string>("userId");
+    if (!userId) return;
+
+    const symbol = tick.symbol;
+    const watermarkKey = `persisted:candles:${symbol}`;
+    const sentSetupsKey = `persisted:setups:${symbol}`;
+    const [watermark, sentSetups] = await Promise.all([
+      this.ctx.storage.get<Record<string, number>>(watermarkKey),
+      this.ctx.storage.get<Record<string, string>>(sentSetupsKey),
+    ]);
+    const marks = watermark ?? {};
+    const seen = sentSetups ?? {};
+
+    // Re-send the newest stored bar per timeframe: it may have closed since the
+    // last write. The unique index makes the repeat an upsert, not a duplicate.
+    const candles = Object.values(tick.analysis.snapshots)
+      .flatMap((snapshot) => snapshot?.candles ?? [])
+      .filter((candle) => candle.timestamp >= (marks[candle.timeframe] ?? 0));
+
+    // A setup is re-sent when its status changes, so the stored decision keeps up.
+    const setups = tick.analysis.setups.filter((setup) => seen[setup.id] !== setup.status);
+
+    const result = await sendIngest(
+      { url: this.env.PLATFORM_API_URL ?? "", secret: this.env.WORKER_AUTH_SECRET ?? "" },
+      {
+        userId,
+        candles,
+        setups,
+        run: {
+          symbol,
+          exchange: tick.exchange,
+          bias: tick.analysis.bias,
+          status: tick.status,
+          warming: tick.warming,
+          setupsSeen: tick.analysis.setups.length,
+          validSetups: tick.analysis.setups.filter((s) => s.status === "VALID").length,
+          rejectedSetups: tick.rejected,
+          executedSetups: tick.executed,
+          timestamp: Date.now(),
+        },
+      },
+    );
+
+    if (!result.sent) {
+      if (result.reason && !result.reason.includes("not configured")) {
+        console.warn(JSON.stringify({ event: "ingest_failed", symbol, reason: result.reason, timestamp: Date.now() }));
+      }
+      return;
+    }
+
+    for (const candle of candles) {
+      marks[candle.timeframe] = Math.max(marks[candle.timeframe] ?? 0, candle.timestamp);
+    }
+    for (const setup of setups) seen[setup.id] = setup.status;
+
+    await this.ctx.storage.put({
+      [watermarkKey]: marks,
+      // Bound the map so a long-running session cannot grow it without limit.
+      [sentSetupsKey]: Object.fromEntries(Object.entries(seen).slice(-500)),
+    });
   }
 
   /**
@@ -508,6 +588,9 @@ export default {
     if (!userId) return json(request, env, { error: "Authentication is required." }, 401);
     const session = env.TRADING_SESSION.getByName(`user:${userId}`);
     if (!(await session.allowRequest())) return json(request, env, { error: "Rate limit exceeded. Please retry in one minute." }, 429);
+    // The cron alarm has no request context, so the session records who it
+    // belongs to in order to scope its durable writes.
+    await session.setUserId(userId);
     await session.ensureAnalysisAlarm();
     const [mode, assets] = await Promise.all([session.getMode(), session.getAssets()]);
     const state = baseState(mode, assets);

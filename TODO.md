@@ -30,10 +30,16 @@
 - [x] Fixed profit factor, which compared a negative gross loss against zero and so
       always reported `Infinity` or `0`.
 
+- [x] Persist candles, setup decisions and analysis runs in MongoDB via a signed
+      `/api/ingest` endpoint, since the Workers runtime cannot open a TCP socket to
+      Atlas. Writes are idempotent and best-effort: a storage outage never stops
+      analysis or position management.
+
 ## Next
 
-- [ ] Persist candle history, analysis runs and setup decisions in MongoDB, not only
-      in Durable Object storage.
+- [ ] Read history back from MongoDB: seed a cold Durable Object from stored candles
+      instead of refetching, and serve analytics from `setup_decisions` so the
+      rejected-setup history outlives the current analysis window.
 - [ ] Analytics by market regime and session (§60) — needs the crypto context layer (§39).
 - [ ] Notifications: browser, email, Telegram (§64).
 - [ ] Admin panel (§85), replay engine (§89) and strategy debug mode (§90).

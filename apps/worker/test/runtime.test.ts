@@ -3,7 +3,9 @@ import type { Candle, Timeframe } from "@smc/core";
 import {
   CANDLE_BUFFER,
   HYDRATION_BUDGET,
+  STEADY_TICK_MS,
   TradingRuntime,
+  WARMING_TICK_MS,
   closedCandlesOnly,
   mergeCandles,
   type RuntimeStorage,
@@ -182,6 +184,58 @@ describe("TradingRuntime", () => {
     expect(after.journal.length).toBeGreaterThanOrEqual(before.journal.length);
     expect(after.risk.equity).toBeCloseTo(before.risk.equity, 6);
     expect(after.positions.length).toBe(before.positions.length);
+  });
+
+  it("replays stored history without calling an exchange, then resumes fetching", async () => {
+    const now = 1_800_000_000_000;
+    const storage = memoryStorage();
+    let fetches = 0;
+    const counting = (): typeof fetch => {
+      const inner = stubFetch(now);
+      return (async (input: string | URL, init?: RequestInit) => {
+        fetches++;
+        return inner(input as string, init);
+      }) as unknown as typeof fetch;
+    };
+
+    // First runtime populates storage.
+    const seed = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
+    let tick = await seed.tick("BTCUSDT", { ...baseOpts, now });
+    for (let i = 0; i < 20 && tick.warming; i++) tick = await seed.tick("BTCUSDT", { ...baseOpts, now });
+
+    // A fresh runtime over the same storage is a cold start with a full backlog.
+    const revived = new TradingRuntime(storage, { fetchFn: counting() });
+    const first = await revived.tick("BTCUSDT", { ...baseOpts, now });
+
+    expect(first.warming).toBe(true);
+    expect(first.usedStoredHistory).toBe(true);
+    // Replaying history must not hit the exchange at all.
+    expect(fetches).toBe(0);
+
+    // Once the backlog is drained it goes back to the network for new bars.
+    let next = first;
+    for (let i = 0; i < 25 && next.usedStoredHistory; i++) {
+      next = await revived.tick("BTCUSDT", { ...baseOpts, now });
+    }
+    expect(next.usedStoredHistory).toBe(false);
+    expect(next.warming).toBe(false);
+    expect(fetches).toBeGreaterThan(0);
+  });
+
+  it("asks to be woken quickly while warming and slowly once caught up", async () => {
+    const now = 1_800_000_000_000;
+    const runtime = new TradingRuntime(memoryStorage(), { fetchFn: stubFetch(now) });
+
+    let tick = await runtime.tick("BTCUSDT", { ...baseOpts, now });
+    expect(tick.warming).toBe(true);
+    expect(tick.nextTickMs).toBe(WARMING_TICK_MS);
+
+    for (let i = 0; i < 20 && tick.warming; i++) {
+      tick = await runtime.tick("BTCUSDT", { ...baseOpts, now });
+    }
+    expect(tick.warming).toBe(false);
+    expect(tick.nextTickMs).toBe(STEADY_TICK_MS);
+    expect(WARMING_TICK_MS).toBeLessThan(STEADY_TICK_MS);
   });
 
   it("keeps stored history when every market data provider fails", async () => {

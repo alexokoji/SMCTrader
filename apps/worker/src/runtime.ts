@@ -35,7 +35,17 @@ import {
 export const CANDLE_BUFFER = 240;
 
 /** Maximum candles replayed per invocation while warming a cold engine. */
-export const HYDRATION_BUDGET = 90;
+export const HYDRATION_BUDGET = 150;
+
+/**
+ * Alarm delay while an engine still has history to replay. Warm-up is bounded
+ * by CPU per invocation, not by wall-clock, so the fastest safe way through it
+ * is many small invocations rather than fewer large ones.
+ */
+export const WARMING_TICK_MS = 5_000;
+
+/** Alarm delay once the engine is caught up and only needs new closed bars. */
+export const STEADY_TICK_MS = 5 * 60_000;
 
 export interface RuntimeStorage {
   get<T>(key: string): Promise<T | undefined>;
@@ -55,6 +65,10 @@ export interface AnalysisTick {
   exchange: string;
   status: string;
   warming: boolean;
+  /** How long the caller should wait before the next tick for this symbol. */
+  nextTickMs: number;
+  /** True when this tick replayed stored history instead of calling an exchange. */
+  usedStoredHistory: boolean;
   analysis: SymbolAnalysis;
   executed: number;
   rejected: number;
@@ -116,6 +130,21 @@ export class TradingRuntime {
       symbol,
       exchange: "multi-exchange",
     };
+  }
+
+  /** Read the stored candle buffers without contacting an exchange. */
+  async storedBuffers(
+    symbol: string,
+    timeframes: { htf: Timeframe; mtf: Timeframe; ltf: Timeframe },
+    now: number,
+  ): Promise<Record<Timeframe, Candle[]>> {
+    const unique = [...new Set([timeframes.htf, timeframes.mtf, timeframes.ltf])];
+    const buffers = {} as Record<Timeframe, Candle[]>;
+    for (const tf of unique) {
+      const stored = (await this.storage.get<Candle[]>(candleKey(symbol, tf))) ?? [];
+      buffers[tf] = closedCandlesOnly(stored, TF_MS[tf], now);
+    }
+    return buffers;
   }
 
   /**
@@ -203,14 +232,25 @@ export class TradingRuntime {
     if (opts.safetyBlocked && !engine.isSafetyBlocked()) engine.enterSafeMode("Safety stop is engaged.");
     if (!opts.safetyBlocked && engine.isSafetyBlocked()) engine.exitSafeMode();
 
-    const buffers = await this.refreshCandles(symbol, strategyCfg.timeframes, now);
+    const backlogOf = (buffers: Record<Timeframe, Candle[]>) =>
+      Object.values(buffers)
+        .flat()
+        .filter((candle) => candle.timestamp > (state!.fedThrough[candle.timeframe] ?? 0))
+        .sort((a, b) => a.timestamp - b.timestamp);
+
+    // Replaying stored history needs no network. Only call an exchange once the
+    // backlog is small enough that this tick can also absorb new bars, which
+    // keeps warm-up off the exchange rate limits and much faster.
+    let buffers = await this.storedBuffers(symbol, strategyCfg.timeframes, now);
+    let usedStoredHistory = true;
+    if (backlogOf(buffers).length < HYDRATION_BUDGET) {
+      buffers = await this.refreshCandles(symbol, strategyCfg.timeframes, now);
+      usedStoredHistory = false;
+    }
 
     // Interleave timeframes in chronological order so structure on each
     // timeframe advances together, exactly as it would in a live feed.
-    const pending = Object.values(buffers)
-      .flat()
-      .filter((candle) => candle.timestamp > (state!.fedThrough[candle.timeframe] ?? 0))
-      .sort((a, b) => a.timestamp - b.timestamp);
+    const pending = backlogOf(buffers);
 
     const budgeted = pending.slice(0, HYDRATION_BUDGET);
     const warming = budgeted.length < pending.length;
@@ -244,6 +284,8 @@ export class TradingRuntime {
       exchange: this.lastProvider,
       status: warming ? "WARMING_UP" : analysis.status,
       warming,
+      nextTickMs: warming ? WARMING_TICK_MS : STEADY_TICK_MS,
+      usedStoredHistory,
       analysis,
       executed,
       rejected,

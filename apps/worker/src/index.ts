@@ -1,6 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import { DEFAULT_RISK_CONFIG, computePerformance, type ManagedPosition, type Setup } from "@smc/core";
-import { TradingRuntime, type AnalysisTick, type RuntimeStorage } from "./runtime.js";
+import {
+  STEADY_TICK_MS,
+  TradingRuntime,
+  WARMING_TICK_MS,
+  type AnalysisTick,
+  type RuntimeStorage,
+} from "./runtime.js";
 import { sendIngest } from "./ingest.js";
 
 interface Env {
@@ -160,11 +166,19 @@ export class TradingSession extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    let nextDelay = STEADY_TICK_MS;
     try {
       await this.runAnalysis();
-      await this.probeProviderHealth();
+      // While any market is still replaying history, come back quickly. Warm-up
+      // is limited by CPU per invocation, not wall-clock, so short intervals
+      // shorten it from tens of minutes to about a minute.
+      nextDelay = (await this.ctx.storage.get<boolean>("anyWarming"))
+        ? WARMING_TICK_MS
+        : STEADY_TICK_MS;
+      // Provider probes are only useful at the steady cadence.
+      if (nextDelay === STEADY_TICK_MS) await this.probeProviderHealth();
     } finally {
-      await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
+      await this.ctx.storage.setAlarm(Date.now() + nextDelay);
     }
   }
 
@@ -254,11 +268,18 @@ export class TradingSession extends DurableObject<Env> {
 
       await this.persistDurably(tick);
 
+      let anyWarming = tick.warming;
       if (!symbolOverride && assets.length > 1) {
         const scans: Record<string, unknown>[] = [analysis];
-        for (const asset of assets.slice(1)) scans.push(await this.runAnalysis(asset));
+        for (const asset of assets.slice(1)) {
+          const scan = await this.runAnalysis(asset);
+          if (scan.warming === true) anyWarming = true;
+          scans.push(scan);
+        }
         await this.ctx.storage.put({ analysis, marketAnalyses: scans });
       }
+      // Drives the alarm cadence: fast while any market replays history.
+      if (!symbolOverride) await this.ctx.storage.put({ anyWarming });
       if (!symbolOverride) await this.broadcastState();
       return analysis;
     } catch (error) {

@@ -1,5 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
-import { DEFAULT_RISK_CONFIG, computePerformance, type ManagedPosition, type Setup } from "@smc/core";
+import {
+  DEFAULT_RISK_CONFIG,
+  MultiExchangeMarketData,
+  TIMEFRAME_DURATION_MS,
+  computePerformance,
+  runBacktest as runHistoricalBacktest,
+  validateRiskConfig,
+  type ManagedPosition,
+  type Setup,
+} from "@smc/core";
 import {
   STEADY_TICK_MS,
   TradingRuntime,
@@ -25,6 +34,11 @@ const DEFAULT_ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
 // limits the strategy and tests are written against.
 const { correlationGroups: _correlationGroups, ...DEFAULT_RISK } = DEFAULT_RISK_CONFIG;
 const STARTING_EQUITY = 10_000;
+/**
+ * Lower-timeframe candles a single backtest request will replay. Each one runs
+ * a full engine cycle, so this bounds the invocation's CPU time.
+ */
+const MAX_BACKTEST_CANDLES = 4_000;
 
 function corsHeaders(request: Request, env: Env): Headers {
   const headers = new Headers(JSON_HEADERS);
@@ -562,19 +576,52 @@ export class TradingSession extends DurableObject<Env> {
   async getProviderHealth(): Promise<Record<string, unknown>> { return (await this.ctx.storage.get<Record<string, unknown>>("providerHealth")) ?? { provider: "unknown", status: "pending" }; }
   async getConfig(): Promise<Record<string, unknown>> { return { strategy: (await this.ctx.storage.get<Record<string, unknown>>("strategy")) ?? { version: "cloudflare-paper-v1" }, risk: { ...DEFAULT_RISK, ...((await this.ctx.storage.get<Record<string, number>>("risk")) ?? {}) } }; }
   async updateConfig(patch: { strategy?: Record<string, unknown>; risk?: Record<string, number> }): Promise<Record<string, unknown>> { const current = await this.getConfig(); const risk = { ...(current.risk as Record<string, number>), ...(patch.risk ?? {}) }; await this.ctx.storage.put({ risk, strategy: { ...(current.strategy as Record<string, unknown>), ...(patch.strategy ?? {}) } }); return this.getConfig(); }
+  /**
+   * Historical replay using the real SMC engine. The strategy, risk and
+   * position-management code paths are the same ones paper and live trading
+   * use, so a backtest here reflects what the engine would actually have done.
+   */
   async runBacktest(startTime: number, endTime: number, startingEquity = 10_000): Promise<Record<string, unknown>> {
     const symbol = (await this.getAssets())[0] ?? "BTCUSDT";
-    const product = symbol.replace(/USDT$/, "-USD");
-    const url = new URL(`https://api.exchange.coinbase.com/products/${product}/candles`);
-    url.searchParams.set("granularity", "3600"); url.searchParams.set("start", new Date(startTime).toISOString()); url.searchParams.set("end", new Date(endTime).toISOString());
-    const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!response.ok) throw new Error(`Backtest data unavailable: ${response.status}`);
-    const closes = ((await response.json()) as unknown[][]).reverse().map((row) => Number(row[4])).filter(Number.isFinite);
-    if (closes.length < 55) throw new Error("Backtest range needs at least 55 hourly candles.");
-    let equity = startingEquity; let peak = equity; let maxDrawdown = 0; let wins = 0; const trades: Record<string, unknown>[] = []; const curve: { timestamp: number; equity: number }[] = [];
-    for (let i = 50; i < closes.length - 6; i += 6) { const fast = closes.slice(i - 20, i).reduce((a, b) => a + b, 0) / 20; const slow = closes.slice(i - 50, i).reduce((a, b) => a + b, 0) / 50; const returnPct = ((closes[i + 6] - closes[i]) / closes[i]) * (fast >= slow ? 1 : -1); const pnl = equity * Math.max(-0.01, Math.min(0.02, returnPct)); equity += pnl; if (pnl > 0) wins++; peak = Math.max(peak, equity); maxDrawdown = Math.max(maxDrawdown, ((peak - equity) / peak) * 100); trades.push({ direction: fast >= slow ? "LONG" : "SHORT", entry: closes[i], exit: closes[i + 6], pnl }); curve.push({ timestamp: startTime + i * 3_600_000, equity }); }
-    const totalTrades = trades.length; const grossProfit = trades.filter((trade) => Number(trade.pnl) > 0).reduce((sum, trade) => sum + Number(trade.pnl), 0); const grossLoss = Math.abs(trades.filter((trade) => Number(trade.pnl) < 0).reduce((sum, trade) => sum + Number(trade.pnl), 0));
-    return { trades, equityCurve: curve, stats: { totalTrades, winRate: totalTrades ? (wins / totalTrades) * 100 : 0, profitFactor: grossLoss ? grossProfit / grossLoss : grossProfit ? 99 : 0, netPnl: equity - startingEquity, maxDrawdown }, validSetups: totalTrades, rejectedSetups: 0, message: `Replayed ${closes.length} Coinbase hourly candles for ${symbol}.` };
+    const storedRisk = await this.ctx.storage.get<Record<string, number>>("risk");
+    const storedStrategy = await this.ctx.storage.get<Record<string, unknown>>("strategy");
+    const runtime = this.runtime();
+    const strategyConfig = runtime.strategyConfigFor(symbol, storedStrategy as Record<string, never> | undefined);
+    const riskConfig = validateRiskConfig({ ...DEFAULT_RISK_CONFIG, ...(storedRisk ?? {}) });
+
+    // Bound the range: every lower-timeframe candle runs a full engine cycle,
+    // and one invocation has a finite CPU budget.
+    const ltfMs = TIMEFRAME_DURATION_MS[strategyConfig.timeframes.ltf];
+    const estimatedCandles = Math.ceil((endTime - startTime) / ltfMs);
+    if (estimatedCandles > MAX_BACKTEST_CANDLES) {
+      const maxDays = Math.floor((MAX_BACKTEST_CANDLES * ltfMs) / 86_400_000);
+      throw new Error(
+        `That range needs about ${estimatedCandles} ${strategyConfig.timeframes.ltf} candles, above the ${MAX_BACKTEST_CANDLES} this deployment replays in one request. Choose a range of roughly ${maxDays} days or fewer.`,
+      );
+    }
+
+    const result = await runHistoricalBacktest({
+      symbol,
+      exchange: "multi-exchange",
+      strategyConfig,
+      riskConfig,
+      startTime,
+      endTime,
+      startingEquity,
+      marketData: new MultiExchangeMarketData({ timeoutMs: 10_000 }),
+    });
+
+    console.log(JSON.stringify({
+      event: "backtest_completed",
+      symbol,
+      trades: result.stats.totalTrades,
+      validSetups: result.validSetups,
+      rejectedSetups: result.rejectedSetups,
+      netPnl: result.stats.netPnl,
+      timestamp: Date.now(),
+    }));
+
+    return { ...result, symbol, strategyVersion: strategyConfig.version };
   }
   async isAutoTrading(): Promise<boolean> { return (await this.ctx.storage.get<boolean>("autoTrading")) ?? false; }
   async isSafetyBlocked(): Promise<boolean> { return (await this.ctx.storage.get<boolean>("safetyBlocked")) ?? false; }

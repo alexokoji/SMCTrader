@@ -166,7 +166,6 @@ export class MarketStructureEngine {
     const prevTrend = this.trend;
 
     if (lastHigh && close > lastHigh.price + EPS) {
-      const sweepish = this.levelWasSwept(lastHigh.price, "BULLISH", (n - 1));
       const key = `BOS_UP_${lastHigh.price.toFixed(8)}_${(n - 1)}`;
       if (key !== this.lastBreakKey || n - 1 > this.lastEventIndex + 60) {
         this.lastBreakKey = key;
@@ -189,7 +188,6 @@ export class MarketStructureEngine {
     }
 
     if (lastLow && close < lastLow.price - EPS) {
-      const sweepish = this.levelWasSwept(lastLow.price, "BEARISH", (n - 1));
       const key = `BOS_DOWN_${lastLow.price.toFixed(8)}_${(n - 1)}`;
       if (key !== this.lastBreakKey || n - 1 > this.lastEventIndex + 60) {
         this.lastBreakKey = key;

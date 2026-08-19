@@ -5,6 +5,13 @@ import { atr, hashString } from "../util.js";
 export interface OrderBlockEngineOptions {
   displacementAtrMultiple: number;
   maxBlocks: number;
+  /**
+   * How far back to look for the candle that originated an impulse. An order
+   * block is the last opposite-colour candle before the move, which is often
+   * several bars behind the displacement candle rather than immediately behind
+   * it.
+   */
+  impulseLookback: number;
 }
 
 export interface OrderBlockUpdateResult {
@@ -18,6 +25,8 @@ export class OrderBlockEngine {
   readonly timeframe: Timeframe;
   private candles: Candle[] = [];
   private blocks: OrderBlock[] = [];
+  /** Candle index each block was created on, used to defer mitigation checks. */
+  private creationIndex = new Map<string, number>();
   private opts: OrderBlockEngineOptions;
 
   constructor(
@@ -32,6 +41,7 @@ export class OrderBlockEngine {
     this.opts = {
       displacementAtrMultiple: opts?.displacementAtrMultiple ?? 1.5,
       maxBlocks: opts?.maxBlocks ?? 80,
+      impulseLookback: opts?.impulseLookback ?? 5,
     };
   }
 
@@ -57,35 +67,33 @@ export class OrderBlockEngine {
         (body >= a * this.opts.displacementAtrMultiple * 0.8 && body > 0));
 
     if (displacement && n >= 2) {
-      const prev = this.candles[n - 2];
-      if (prev) {
-        if (candle.close > candle.open && prev.close < prev.open) {
-          const block = this.build(
-            "BULLISH",
-            prev.low,
-            prev.high,
-            n - 2,
-            prev.timestamp,
-            a,
-          );
-          created.push(block);
-        } else if (candle.close < candle.open && prev.close > prev.open) {
-          const block = this.build(
-            "BEARISH",
-            prev.low,
-            prev.high,
-            n - 2,
-            prev.timestamp,
-            a,
-          );
-          created.push(block);
-        }
+      const impulseIsUp = candle.close > candle.open;
+      // Walk back through the impulse leg to the last candle that closed
+      // against it. Requiring that candle to sit immediately behind the
+      // displacement bar discards most real order blocks, because an impulse
+      // usually spans several candles in the same direction.
+      const originIndex = this.findImpulseOrigin(n - 1, impulseIsUp);
+      if (originIndex >= 0) {
+        const origin = this.candles[originIndex];
+        const block = this.build(
+          impulseIsUp ? "BULLISH" : "BEARISH",
+          origin.low,
+          origin.high,
+          originIndex,
+          origin.timestamp,
+          a,
+        );
+        this.creationIndex.set(block.id, n - 1);
+        created.push(block);
       }
     }
 
     const current = this.candles[n - 1];
     for (const block of this.blocks) {
       if (block.status === "MITIGATED") continue;
+      // The displacement candle that created a block necessarily trades through
+      // it, so mitigation is only assessed from the following candle onwards.
+      if (n - 1 <= (this.creationIndex.get(block.id) ?? -1)) continue;
       if (current.low <= block.bottom || current.high >= block.top) {
         if (current.high >= block.top && current.close < block.bottom) {
           block.status = "MITIGATED";
@@ -136,6 +144,22 @@ export class OrderBlockEngine {
     };
     this.blocks.push(block);
     return block;
+  }
+
+  /**
+   * Index of the last candle closing against an impulse that ends at
+   * `endIndex`, or -1 when the impulse has no such origin in range.
+   */
+  private findImpulseOrigin(endIndex: number, impulseIsUp: boolean): number {
+    for (let k = 1; k <= this.opts.impulseLookback; k++) {
+      const index = endIndex - k;
+      if (index < 0) return -1;
+      const c = this.candles[index];
+      const body = c.close - c.open;
+      if (body === 0) continue;
+      if (impulseIsUp ? body < 0 : body > 0) return index;
+    }
+    return -1;
   }
 
   getBlocks(): OrderBlock[] {

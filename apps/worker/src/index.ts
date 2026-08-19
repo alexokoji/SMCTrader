@@ -623,7 +623,18 @@ export class TradingSession extends DurableObject<Env> {
 
     return { ...result, symbol, strategyVersion: strategyConfig.version };
   }
-  async isAutoTrading(): Promise<boolean> { return (await this.ctx.storage.get<boolean>("autoTrading")) ?? false; }
+  /**
+   * Auto trading defaults to on in PAPER mode. Paper trading risks nothing and
+   * observing the engine trade is the entire point of the deployment, so a
+   * session that has never been configured should not sit idle. An explicit
+   * choice is always respected: turning it off stores `false`, which wins here.
+   * Any other mode stays off until deliberately enabled.
+   */
+  async isAutoTrading(): Promise<boolean> {
+    const stored = await this.ctx.storage.get<boolean>("autoTrading");
+    if (typeof stored === "boolean") return stored;
+    return (await this.getMode()) === "PAPER";
+  }
   async isSafetyBlocked(): Promise<boolean> { return (await this.ctx.storage.get<boolean>("safetyBlocked")) ?? false; }
   async setSafetyBlocked(blocked: boolean, reason = "Manual safety control"): Promise<{ safetyBlocked: boolean }> { await this.ctx.storage.put({ safetyBlocked: blocked, safetyReason: reason }); return { safetyBlocked: blocked }; }
   async setAutoTrading(enabled: boolean): Promise<{ enabled: boolean }> { await this.ctx.storage.put("autoTrading", enabled); return { enabled }; }

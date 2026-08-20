@@ -42,7 +42,10 @@ export const HYDRATION_BUDGET = 150;
  * by CPU per invocation, not by wall-clock, so the fastest safe way through it
  * is many small invocations rather than fewer large ones.
  */
-export const WARMING_TICK_MS = 5_000;
+export const WARMING_TICK_MS = 20_000;
+
+/** Slowest interval at which an unchanged engine snapshot is still persisted. */
+export const SNAPSHOT_HEARTBEAT_MS = 10 * 60_000;
 
 /** Alarm delay once the engine is caught up and only needs new closed bars. */
 export const STEADY_TICK_MS = 5 * 60_000;
@@ -54,6 +57,9 @@ export interface RuntimeStorage {
 
 export interface SymbolState {
   engine: StrategyEngine;
+  /** Signature of the last persisted snapshot, to skip unchanged writes. */
+  lastSnapshotSignature?: string;
+  lastPersistAt?: number;
   /** Newest candle timestamp fed per timeframe, used for incremental feeding. */
   fedThrough: Partial<Record<Timeframe, number>>;
   /** True once the stored history has been fully replayed into the engine. */
@@ -177,10 +183,17 @@ export class TradingRuntime {
       }
       const merged = mergeCandles(stored, fetched);
       buffers[tf] = closedCandlesOnly(merged, TF_MS[tf], now);
-      writes[candleKey(symbol, tf)] = merged;
+      // Only write when the buffer actually changed. Each timeframe is its own
+      // storage row, and rewriting identical buffers every tick was a large
+      // share of the write budget.
+      const changed =
+        merged.length !== stored.length ||
+        merged.at(-1)?.timestamp !== stored.at(-1)?.timestamp ||
+        merged.at(-1)?.close !== stored.at(-1)?.close;
+      if (changed) writes[candleKey(symbol, tf)] = merged;
     }
 
-    await this.storage.put(writes);
+    if (Object.keys(writes).length > 0) await this.storage.put(writes);
     return buffers;
   }
 
@@ -295,8 +308,29 @@ export class TradingRuntime {
     };
   }
 
+  /**
+   * Snapshots exist so an evicted Durable Object can resume without losing
+   * positions or the audit trail. They are large, so they are written when that
+   * state changes and otherwise at a slow heartbeat, rather than every tick.
+   */
   private async persist(symbol: string, engine: StrategyEngine): Promise<void> {
-    await this.storage.put({ [snapshotKey(symbol)]: engine.serialize() });
+    const snapshot = engine.serialize();
+    const signature = [
+      snapshot.positions.length,
+      snapshot.journal.length,
+      snapshot.activity.length,
+      snapshot.risk.equity.toFixed(6),
+      snapshot.risk.tradesToday,
+    ].join(":");
+    const state = this.symbols.get(symbol);
+    const now = Date.now();
+    const due = !state?.lastPersistAt || now - state.lastPersistAt >= SNAPSHOT_HEARTBEAT_MS;
+    if (state && signature === state.lastSnapshotSignature && !due) return;
+    if (state) {
+      state.lastSnapshotSignature = signature;
+      state.lastPersistAt = now;
+    }
+    await this.storage.put({ [snapshotKey(symbol)]: snapshot });
   }
 
   engineFor(symbol: string): StrategyEngine | undefined {

@@ -117,6 +117,9 @@ function lastCloseOf(tick: AnalysisTick): number | null {
 
 export class TradingSession extends DurableObject<Env> {
   private runtimeInstance?: TradingRuntime;
+  /** Guards against rewriting unchanged engine output every tick. */
+  private lastEngineSignature = "";
+  private lastAnyWarming?: boolean;
 
   /**
    * The runtime is held on the Durable Object instance so engines stay warm
@@ -162,15 +165,18 @@ export class TradingSession extends DurableObject<Env> {
     const frame = JSON.stringify({ type: "state", payload: await this.getStreamState() });
     for (const socket of sockets) { try { socket.send(frame); } catch { /* stale sockets are cleaned up by the runtime */ } }
   }
+  /**
+   * Rate limiting is held in memory rather than storage. A Durable Object is a
+   * single instance, so the window does not need to survive eviction, and
+   * persisting it wrote a storage row on every request.
+   */
+  private requestTimes: number[] = [];
+
   async allowRequest(limit = 120, windowMs = 60_000): Promise<boolean> {
     const now = Date.now();
-    const recent = ((await this.ctx.storage.get<number[]>("requestTimestamps")) ?? []).filter((timestamp) => timestamp > now - windowMs);
-    if (recent.length >= limit) {
-      await this.ctx.storage.put("requestTimestamps", recent);
-      return false;
-    }
-    recent.push(now);
-    await this.ctx.storage.put("requestTimestamps", recent);
+    this.requestTimes = this.requestTimes.filter((t) => t > now - windowMs);
+    if (this.requestTimes.length >= limit) return false;
+    this.requestTimes.push(now);
     return true;
   }
 
@@ -244,29 +250,41 @@ export class TradingSession extends DurableObject<Env> {
       const engine = this.runtime().engineFor(symbol)!;
       const analysis = serializeAnalysis(tick);
 
-      await this.ctx.storage.put({
+      // Every distinct key written is a billed storage row, so telemetry that
+      // used to occupy five keys is kept in one.
+      const writes: Record<string, unknown> = {
         analysis,
-        lastPrice: lastCloseOf(tick),
-        lastPollAt: Date.now(),
-        lastError: null,
-        providerHealth: { provider: tick.exchange, status: "healthy", checkedAt: Date.now(), symbol },
-      });
+        feed: {
+          lastPrice: lastCloseOf(tick),
+          lastPollAt: Date.now(),
+          lastError: null,
+          provider: tick.exchange,
+          providerStatus: "healthy",
+        },
+      };
 
-      // Positions, journal and activity are the engine's, not the Worker's.
       if (!symbolOverride) {
         const positions = engine.getPositions();
-        const equity = engine.getRiskState().equity;
-        const equityHistory = (await this.ctx.storage.get<{ timestamp: number; equity: number }[]>("equityHistory")) ?? [];
-        const last = equityHistory.at(-1);
-        await this.ctx.storage.put({
-          positions,
-          journal: engine.getJournal().getAll().slice(0, 200),
-          activity: engine.getActivity().getAll().slice(0, 200),
-          ...(!last || Date.now() - last.timestamp >= 60_000
-            ? { equityHistory: [...equityHistory, { timestamp: Date.now(), equity }].slice(-2_000) }
-            : {}),
-        });
+        const journal = engine.getJournal().getAll().slice(0, 200);
+        const activity = engine.getActivity().getAll().slice(0, 200);
+        // Rewriting these on every tick dominated the write budget while
+        // nothing about them had changed.
+        const signature = `${positions.length}:${journal.length}:${activity.length}:${engine.getRiskState().equity.toFixed(4)}`;
+        if (signature !== this.lastEngineSignature) {
+          this.lastEngineSignature = signature;
+          writes.positions = positions;
+          writes.journal = journal;
+          writes.activity = activity;
+
+          const equityHistory = (await this.ctx.storage.get<{ timestamp: number; equity: number }[]>("equityHistory")) ?? [];
+          const last = equityHistory.at(-1);
+          if (!last || Date.now() - last.timestamp >= 60_000) {
+            writes.equityHistory = [...equityHistory, { timestamp: Date.now(), equity: engine.getRiskState().equity }].slice(-2_000);
+          }
+        }
       }
+
+      await this.ctx.storage.put(writes);
 
       console.log(JSON.stringify({
         event: "analysis_completed",
@@ -292,16 +310,18 @@ export class TradingSession extends DurableObject<Env> {
         }
         await this.ctx.storage.put({ analysis, marketAnalyses: scans });
       }
-      // Drives the alarm cadence: fast while any market replays history.
-      if (!symbolOverride) await this.ctx.storage.put({ anyWarming });
+      // Drives the alarm cadence: fast while any market replays history. Only
+      // written when it actually flips.
+      if (!symbolOverride && anyWarming !== this.lastAnyWarming) {
+        this.lastAnyWarming = anyWarming;
+        await this.ctx.storage.put({ anyWarming });
+      }
       if (!symbolOverride) await this.broadcastState();
       return analysis;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Market data request failed";
       await this.ctx.storage.put({
-        lastError: message,
-        lastPollAt: Date.now(),
-        providerHealth: { provider: "unavailable", status: "error", checkedAt: Date.now(), symbol, error: message },
+        feed: { lastError: message, lastPollAt: Date.now(), provider: "unavailable", providerStatus: "error" },
       });
       console.error(JSON.stringify({ event: "analysis_failed", symbol, message, timestamp: Date.now() }));
       return (await this.ctx.storage.get<Record<string, unknown>>("analysis")) ?? {
@@ -496,6 +516,11 @@ export class TradingSession extends DurableObject<Env> {
       limits,
     };
   }
+  /** Feed telemetry recorded by the most recent analysis tick. */
+  async getFeed(): Promise<Record<string, unknown>> {
+    return (await this.ctx.storage.get<Record<string, unknown>>("feed")) ?? { lastPollAt: null, lastError: null, provider: "unknown" };
+  }
+
   async getEquityHistory(): Promise<{ timestamp: number; equity: number }[]> { return (await this.ctx.storage.get<{ timestamp: number; equity: number }[]>("equityHistory")) ?? []; }
 
   /**
@@ -722,7 +747,9 @@ export default {
 
     if (url.pathname === "/api/status" && request.method === "GET") {
       const [analysis, positions, autoTrading, safetyBlocked] = await Promise.all([session.getAnalysis(), session.getPositions(), session.isAutoTrading(), session.isSafetyBlocked()]);
-      return json(request, env, { ...state, autoTrading, safetyBlocked, analysis, positions, feed: { ...state.feed, running: true, candlesFed: 60, cyclesProcessed: 1 } });
+      const feed = (await session.getFeed()) as { lastError?: string | null };
+      // Report the feed the engine actually recorded rather than fixed numbers.
+      return json(request, env, { ...state, autoTrading, safetyBlocked, analysis, positions, feed: { ...state.feed, ...feed, running: !feed.lastError } });
     }
     if (url.pathname === "/api/assets") {
       if (request.method === "GET") return json(request, env, { assets });

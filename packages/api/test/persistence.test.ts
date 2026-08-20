@@ -168,6 +168,19 @@ describe("persistSetupDecisions", () => {
     expect(op.updateOne.update.$set.status).toBe("EXECUTED");
   });
 
+  it("never puts createdAt in both operators, which MongoDB rejects outright", async () => {
+    const { store: s, setupDecisions } = store();
+    await persistSetupDecisions(s, "user-1", [{ setupId: "s-1", createdAt: 100, status: "VALID" }], 900);
+    const [op] = setupDecisions.bulkOps[0] as [{ updateOne: { update: Record<string, Record<string, unknown>> } }];
+
+    // "Updating the path 'createdAt' would create a conflict at 'createdAt'"
+    expect(op.updateOne.update.$set).not.toHaveProperty("createdAt");
+    expect(op.updateOne.update.$setOnInsert).toEqual({ createdAt: 100 });
+    const setKeys = Object.keys(op.updateOne.update.$set);
+    const insertKeys = Object.keys(op.updateOne.update.$setOnInsert);
+    expect(setKeys.filter((k) => insertKeys.includes(k))).toEqual([]);
+  });
+
   it("skips entries without a setup id rather than writing junk keys", async () => {
     const { store: s, setupDecisions } = store();
     const result = await persistSetupDecisions(s, "user-1", [{ symbol: "BTCUSDT" }, { setupId: "" }]);

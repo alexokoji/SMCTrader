@@ -82,6 +82,9 @@ export interface AnalysisTick {
   analysis: SymbolAnalysis;
   executed: number;
   rejected: number;
+  /** Why the execution path declined a setup, so a READY market that never
+   * trades can be explained rather than guessed at. */
+  blockedReasons: string[];
   message?: string;
 }
 
@@ -296,12 +299,16 @@ export class TradingRuntime {
     let executed = 0;
     let rejected = 0;
     let message: string | undefined;
+    const blocked = new Set<string>();
 
     for (const candle of budgeted) {
       const result = engine.onCandleClosed(candle);
       state.fedThrough[candle.timeframe] = candle.timestamp;
       executed += result.decisions.filter((d) => d.decision === "EXECUTE").length;
       rejected += result.rejectedSetups.length;
+      for (const decision of result.decisions) {
+        if (decision.decision === "REJECT") for (const reason of decision.reasons) blocked.add(reason);
+      }
       message = result.message ?? message;
     }
     await engine.flush();
@@ -327,6 +334,7 @@ export class TradingRuntime {
       analysis,
       executed,
       rejected,
+      blockedReasons: [...blocked].slice(-6),
       message: warming
         ? `Replaying stored history: ${pending.length - budgeted.length} candles remaining before analysis is authoritative.`
         : message,

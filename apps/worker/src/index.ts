@@ -313,6 +313,7 @@ export class TradingSession extends DurableObject<Env> {
             }]),
         ),
         reason: tick.analysis.noTradeReason ?? null,
+        blocked: tick.blockedReasons,
         timestamp: Date.now(),
       }));
 

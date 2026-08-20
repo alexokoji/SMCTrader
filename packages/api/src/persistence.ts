@@ -176,16 +176,22 @@ export async function persistSetupDecisions(
   const valid = setups.filter((setup) => typeof setup.setupId === "string" && setup.setupId.length > 0);
   if (!valid.length) return { accepted: 0 };
 
-  const operations = valid.slice(0, MAX_SETUPS_PER_INGEST).map((setup) => ({
-    updateOne: {
-      filter: { userId, setupId: setup.setupId },
-      update: {
-        $set: { ...setup, userId, decidedAt: now },
-        $setOnInsert: { createdAt: setup.createdAt ?? now },
+  const operations = valid.slice(0, MAX_SETUPS_PER_INGEST).map((setup) => {
+    // `createdAt` cannot appear in both operators: MongoDB rejects the whole
+    // update with a path conflict. The setup carries its own createdAt, so it
+    // is pulled out of the $set payload and applied on insert only.
+    const { createdAt, ...fields } = setup;
+    return {
+      updateOne: {
+        filter: { userId, setupId: setup.setupId },
+        update: {
+          $set: { ...fields, userId, decidedAt: now },
+          $setOnInsert: { createdAt: createdAt ?? now },
+        },
+        upsert: true,
       },
-      upsert: true,
-    },
-  }));
+    };
+  });
 
   await store.setupDecisions.bulkWrite(operations, { ordered: false });
   return { accepted: operations.length };

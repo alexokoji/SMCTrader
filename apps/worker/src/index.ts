@@ -94,7 +94,9 @@ function serializeAnalysis(tick: AnalysisTick): Record<string, unknown> {
     bias: analysis.bias,
     status: tick.status,
     warming: tick.warming,
-    message: tick.message ?? null,
+    // Prefer the engine's own account of why nothing is tradeable.
+    message: tick.message ?? analysis.noTradeReason ?? null,
+    noTradeReason: analysis.noTradeReason ?? null,
     topDown: analysis.topDown,
     setups: analysis.setups,
     events: analysis.events.map((event) => ({
@@ -286,6 +288,7 @@ export class TradingSession extends DurableObject<Env> {
 
       await this.ctx.storage.put(writes);
 
+      const snaps = tick.analysis.snapshots;
       console.log(JSON.stringify({
         event: "analysis_completed",
         symbol,
@@ -295,6 +298,21 @@ export class TradingSession extends DurableObject<Env> {
         warming: tick.warming,
         executed: tick.executed,
         rejected: tick.rejected,
+        setups: tick.analysis.setups.length,
+        // Per-timeframe structure, so a neutral bias can be traced to the
+        // timeframe responsible instead of guessed at.
+        tf: Object.fromEntries(
+          Object.entries(snaps)
+            .filter(([, snap]) => snap)
+            .map(([timeframe, snap]) => [timeframe, {
+              candles: snap!.candles.length,
+              trend: snap!.structure.trend,
+              freshObs: snap!.orderBlocks.filter((b) => b.status === "FRESH").length,
+              fvgs: snap!.fvgs.length,
+              liquidity: snap!.liquidityZones.length,
+            }]),
+        ),
+        reason: tick.analysis.noTradeReason ?? null,
         timestamp: Date.now(),
       }));
 

@@ -122,6 +122,8 @@ export interface AnalysisResult {
   /** True while the engine is still replaying stored history after a restart. */
   warming?: boolean;
   message?: string | null;
+  /** Why no setup exists, in the engine's own words. */
+  noTradeReason?: string | null;
   updatedAt: number;
 }
 

@@ -89,10 +89,17 @@ export function AnalysisExplanation({ analysis }: { analysis: AnalysisResult | n
           <SetupReasoning setup={leading} />
         </>
       ) : (
-        <p className="helper">
-          No setup is on the table. The engine trades only when its conditions are met, so
-          zero setups is a valid outcome.
-        </p>
+        <>
+          <p className="helper">
+            {analysis.noTradeReason
+              ?? "No setup is on the table. The engine trades only when its conditions are met, so zero setups is a valid outcome."}
+          </p>
+          {analysis.noTradeReason && (
+            <p className="helper">
+              Zero setups is a valid outcome. The engine does not trade to fill a quota.
+            </p>
+          )}
+        </>
       )}
 
       {analysis.message && !analysis.warming && <p className="helper">{analysis.message}</p>}

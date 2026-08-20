@@ -66,6 +66,12 @@ export interface SymbolAnalysis {
   setups: Setup[];
   events: EngineEvent[];
   status: string;
+  /**
+   * Why no setup exists, when none does. Without this the dashboard could only
+   * show a status, and "waiting for POI" was reported even when the real
+   * blocker was that no higher-timeframe bias had formed.
+   */
+  noTradeReason?: string;
   updatedAt: number;
 }
 
@@ -92,6 +98,7 @@ export class AnalysisEngine {
   private events: EngineEvent[] = [];
   private lastSetupKeys = new Set<string>();
   private lastStatus = "SCANNING";
+  private lastNoTradeReason: string | undefined;
   private setupCounter = 0;
 
   constructor(symbol: string, exchange: string, cfg: StrategyConfig) {
@@ -226,7 +233,7 @@ export class AnalysisEngine {
     }
     this.trimEvents();
 
-    this.lastStatus = this.computeStatus(setups);
+    this.lastStatus = this.computeStatus(setups, td, snapshots);
 
     const topDown: TimeframeAnalysis = td
       ? {
@@ -246,17 +253,57 @@ export class AnalysisEngine {
       setups,
       events: this.events.slice(-80),
       status: this.lastStatus,
+      noTradeReason: setups.length === 0 ? this.lastNoTradeReason : undefined,
       updatedAt: this.now(),
     };
   }
 
-  private computeStatus(setups: Setup[]): string {
+  private computeStatus(
+    setups: Setup[],
+    td: ReturnType<typeof topDownAnalysis> | null,
+    snapshots: Record<Timeframe, TimeframeSnapshot | undefined>,
+  ): string {
     if (this.isSafe) return "SAFE_MODE";
     const valid = setups.filter((s) => s.status === "VALID");
     if (valid.length > 0) return "READY";
     const reject = setups.filter((s) => s.status === "REJECTED");
     if (reject.length > 0) return "REJECTED";
+
+    // No setups at all. Report which gate actually stopped the pipeline rather
+    // than blaming the point of interest for every case.
+    this.lastNoTradeReason = this.explainNoSetup(td, snapshots);
+    if (!td) return "WAITING_FOR_DATA";
+    if (td.bias === "UNCLEAR") return "NO_HTF_BIAS";
     return "WAITING_FOR_POI";
+  }
+
+  /** Human-readable account of why the pipeline produced no setup. */
+  private explainNoSetup(
+    td: ReturnType<typeof topDownAnalysis> | null,
+    snapshots: Record<Timeframe, TimeframeSnapshot | undefined>,
+  ): string {
+    const htf = this.cfg.timeframes.htf;
+    const ltf = this.cfg.timeframes.ltf;
+    const ltfCount = this.candles[ltf]?.length ?? 0;
+
+    if (!td) {
+      return `Not enough candle history yet to establish structure on ${htf}, ${this.cfg.timeframes.mtf} and ${ltf}.`;
+    }
+    if (ltfCount < 30) {
+      return `Only ${ltfCount} ${ltf} candles are loaded; at least 30 are required before a setup is considered.`;
+    }
+    if (td.bias === "UNCLEAR") {
+      return `No directional bias: ${htf} structure is ${td.htf.trend.toLowerCase()}, so neither a long nor a short thesis is valid yet. The engine trades with the higher timeframe, not against an undecided one.`;
+    }
+    if (td.conflict) return td.conflict;
+
+    const poiCounts = [this.cfg.timeframes.mtf, ltf]
+      .map((tf) => (snapshots[tf]?.orderBlocks.filter((b) => b.status === "FRESH").length ?? 0))
+      .reduce((a, b) => a + b, 0);
+    if (poiCounts === 0) {
+      return `${htf} bias is ${td.bias.toLowerCase()} but no unmitigated point of interest is in range, so there is nothing to trade into.`;
+    }
+    return `${htf} bias is ${td.bias.toLowerCase()} and points of interest exist, but price has not reached one within the configured entry tolerance.`;
   }
 
   get isSafe(): boolean {

@@ -13,6 +13,10 @@ Set these Vercel variables (Production, Preview, and Development as needed):
 - `AUTH_REDIRECT_URL=https://<vercel-domain>/`
 - `AUTH_COOKIE_SECURE=true`
 - `VITE_API_BASE_URL`: deployed Cloudflare Worker URL, for example `https://smc-trader-api.<account>.workers.dev`
+- `CREDENTIAL_ENCRYPTION_KEY`: envelope key for exchange API credentials at
+  rest. Without it `/api/connections` returns 503 on every dashboard load and
+  the Exchanges page stays unavailable. Paper trading is unaffected, so this is
+  only required before connecting an exchange account.
 - `WORKER_AUTH_SECRET`: shared secret. It signs the short-lived tokens the
   dashboard uses to call the Worker, and the Worker uses it to sign the batches
   it posts back to `/api/auth`-adjacent `/api/ingest`. Use a long random value

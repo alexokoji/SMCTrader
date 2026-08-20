@@ -10,7 +10,15 @@ declare global {
   var smcConnectionsAuth: Promise<MongoAuthService> | undefined;
 }
 
-function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is not configured.`); return value; }
+function required(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(
+      `${name} is not configured. Exchange connections stay unavailable until it is set; paper trading is unaffected.`,
+    );
+  }
+  return value;
+}
 function sessionToken(req: RequestLike): string | undefined { const cookie = req.headers.cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith("smc_session=")); return cookie ? decodeURIComponent(cookie.slice("smc_session=".length)) : undefined; }
 function body(req: RequestLike): Record<string, unknown> { return req.body && typeof req.body === "object" ? req.body as Record<string, unknown> : {}; }
 
@@ -55,6 +63,10 @@ export default async function handler(req: RequestLike, res: ResponseLike): Prom
     }
     return res.status(405).json({ error: "Use GET, POST, or DELETE." });
   } catch (error) {
-    return res.status(400).json({ error: error instanceof Error ? error.message : "Connection request failed." });
+    // A missing server-side setting is not a bad request. Reporting it as 400
+    // made a configuration gap look like a client error on every page load.
+    const message = error instanceof Error ? error.message : "Connection request failed.";
+    const status = message.includes("is not configured") ? 503 : 400;
+    return res.status(status).json({ error: message });
   }
 }

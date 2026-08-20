@@ -216,16 +216,64 @@ export class RiskEngine {
       });
     }
 
-    // 5. Symbol exposure (notional vs equity)
-    const sizing = computePositionSize({
+    // 5. Exposure.
+    //
+    // Risk-based sizing and notional exposure limits pull against each other: a
+    // structural stop 0.3% away needs roughly 333% of equity in notional to
+    // risk 1%. Vetoing the trade would discard every setup with a tight stop,
+    // which is most of them on a lower timeframe. Exposure limits exist to
+    // bound exposure, so the size is reduced to fit and the trade risks
+    // proportionally less than configured.
+    const leverage = Math.min(input.leverage || this.cfg.maxLeverage, this.cfg.maxLeverage);
+    const requested = computePositionSize({
       entry: input.entry,
       stopLoss: input.stopLoss,
       riskPct: this.cfg.riskPerTrade,
       accountEquity: equity,
-      leverage: Math.min(input.leverage || this.cfg.maxLeverage, this.cfg.maxLeverage),
+      leverage,
       minQuantity: input.minQuantity,
       stepSize: input.stepSize,
     });
+
+    const headroom = (limitPct: number, usedNotional: number) =>
+      Math.max(0, (equity * limitPct) / 100 - usedNotional);
+    const notionalCap = Math.min(
+      headroom(this.cfg.maxSymbolExposurePct, 0),
+      headroom(this.cfg.maxPortfolioExposurePct, this.state.usedExposure),
+      headroom(this.cfg.maxCorrelatedExposurePct, this.state.usedCorrelatedExposure),
+    );
+
+    let sizing = requested;
+    let sizeReducedTo: number | undefined;
+    if (requested.notional > notionalCap) {
+      const cappedRiskPct = requested.notional > 0
+        ? (this.cfg.riskPerTrade * notionalCap) / requested.notional
+        : 0;
+      sizing = computePositionSize({
+        entry: input.entry,
+        stopLoss: input.stopLoss,
+        riskPct: cappedRiskPct,
+        accountEquity: equity,
+        leverage,
+        minQuantity: input.minQuantity,
+        stepSize: input.stepSize,
+      });
+      sizeReducedTo = cappedRiskPct;
+      sizing.warnings.push(
+        `Position reduced to respect exposure limits: risking ${round(cappedRiskPct, 3)}% instead of ${this.cfg.riskPerTrade}%.`,
+      );
+    }
+
+    // A reduced position that rounds away to nothing is not tradeable.
+    if (sizing.positionSize <= 0 || (input.minQuantity !== undefined && sizing.positionSize < input.minQuantity)) {
+      reasons.push({
+        kind: "MAX_SYMBOL_EXPOSURE",
+        message: sizeReducedTo !== undefined
+          ? `Exposure limits leave room for only ${round(notionalCap, 2)} of notional, below the minimum tradeable size.`
+          : `Calculated position size is below the minimum tradeable size.`,
+      });
+    }
+
     const symbolExposurePct = (sizing.notional / equity) * 100;
     limits.push({
       kind: "MAX_SYMBOL_EXPOSURE",
@@ -290,19 +338,27 @@ export class RiskEngine {
       });
     }
 
-    // 9. Minimum RR (projected on TP1)
-    const rr0 = checkRr(input.entry, input.stopLoss, input.takeProfits[0] ?? 0, input.minRr);
+    // 9. Minimum RR, judged on the furthest target the trade is aiming at.
+    // Earlier targets are partial exits with their own lower threshold, so
+    // testing TP1 here rejected trades that reach the minimum where they end.
+    const finalTp = input.takeProfits.length
+      ? input.takeProfits.reduce(
+          (best, tp) => (Math.abs(tp - input.entry) > Math.abs(best - input.entry) ? tp : best),
+          input.takeProfits[0],
+        )
+      : 0;
+    const finalRr = checkRr(input.entry, input.stopLoss, finalTp, input.minRr);
     limits.push({
       kind: "MIN_RR",
       limit: input.minRr,
-      current: round(rr0, 2),
-      allowed: rr0 >= input.minRr,
-      detail: `Projected RR 1:${round(rr0, 2)} / minimum 1:${input.minRr}.`,
+      current: round(finalRr, 2),
+      allowed: finalRr >= input.minRr,
+      detail: `Projected RR to final target 1:${round(finalRr, 2)} / minimum 1:${input.minRr}.`,
     });
-    if (rr0 < input.minRr) {
+    if (finalRr < input.minRr) {
       reasons.push({
         kind: "MIN_RR",
-        message: `Projected RR 1:${round(rr0, 2)} is below the configured minimum 1:${input.minRr}.`,
+        message: `Projected RR to the final target 1:${round(finalRr, 2)} is below the configured minimum 1:${input.minRr}.`,
       });
     }
 

@@ -84,8 +84,14 @@ export function validateStrategyConfig(cfg: StrategyConfig): void {
   if (cfg.minRr < PLATFORM_LIMITS.minRr) {
     throw new Error(`minRr below platform minimum ${PLATFORM_LIMITS.minRr}`);
   }
-  if (cfg.tp1MinRr < cfg.minRr) {
-    throw new Error("tp1MinRr cannot be below minRr");
+  // TP1 is a partial exit nearer than the final objective, so its threshold is
+  // a floor below the trade minimum, never above it. The check was inverted,
+  // which made the shipped defaults (minRr 3, tp1MinRr 1.5) fail validation.
+  if (cfg.tp1MinRr > cfg.minRr) {
+    throw new Error("tp1MinRr cannot exceed minRr: TP1 is a nearer target than the final objective");
+  }
+  if (cfg.tp1MinRr <= 0) {
+    throw new Error("tp1MinRr must be greater than zero");
   }
   if (cfg.swingStrength < 1 || cfg.swingStrength > 10) {
     throw new Error("swingStrength must be between 1 and 10");

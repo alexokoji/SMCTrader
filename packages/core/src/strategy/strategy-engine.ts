@@ -718,7 +718,8 @@ export class StrategyEngine {
       ["Quantity valid", quantity > 0, "Position quantity is zero or negative."],
       ["Stop loss valid", setup.stopLoss > 0 && Math.abs(setup.stopLoss - setup.entry) > 0, "Stop loss is not structurally valid."],
       ["Take profits valid", setup.takeProfits.length > 0 && setup.takeProfits[0] > 0, "No valid take-profit targets."],
-      ["RR valid", (setup.rr[0] ?? 0) >= this.minRrFor(setup), "Projected RR is below the configured minimum."],
+      // Judged on the final target, matching the analysis engine's hard rule.
+      ["RR valid", (setup.rr.length ? Math.max(...setup.rr) : 0) >= this.minRrFor(setup), "Projected RR is below the configured minimum."],
     ];
     for (const [, ok, reason] of checks) {
       if (!ok) return { ok: false, reason };

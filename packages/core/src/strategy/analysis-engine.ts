@@ -867,21 +867,40 @@ export class AnalysisEngine {
       detail: `Price is at a valid ${setup.components.poi?.kind ?? "POI"}.`,
     });
 
-    // Hard rule: minimum RR
-    const minRr = setup.counterTrend
-      ? this.cfg.minRr * this.cfg.counterTrendMinRrMultiplier
-      : this.cfg.minRr;
+    // Hard rule: minimum reward-to-risk.
+    //
+    // The trade is judged by the target it is actually aiming at, which is the
+    // furthest one. Earlier targets are partial exits along the way and have
+    // their own, lower, threshold. Testing the first target against the trade
+    // minimum rejected setups that reached 1:3 at their final objective.
+    const multiplier = setup.counterTrend ? this.cfg.counterTrendMinRrMultiplier : 1;
+    const minRr = this.cfg.minRr * multiplier;
+    const tp1MinRr = this.cfg.tp1MinRr * multiplier;
     const rr0 = setup.rr[0] ?? 0;
-    const rrOk = rr0 >= minRr;
+    const finalRr = setup.rr.length ? Math.max(...setup.rr) : 0;
+
+    const rrOk = finalRr >= minRr;
     hardRules.push({
-      name: "RR",
+      name: "Reward-to-risk",
       status: rrOk ? "PASS" : "FAIL",
       detail: rrOk
-        ? `RR = 1:${rr0.toFixed(1)} meets the 1:${minRr} minimum.`
-        : `RR = 1:${rr0.toFixed(1)} is below the 1:${minRr} minimum.`,
+        ? `Final target is 1:${finalRr.toFixed(1)}, meeting the 1:${minRr} minimum.`
+        : `Final target is only 1:${finalRr.toFixed(1)}, below the 1:${minRr} minimum.`,
     });
     if (!rrOk) {
-      rejections.push(`RR = 1:${rr0.toFixed(1)} is below the required 1:${minRr}.`);
+      rejections.push(`Final target RR = 1:${finalRr.toFixed(1)} is below the required 1:${minRr}.`);
+    }
+
+    const tp1Ok = rr0 >= tp1MinRr;
+    hardRules.push({
+      name: "First target distance",
+      status: tp1Ok ? "PASS" : "FAIL",
+      detail: tp1Ok
+        ? `TP1 sits at 1:${rr0.toFixed(1)}, at or beyond the 1:${tp1MinRr} minimum.`
+        : `TP1 sits at only 1:${rr0.toFixed(1)}, inside the 1:${tp1MinRr} minimum for a first target.`,
+    });
+    if (!tp1Ok) {
+      rejections.push(`TP1 RR = 1:${rr0.toFixed(1)} is below the required 1:${tp1MinRr} for a first target.`);
     }
 
     // Hard rule: entry model conditions
@@ -1021,7 +1040,7 @@ export class AnalysisEngine {
             ? setup.components.premiumDiscount.ratio
             : 0.5,
       momentumScore: ltfSnap ? (setup.components.momentum?.score ?? 0.5) : 0.5,
-      rrDepth: Math.min(1, rr0 / (minRr * 1.5)),
+      rrDepth: Math.min(1, finalRr / (minRr * 1.5)),
       targetLiquidity: setup.components.targetLiquidity ? 1 : 0,
       chochConfirmed: ltfConfirmed,
     });

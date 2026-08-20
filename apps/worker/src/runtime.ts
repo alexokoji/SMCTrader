@@ -311,12 +311,28 @@ export class TradingRuntime {
       }
       message = result.message ?? message;
     }
+    const ltfBuffer = buffers[strategyCfg.timeframes.ltf] ?? [];
+    const lastBar = ltfBuffer.at(-1);
+
+    // A tick usually feeds nothing: the alarm runs every five minutes while a
+    // lower-timeframe bar closes every fifteen. The decision pipeline only ran
+    // inside the candle loop, so a setup that became valid on the last bar was
+    // analysed as READY on every later tick and never acted on. Re-run the
+    // pipeline against the current price when no candle arrived.
+    if (budgeted.length === 0 && lastBar) {
+      const result = engine.reevaluate(lastBar.close);
+      executed += result.decisions.filter((d) => d.decision === "EXECUTE").length;
+      rejected += result.rejectedSetups.length;
+      for (const decision of result.decisions) {
+        if (decision.decision === "REJECT") for (const reason of decision.reasons) blocked.add(reason);
+      }
+      message = result.message ?? message;
+    }
+
     await engine.flush();
 
     // Mark open positions against the newest close so stops and targets are
     // evaluated on every tick, not only when a setup appears.
-    const ltfBuffer = buffers[strategyCfg.timeframes.ltf] ?? [];
-    const lastBar = ltfBuffer.at(-1);
     if (lastBar) engine.onPriceBar(symbol, lastBar, lastBar.timestamp);
 
     state.warm = !warming && pending.length === budgeted.length;

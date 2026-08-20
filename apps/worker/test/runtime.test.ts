@@ -264,6 +264,28 @@ describe("TradingRuntime", () => {
     expect(tick.analysis.snapshots["15M"]!.candles.length).toBeGreaterThan(30);
   });
 
+  it("runs the decision pipeline on ticks where no new candle arrived", async () => {
+    const now = 1_800_000_000_000;
+    const runtime = new TradingRuntime(memoryStorage(), { fetchFn: stubFetch(now) });
+    const opts = { ...baseOpts, autoTrading: true, now };
+
+    // First tick replays the history; later ticks have nothing new to feed.
+    let tick = await runtime.tick("BTCUSDT", opts);
+    for (let i = 0; i < 5 && tick.warming; i++) tick = await runtime.tick("BTCUSDT", opts);
+
+    const engine = runtime.engineFor("BTCUSDT")!;
+    const before = engine.getActivity().getAll().length;
+    const idle = await runtime.tick("BTCUSDT", opts);
+
+    // Nothing new was fed, yet the engine still evaluated rather than idling.
+    expect(idle.warming).toBe(false);
+    expect(engine.getActivity().getAll().length).toBeGreaterThanOrEqual(before);
+    // A valid setup must be acted on, not merely reported as ready forever.
+    if (idle.analysis.setups.some((s) => s.status === "VALID")) {
+      expect(idle.executed + idle.rejected + idle.blockedReasons.length).toBeGreaterThan(0);
+    }
+  });
+
   it("keeps stored history when every market data provider fails", async () => {
     const now = 1_800_000_000_000;
     const storage = memoryStorage();

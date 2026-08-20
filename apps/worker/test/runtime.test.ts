@@ -136,7 +136,7 @@ describe("TradingRuntime", () => {
 
   it("spreads a cold replay across ticks so no single invocation blows the CPU budget", async () => {
     const now = 1_800_000_000_000;
-    const runtime = new TradingRuntime(memoryStorage(), { fetchFn: stubFetch(now) });
+    const runtime = new TradingRuntime(memoryStorage(), { fetchFn: stubFetch(now), hydrationBudget: 150 });
 
     const first = await runtime.tick("BTCUSDT", { ...baseOpts, now });
     expect(first.warming).toBe(true);
@@ -157,12 +157,12 @@ describe("TradingRuntime", () => {
   it("never feeds more than the hydration budget in one invocation", async () => {
     const now = 1_800_000_000_000;
     const storage = memoryStorage();
-    const runtime = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
+    const runtime = new TradingRuntime(storage, { fetchFn: stubFetch(now), hydrationBudget: 150 });
     const tick = await runtime.tick("BTCUSDT", { ...baseOpts, now });
     const engine = runtime.engineFor("BTCUSDT")!;
     const fed = (["4H", "1H", "15M"] as Timeframe[])
       .reduce((sum, tf) => sum + engine.analysis.candlesFor(tf).length, 0);
-    expect(fed).toBeLessThanOrEqual(HYDRATION_BUDGET);
+    expect(fed).toBeLessThanOrEqual(150);
     expect(tick.warming).toBe(true);
   });
 
@@ -200,12 +200,12 @@ describe("TradingRuntime", () => {
 
     // One tick populates the candle buffers but leaves most of the history
     // unreplayed, which is the state a cold start actually resumes from.
-    const seed = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
+    const seed = new TradingRuntime(storage, { fetchFn: stubFetch(now), hydrationBudget: 150 });
     const seeded = await seed.tick("BTCUSDT", { ...baseOpts, now });
     expect(seeded.warming).toBe(true);
 
     // A fresh runtime over the same storage still has a backlog to replay.
-    const revived = new TradingRuntime(storage, { fetchFn: counting() });
+    const revived = new TradingRuntime(storage, { fetchFn: counting(), hydrationBudget: 150 });
     const first = await revived.tick("BTCUSDT", { ...baseOpts, now });
 
     expect(first.warming).toBe(true);
@@ -225,7 +225,8 @@ describe("TradingRuntime", () => {
 
   it("asks to be woken quickly while warming and slowly once caught up", async () => {
     const now = 1_800_000_000_000;
-    const runtime = new TradingRuntime(memoryStorage(), { fetchFn: stubFetch(now) });
+    // A small budget forces a multi-tick warm-up so both cadences are exercised.
+    const runtime = new TradingRuntime(memoryStorage(), { fetchFn: stubFetch(now), hydrationBudget: 150 });
 
     let tick = await runtime.tick("BTCUSDT", { ...baseOpts, now });
     expect(tick.warming).toBe(true);
@@ -239,7 +240,7 @@ describe("TradingRuntime", () => {
     expect(WARMING_TICK_MS).toBeLessThan(STEADY_TICK_MS);
   });
 
-  it("resumes warm-up after an eviction instead of replaying from the start", async () => {
+  it("loads candles into a rebuilt engine after an eviction", async () => {
     const now = 1_800_000_000_000;
     const storage = memoryStorage();
 
@@ -247,19 +248,20 @@ describe("TradingRuntime", () => {
     const seed = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
     await seed.tick("BTCUSDT", { ...baseOpts, now });
 
-    // Each tick uses a brand new runtime, simulating a Durable Object that is
-    // evicted between alarms. Progress must come from storage, not memory.
-    let ticks = 0;
-    let tick;
-    do {
-      const revived = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
-      tick = await revived.tick("BTCUSDT", { ...baseOpts, now });
-      ticks++;
-    } while (tick.warming && ticks < 30);
+    // A brand new runtime is what a Durable Object evicted between alarms gets.
+    // Its analysis engine has no candles, so it must replay the stored buffer
+    // rather than trusting any record of previous progress.
+    const revived = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
+    const tick = await revived.tick("BTCUSDT", { ...baseOpts, now });
+    const engine = revived.engineFor("BTCUSDT")!;
 
-    // Without persisted replay progress this loops forever and never warms.
+    const fed = (["4H", "1H", "15M"] as Timeframe[])
+      .reduce((sum, tf) => sum + engine.analysis.candlesFor(tf).length, 0);
+    // Marking a rebuilt engine as warm while it held zero candles left it
+    // permanently unable to form a bias.
+    expect(fed).toBeGreaterThan(0);
     expect(tick.warming).toBe(false);
-    expect(ticks).toBeLessThan(30);
+    expect(tick.analysis.snapshots["15M"]!.candles.length).toBeGreaterThan(30);
   });
 
   it("keeps stored history when every market data provider fails", async () => {

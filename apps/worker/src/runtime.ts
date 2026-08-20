@@ -34,8 +34,12 @@ import {
 /** Candles retained per timeframe. Bounds both storage and replay cost. */
 export const CANDLE_BUFFER = 240;
 
-/** Maximum candles replayed per invocation while warming a cold engine. */
-export const HYDRATION_BUDGET = 150;
+/**
+ * Candles replayed per invocation. Because a rebuilt engine always replays from
+ * the start, this is set to cover a full buffer for all three timeframes in one
+ * invocation, so an engine is usable immediately rather than after N alarms.
+ */
+export const HYDRATION_BUDGET = 800;
 
 /**
  * Alarm delay while an engine still has history to replay. Warm-up is bounded
@@ -90,14 +94,15 @@ function snapshotKey(symbol: string): string {
 }
 
 /**
- * What is persisted under the engine key. `fedThrough` records how far the
- * stored candle history has been replayed. It must survive eviction: without
- * it a Durable Object evicted between alarms restarts its replay from the
- * beginning every time and never finishes warming up.
+ * What is persisted under the engine key.
+ *
+ * Only execution and risk state is stored. Replay progress deliberately is not:
+ * the analysis engine's candle buffers live in memory and are rebuilt purely by
+ * replaying, so a restored watermark on a freshly built engine would mark an
+ * empty engine as warm and it would never load a single candle.
  */
 interface PersistedEngine {
   snapshot: StrategyEngineSnapshot;
-  fedThrough?: Partial<Record<Timeframe, number>>;
 }
 
 /** Merge freshly fetched candles into a stored buffer, de-duplicating by open time. */
@@ -128,8 +133,11 @@ export class TradingRuntime {
   private readonly symbols = new Map<string, SymbolState>();
   private lastProvider = "unknown";
 
-  constructor(storage: RuntimeStorage, opts: { fetchFn?: typeof fetch } = {}) {
+  private readonly hydrationBudget: number;
+
+  constructor(storage: RuntimeStorage, opts: { fetchFn?: typeof fetch; hydrationBudget?: number } = {}) {
     this.storage = storage;
+    this.hydrationBudget = opts.hydrationBudget ?? HYDRATION_BUDGET;
     this.marketData = new MultiExchangeMarketData({
       fetchFn: opts.fetchFn,
       timeoutMs: 8_000,
@@ -249,7 +257,9 @@ export class TradingRuntime {
           // silently mixed into current state.
         }
       }
-      state = { engine, fedThrough: { ...(persisted?.fedThrough ?? {}) }, warm: false };
+      // Always replay from the start of the stored buffer: a new engine has no
+      // candles, whatever a previous invocation had already fed.
+      state = { engine, fedThrough: {}, warm: false };
       this.symbols.set(symbol, state);
     }
 
@@ -271,7 +281,7 @@ export class TradingRuntime {
     // keeps warm-up off the exchange rate limits and much faster.
     let buffers = await this.storedBuffers(symbol, strategyCfg.timeframes, now);
     let usedStoredHistory = true;
-    if (backlogOf(buffers).length < HYDRATION_BUDGET) {
+    if (backlogOf(buffers).length < this.hydrationBudget) {
       buffers = await this.refreshCandles(symbol, strategyCfg.timeframes, now);
       usedStoredHistory = false;
     }
@@ -280,7 +290,7 @@ export class TradingRuntime {
     // timeframe advances together, exactly as it would in a live feed.
     const pending = backlogOf(buffers);
 
-    const budgeted = pending.slice(0, HYDRATION_BUDGET);
+    const budgeted = pending.slice(0, this.hydrationBudget);
     const warming = budgeted.length < pending.length;
 
     let executed = 0;
@@ -305,7 +315,7 @@ export class TradingRuntime {
     state.warm = !warming && pending.length === budgeted.length;
 
     const analysis = engine.analysis.analyze();
-    await this.persist(symbol, engine, budgeted.length > 0);
+    await this.persist(symbol, engine);
 
     return {
       symbol,
@@ -328,7 +338,7 @@ export class TradingRuntime {
    * positions or the audit trail. They are large, so they are written when that
    * state changes and otherwise at a slow heartbeat, rather than every tick.
    */
-  private async persist(symbol: string, engine: StrategyEngine, replayAdvanced = false): Promise<void> {
+  private async persist(symbol: string, engine: StrategyEngine): Promise<void> {
     const snapshot = engine.serialize();
     const signature = [
       snapshot.positions.length,
@@ -340,14 +350,12 @@ export class TradingRuntime {
     const state = this.symbols.get(symbol);
     const now = Date.now();
     const due = !state?.lastPersistAt || now - state.lastPersistAt >= SNAPSHOT_HEARTBEAT_MS;
-    // Replay progress must be written even when nothing else changed, or an
-    // eviction would rewind the warm-up.
-    if (state && signature === state.lastSnapshotSignature && !due && !replayAdvanced) return;
+    if (state && signature === state.lastSnapshotSignature && !due) return;
     if (state) {
       state.lastSnapshotSignature = signature;
       state.lastPersistAt = now;
     }
-    const payload: PersistedEngine = { snapshot, fedThrough: state?.fedThrough ?? {} };
+    const payload: PersistedEngine = { snapshot };
     await this.storage.put({ [snapshotKey(symbol)]: payload });
   }
 

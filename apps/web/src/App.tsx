@@ -88,8 +88,15 @@ function App() {
   useEffect(() => {
     if (!user) return;
     void api.auth.account().then(async ({ account }) => {
-      await api.updateAssets(account.assets);
-      await api.updateConfig({ risk: account.risk });
+      // Only push settings the account actually has. Sending an empty or
+      // missing list made the Worker reject the whole load with
+      // "assets must be a string array".
+      if (Array.isArray(account.assets) && account.assets.length > 0) {
+        await api.updateAssets(account.assets);
+      }
+      if (account.risk && Object.keys(account.risk).length > 0) {
+        await api.updateConfig({ risk: account.risk });
+      }
       const { state } = await api.auth.paperState();
       if (state) await api.restorePaperState(state);
       await refresh();

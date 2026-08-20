@@ -80,6 +80,46 @@ export interface GoogleOAuthConfig {
   redirectUri: string;
 }
 
+/** Defaults for a trading account, shared by creation and repair. */
+export const TRADING_ACCOUNT_DEFAULTS = {
+  startingEquity: 10_000,
+  paperEquity: 10_000,
+  mode: "PAPER",
+  assets: ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+  risk: { riskPerTrade: 1, maxDailyLossPct: 3, maxDrawdownPct: 8 },
+} as const;
+
+type AccountField = keyof typeof TRADING_ACCOUNT_DEFAULTS;
+
+/** Fields absent or unusable on a stored account document. */
+export function accountFieldsMissing(account: Partial<TradingAccount>): AccountField[] {
+  const missing: AccountField[] = [];
+  if (!Number.isFinite(account.startingEquity)) missing.push("startingEquity");
+  if (!Number.isFinite(account.paperEquity)) missing.push("paperEquity");
+  if (typeof account.mode !== "string" || !account.mode) missing.push("mode");
+  if (!Array.isArray(account.assets) || account.assets.length === 0) missing.push("assets");
+  if (!account.risk || typeof account.risk !== "object") missing.push("risk");
+  return missing;
+}
+
+/**
+ * Fill in anything a stored account is missing. Returning a partly-undefined
+ * account made the dashboard send `assets: undefined` to the Worker, which
+ * rejected the request with "assets must be a string array" on every load.
+ */
+export function withAccountDefaults(account: Partial<TradingAccount> & { userId: string }): TradingAccount {
+  return {
+    userId: account.userId,
+    startingEquity: Number.isFinite(account.startingEquity) ? account.startingEquity! : TRADING_ACCOUNT_DEFAULTS.startingEquity,
+    paperEquity: Number.isFinite(account.paperEquity) ? account.paperEquity! : TRADING_ACCOUNT_DEFAULTS.paperEquity,
+    mode: account.mode || TRADING_ACCOUNT_DEFAULTS.mode,
+    assets: Array.isArray(account.assets) && account.assets.length > 0
+      ? account.assets
+      : [...TRADING_ACCOUNT_DEFAULTS.assets],
+    risk: account.risk && typeof account.risk === "object" ? account.risk : { ...TRADING_ACCOUNT_DEFAULTS.risk },
+  };
+}
+
 export class MongoAuthService {
   private readonly users: Collection<UserDocument>;
   private readonly sessions: Collection<SessionDocument>;
@@ -195,7 +235,19 @@ export class MongoAuthService {
     await this.ensureTradingAccount(userId);
     const account = await this.tradingAccounts.findOne({ userId });
     if (!account) throw new Error("Trading account could not be created.");
-    return { userId: account.userId, startingEquity: account.startingEquity, paperEquity: account.paperEquity, mode: account.mode, assets: account.assets, risk: account.risk };
+
+    const complete = withAccountDefaults(account);
+    // `$setOnInsert` only populates a field when the document is first created,
+    // so an account made by an earlier build is missing fields added since.
+    // Repair it here rather than handing callers an undefined value.
+    const missing = accountFieldsMissing(account);
+    if (missing.length > 0) {
+      await this.tradingAccounts.updateOne(
+        { userId },
+        { $set: { ...Object.fromEntries(missing.map((key) => [key, complete[key]])), updatedAt: new Date() } },
+      );
+    }
+    return complete;
   }
 
   async recordAudit(userId: string, action: string, detail: string): Promise<void> {

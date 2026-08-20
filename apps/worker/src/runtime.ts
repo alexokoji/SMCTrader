@@ -89,6 +89,17 @@ function snapshotKey(symbol: string): string {
   return `engine:${symbol}`;
 }
 
+/**
+ * What is persisted under the engine key. `fedThrough` records how far the
+ * stored candle history has been replayed. It must survive eviction: without
+ * it a Durable Object evicted between alarms restarts its replay from the
+ * beginning every time and never finishes warming up.
+ */
+interface PersistedEngine {
+  snapshot: StrategyEngineSnapshot;
+  fedThrough?: Partial<Record<Timeframe, number>>;
+}
+
 /** Merge freshly fetched candles into a stored buffer, de-duplicating by open time. */
 export function mergeCandles(stored: Candle[], incoming: Candle[]): Candle[] {
   const byTimestamp = new Map<number, Candle>();
@@ -225,16 +236,20 @@ export class TradingRuntime {
         mode: opts.mode,
         analysis: new AnalysisEngine(symbol, "multi-exchange", strategyCfg),
       });
-      const snapshot = await this.storage.get<StrategyEngineSnapshot>(snapshotKey(symbol));
-      if (snapshot) {
+      const stored = await this.storage.get<PersistedEngine | StrategyEngineSnapshot>(snapshotKey(symbol));
+      // Older deployments stored the bare snapshot under this key.
+      const persisted: PersistedEngine | undefined = stored
+        ? ("snapshot" in stored ? (stored as PersistedEngine) : { snapshot: stored as StrategyEngineSnapshot })
+        : undefined;
+      if (persisted?.snapshot) {
         try {
-          engine.restore(snapshot);
+          engine.restore(persisted.snapshot);
         } catch {
           // A snapshot from an older engine version is discarded rather than
           // silently mixed into current state.
         }
       }
-      state = { engine, fedThrough: {}, warm: false };
+      state = { engine, fedThrough: { ...(persisted?.fedThrough ?? {}) }, warm: false };
       this.symbols.set(symbol, state);
     }
 
@@ -290,7 +305,7 @@ export class TradingRuntime {
     state.warm = !warming && pending.length === budgeted.length;
 
     const analysis = engine.analysis.analyze();
-    await this.persist(symbol, engine);
+    await this.persist(symbol, engine, budgeted.length > 0);
 
     return {
       symbol,
@@ -313,7 +328,7 @@ export class TradingRuntime {
    * positions or the audit trail. They are large, so they are written when that
    * state changes and otherwise at a slow heartbeat, rather than every tick.
    */
-  private async persist(symbol: string, engine: StrategyEngine): Promise<void> {
+  private async persist(symbol: string, engine: StrategyEngine, replayAdvanced = false): Promise<void> {
     const snapshot = engine.serialize();
     const signature = [
       snapshot.positions.length,
@@ -325,12 +340,15 @@ export class TradingRuntime {
     const state = this.symbols.get(symbol);
     const now = Date.now();
     const due = !state?.lastPersistAt || now - state.lastPersistAt >= SNAPSHOT_HEARTBEAT_MS;
-    if (state && signature === state.lastSnapshotSignature && !due) return;
+    // Replay progress must be written even when nothing else changed, or an
+    // eviction would rewind the warm-up.
+    if (state && signature === state.lastSnapshotSignature && !due && !replayAdvanced) return;
     if (state) {
       state.lastSnapshotSignature = signature;
       state.lastPersistAt = now;
     }
-    await this.storage.put({ [snapshotKey(symbol)]: snapshot });
+    const payload: PersistedEngine = { snapshot, fedThrough: state?.fedThrough ?? {} };
+    await this.storage.put({ [snapshotKey(symbol)]: payload });
   }
 
   engineFor(symbol: string): StrategyEngine | undefined {

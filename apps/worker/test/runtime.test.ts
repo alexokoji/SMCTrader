@@ -198,12 +198,13 @@ describe("TradingRuntime", () => {
       }) as unknown as typeof fetch;
     };
 
-    // First runtime populates storage.
+    // One tick populates the candle buffers but leaves most of the history
+    // unreplayed, which is the state a cold start actually resumes from.
     const seed = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
-    let tick = await seed.tick("BTCUSDT", { ...baseOpts, now });
-    for (let i = 0; i < 20 && tick.warming; i++) tick = await seed.tick("BTCUSDT", { ...baseOpts, now });
+    const seeded = await seed.tick("BTCUSDT", { ...baseOpts, now });
+    expect(seeded.warming).toBe(true);
 
-    // A fresh runtime over the same storage is a cold start with a full backlog.
+    // A fresh runtime over the same storage still has a backlog to replay.
     const revived = new TradingRuntime(storage, { fetchFn: counting() });
     const first = await revived.tick("BTCUSDT", { ...baseOpts, now });
 
@@ -236,6 +237,29 @@ describe("TradingRuntime", () => {
     expect(tick.warming).toBe(false);
     expect(tick.nextTickMs).toBe(STEADY_TICK_MS);
     expect(WARMING_TICK_MS).toBeLessThan(STEADY_TICK_MS);
+  });
+
+  it("resumes warm-up after an eviction instead of replaying from the start", async () => {
+    const now = 1_800_000_000_000;
+    const storage = memoryStorage();
+
+    // Seed storage with a full candle history.
+    const seed = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
+    await seed.tick("BTCUSDT", { ...baseOpts, now });
+
+    // Each tick uses a brand new runtime, simulating a Durable Object that is
+    // evicted between alarms. Progress must come from storage, not memory.
+    let ticks = 0;
+    let tick;
+    do {
+      const revived = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
+      tick = await revived.tick("BTCUSDT", { ...baseOpts, now });
+      ticks++;
+    } while (tick.warming && ticks < 30);
+
+    // Without persisted replay progress this loops forever and never warms.
+    expect(tick.warming).toBe(false);
+    expect(ticks).toBeLessThan(30);
   });
 
   it("keeps stored history when every market data provider fails", async () => {

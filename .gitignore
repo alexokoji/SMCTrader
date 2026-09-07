@@ -12,3 +12,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.tsbuildinfo
+
+# Local-only Worker variables (never committed)
+.dev.vars

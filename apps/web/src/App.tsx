@@ -8,6 +8,7 @@ import {
   type NewsResult,
   type Portfolio,
 } from "./agents-api";
+import { MarketPicker } from "./components/MarketPicker";
 import {
   AgentsView,
   ConditionsView,
@@ -81,12 +82,14 @@ function App() {
     name: "",
     mode: "PAPER" as "PAPER" | "LIVE",
     allocatedCapital: "1000",
-    symbols: "BTCUSDT, ETHUSDT",
+    symbols: ["BTCUSDT", "ETHUSDT"] as string[],
     entryModels: ["CONFIRMATION", "SWEEP"] as string[],
     riskPerTrade: "1",
     minRr: "3",
   });
   const [capitalInput, setCapitalInput] = useState("");
+  const [markets, setMarkets] = useState<string[]>([]);
+  const [marketsError, setMarketsError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -132,6 +135,17 @@ function App() {
   // Conditions and news are polled only while their page is open: both change
   // far more slowly than positions and cost a request each.
   useEffect(() => {
+    if (!user || !showCreate || markets.length > 0) return;
+    void agentsApi
+      .markets()
+      .then((result) => {
+        setMarkets(result.symbols);
+        setMarketsError(result.error ?? (result.symbols.length ? null : "No markets returned."));
+      })
+      .catch((err) => setMarketsError(err instanceof Error ? err.message : String(err)));
+  }, [user, showCreate, markets.length]);
+
+  useEffect(() => {
     if (!user || page !== "conditions") return;
     void agentsApi.conditions().then(setConditions).catch(() => undefined);
   }, [user, page]);
@@ -157,15 +171,12 @@ function App() {
 
   const createAgent = () =>
     void run("create", async () => {
-      const symbols = form.symbols
-        .split(",")
-        .map((s) => s.trim().toUpperCase().replace("/", ""))
-        .filter(Boolean);
+      if (form.symbols.length === 0) throw new Error("Select at least one market for the agent.");
       const result = await agentsApi.create({
         name: form.name.trim() || "Agent",
         mode: form.mode,
         allocatedCapital: Number(form.allocatedCapital),
-        symbols,
+        symbols: form.symbols,
         entryModels: form.entryModels,
         riskPerTrade: Number(form.riskPerTrade),
         minRr: Number(form.minRr),
@@ -257,9 +268,6 @@ function App() {
         <label>Capital to assign
           <input value={form.allocatedCapital} onChange={(e) => setForm({ ...form, allocatedCapital: e.target.value })}/>
         </label>
-        <label>Markets (comma separated)
-          <input value={form.symbols} onChange={(e) => setForm({ ...form, symbols: e.target.value })}/>
-        </label>
         <label>Risk per trade (%)
           <input value={form.riskPerTrade} onChange={(e) => setForm({ ...form, riskPerTrade: e.target.value })}/>
         </label>
@@ -267,6 +275,13 @@ function App() {
           <input value={form.minRr} onChange={(e) => setForm({ ...form, minRr: e.target.value })}/>
         </label>
       </div>
+      <MarketPicker
+        available={markets}
+        selected={form.symbols}
+        error={marketsError}
+        onChange={(symbols) => setForm({ ...form, symbols })}
+      />
+      <h4 className="field-label">Entry models</h4>
       <div className="layer-toggles">
         {ENTRY_MODELS.map((model) => (
           <label key={model} className={form.entryModels.includes(model) ? "on" : ""}>
@@ -390,6 +405,13 @@ function App() {
         <header className="mobile-head">
           <button className="brand-mobile" onClick={() => setPage("agents")}>m</button>
           <span>{activeLabel}</span>
+          <button
+            className="theme-toggle"
+            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+          >
+            {theme === "dark" ? "☾" : "☀"}
+          </button>
         </header>
         {error && (
           <div className="alert error">
@@ -405,6 +427,14 @@ function App() {
         )}
         {pages[page]}
       </main>
+      <nav className="mobile-nav" aria-label="Primary">
+        {nav.map(([id, icon, label]) => (
+          <button key={id} className={page === id ? "active" : ""} onClick={() => setPage(id)}>
+            <i>{icon}</i>
+            <span>{label.split(" ")[0]}</span>
+          </button>
+        ))}
+      </nav>
     </div>
   );
 }

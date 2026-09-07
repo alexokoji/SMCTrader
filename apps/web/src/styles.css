@@ -307,3 +307,51 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   .agent-metrics { grid-template-columns: repeat(2, 1fr); }
   .table-row.agent-row, .table-row.trade-row { grid-template-columns: 1fr; gap: 4px; min-width: 0; }
 }
+
+/* ---- market picker ---- */
+.field-label { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; color: var(--faint); font-size: 9px; font-weight: 800; letter-spacing: .07em; text-transform: uppercase; }
+.field-label em { color: var(--violet); font-style: normal; letter-spacing: 0; }
+.market-picker { margin-bottom: 14px; }
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 9px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border: 1px solid var(--violet); border-radius: 20px;
+  background: var(--violet-soft); color: var(--violet);
+  font: 10px "DM Mono", monospace; cursor: pointer;
+}
+.chip i { font-style: normal; font-size: 12px; opacity: .7; }
+.chip:hover { filter: brightness(1.15); }
+.market-options {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  max-height: 190px; overflow-y: auto;
+  margin-top: 9px; padding: 9px;
+  border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2);
+}
+.market-option {
+  padding: 5px 10px; border: 1px solid var(--line); border-radius: 20px;
+  background: var(--surface); color: var(--muted);
+  font: 10px "DM Mono", monospace; cursor: pointer; transition: .12s;
+}
+.market-option:hover { border-color: var(--violet); color: var(--violet); }
+
+/* ---- mobile navigation ---- */
+.mobile-nav { display: none; }
+@media (max-width: 760px) {
+  main { padding-bottom: 78px; }
+  .mobile-head { gap: 10px; }
+  .mobile-head span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mobile-nav {
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 20;
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+    background: var(--surface); border-top: 1px solid var(--line);
+  }
+  .mobile-nav button {
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    padding: 7px 2px; border: 0; border-radius: 8px;
+    background: transparent; color: var(--faint); font: inherit; cursor: pointer;
+  }
+  .mobile-nav i { font-style: normal; font-size: 15px; }
+  .mobile-nav span { font-size: 9px; font-weight: 700; }
+  .mobile-nav button.active { background: var(--violet-soft); color: var(--violet); }
+}

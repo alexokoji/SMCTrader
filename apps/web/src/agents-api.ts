@@ -155,8 +155,15 @@ export interface CreateAgentInput {
   minRr?: number;
 }
 
+export interface MarketsResponse {
+  symbols: string[];
+  fetchedAt: number;
+  error?: string;
+}
+
 export const agentsApi = {
   list: () => request<AgentsResponse>("/api/agents"),
+  markets: () => request<MarketsResponse>("/api/markets"),
   create: (input: CreateAgentInput) =>
     request<{ agent?: AgentConfig; error?: string }>("/api/agents", {
       method: "POST",

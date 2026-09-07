@@ -271,8 +271,11 @@ export class AgentRuntime {
       const regimes: Record<string, RegimeReading> = {};
 
       for (const symbol of symbols) {
-        const tick = await runtime.tick(symbol, {
-          mode: agent.mode === "LIVE" ? "LIVE" : "PAPER",
+        // One market's feed failing must not abandon the agent's other markets,
+        // nor the supervision pass that follows.
+        try {
+          const tick = await runtime.tick(symbol, {
+            mode: agent.mode === "LIVE" ? "LIVE" : "PAPER",
           risk: {
             ...DEFAULT_RISK_CONFIG,
             riskPerTrade: agent.working.riskPerTrade,
@@ -294,12 +297,21 @@ export class AgentRuntime {
           startingEquity: agent.allocatedCapital,
           now,
         });
-        ticks.push(tick);
+          ticks.push(tick);
 
-        const ltf = agent.timeframes.ltf;
-        const snapshot = tick.analysis.snapshots[ltf];
-        if (snapshot) {
-          regimes[symbol] = classifyRegime(snapshot.candles, snapshot.structure.trend);
+          const ltf = agent.timeframes.ltf;
+          const snapshot = tick.analysis.snapshots[ltf];
+          if (snapshot) {
+            regimes[symbol] = classifyRegime(snapshot.candles, snapshot.structure.trend);
+          }
+        } catch (error) {
+          console.warn(JSON.stringify({
+            event: "agent_symbol_failed",
+            agent: agent.name,
+            symbol,
+            reason: error instanceof Error ? error.message : String(error),
+            timestamp: now,
+          }));
         }
       }
 

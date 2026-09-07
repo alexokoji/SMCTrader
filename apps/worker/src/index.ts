@@ -237,6 +237,32 @@ export class TradingSession extends DurableObject<Env> {
     };
   }
 
+  /**
+   * Tradeable markets, from the exchanges the engine actually reads. Cached for
+   * a day because the list changes rarely and the call is heavy. A failed
+   * refresh keeps the previous list rather than emptying the picker.
+   */
+  async availableMarkets(): Promise<Record<string, unknown>> {
+    const cached = await this.ctx.storage.get<{ symbols: string[]; fetchedAt: number }>("markets");
+    if (cached && Date.now() - cached.fetchedAt < 86_400_000) return cached;
+    try {
+      const symbols = await new MultiExchangeMarketData({ timeoutMs: 10_000 }).getMarkets();
+      const usdt = symbols
+        .filter((symbol) => symbol.endsWith("USDT"))
+        .sort((a, b) => a.localeCompare(b));
+      const fresh = { symbols: usdt, fetchedAt: Date.now() };
+      await this.ctx.storage.put({ markets: fresh });
+      return fresh;
+    } catch (error) {
+      if (cached) return cached;
+      return {
+        symbols: [],
+        fetchedAt: Date.now(),
+        error: error instanceof Error ? error.message : "Market list unavailable.",
+      };
+    }
+  }
+
   async marketConditions(): Promise<Record<string, unknown>> {
     return (await this.ctx.storage.get<Record<string, unknown>>("marketConditions")) ?? {
       conditions: [],
@@ -985,6 +1011,7 @@ export default {
       }
       if (request.method === "DELETE") return json(request, env, await session.deleteAgent(id));
     }
+    if (url.pathname === "/api/markets" && request.method === "GET") return json(request, env, await session.availableMarkets());
     if (url.pathname === "/api/portfolio" && request.method === "GET") return json(request, env, await session.portfolio());
     if (url.pathname === "/api/trades" && request.method === "GET") return json(request, env, await session.agentTrades());
     if (url.pathname === "/api/market-conditions" && request.method === "GET") return json(request, env, await session.marketConditions());
@@ -1005,7 +1032,6 @@ export default {
       return json(request, env, await session.getChart(symbol, url.searchParams.get("timeframe") ?? undefined));
     }
     if (url.pathname === "/api/live-readiness" && request.method === "GET") return json(request, env, await session.getLiveTradingReadiness());
-    if (url.pathname === "/api/markets" && request.method === "GET") return json(request, env, { analyses: await session.getMarketAnalyses() });
     if (url.pathname === "/api/risk" && request.method === "GET") return json(request, env, await session.getRisk());
     if (url.pathname === "/api/equity-history" && request.method === "GET") return json(request, env, { points: await session.getEquityHistory() });
     if (url.pathname === "/api/paper-state/restore" && request.method === "PUT") {

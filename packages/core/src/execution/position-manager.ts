@@ -151,7 +151,9 @@ export class PositionManager {
     const events: PositionEvent[] = [];
     for (const pos of this.positions.values()) {
       if (pos.status !== "OPEN" || pos.symbol !== symbol) continue;
-      // a position opened on this same bar must not be managed against it
+      // A bar at or before the position's open cannot have hit its stop or
+      // target. This also makes replay safe: a rebuilt engine re-runs history,
+      // and without it an old bar would close a position opened long after.
       if (pos.openedAt >= timestamp) continue;
       pos.currentPrice = bar.close;
       pos.unrealizedPnl = this.unrealizedPnl(pos, bar.close);

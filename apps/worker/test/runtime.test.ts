@@ -286,6 +286,28 @@ describe("TradingRuntime", () => {
     }
   });
 
+  it("evaluates stops and targets against every bar that closed since the last check", async () => {
+    const now = 1_800_000_000_000;
+    const storage = memoryStorage();
+    const runtime = new TradingRuntime(storage, { fetchFn: stubFetch(now) });
+    const opts = { ...baseOpts, autoTrading: true, now };
+
+    let tick = await runtime.tick("BTCUSDT", opts);
+    for (let i = 0; i < 5 && tick.warming; i++) tick = await runtime.tick("BTCUSDT", opts);
+
+    const engine = runtime.engineFor("BTCUSDT")!;
+    const ltf = engine.strategyConfig.timeframes.ltf;
+    const bars = engine.analysis.candlesFor(ltf);
+    expect(bars.length).toBeGreaterThan(10);
+
+    // Every open position must have been marked against the newest bar, not
+    // left holding the price it was opened at. Marking only one bar per tick
+    // let a stop or target hit by an intermediate bar go unseen.
+    for (const position of engine.getOpenPositions()) {
+      expect(position.currentPrice).toBe(bars.at(-1)!.close);
+    }
+  });
+
   it("keeps stored history when every market data provider fails", async () => {
     const now = 1_800_000_000_000;
     const storage = memoryStorage();

@@ -66,6 +66,8 @@ export interface SymbolState {
   lastPersistAt?: number;
   /** Newest candle timestamp fed per timeframe, used for incremental feeding. */
   fedThrough: Partial<Record<Timeframe, number>>;
+  /** Newest bar already used to evaluate stops and targets. */
+  markedThrough?: number;
   /** True once the stored history has been fully replayed into the engine. */
   warm: boolean;
 }
@@ -345,9 +347,16 @@ export class TradingRuntime {
 
     await engine.flush();
 
-    // Mark open positions against the newest close so stops and targets are
-    // evaluated on every tick, not only when a setup appears.
-    if (lastBar) engine.onPriceBar(symbol, lastBar, lastBar.timestamp);
+    // Evaluate stops and targets against every bar that has closed since the
+    // last check, in order. Marking only the newest bar meant a stop or target
+    // hit by an intermediate bar was never seen, and the position hung open
+    // indefinitely while the equity that depends on it never moved.
+    const marked = state.markedThrough ?? 0;
+    const unmarked = ltfBuffer.filter((bar) => bar.timestamp > marked);
+    for (const bar of unmarked) {
+      engine.onPriceBar(symbol, bar, bar.timestamp);
+    }
+    if (lastBar) state.markedThrough = lastBar.timestamp;
 
     state.warm = !warming && pending.length === budgeted.length;
 

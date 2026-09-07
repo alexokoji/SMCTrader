@@ -18,6 +18,20 @@ import {
 } from "./components/AgentViews";
 
 type Page = "agents" | "portfolio" | "trades" | "conditions" | "news";
+type Theme = "dark" | "light";
+
+/**
+ * The theme is applied to the document root so CSS tokens switch wholesale.
+ * Dark is the default; a stored choice wins over it. Storage can throw in a
+ * private window, so every access is guarded and falls back to the default.
+ */
+function readStoredTheme(): Theme {
+  try {
+    return localStorage.getItem("smc-theme") === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+}
 
 const nav: Array<[Page, string, string]> = [
   ["agents", "◉", "Agents"],
@@ -44,6 +58,7 @@ function PageTitle({ title, description, action }: { title: string; description:
 
 function App() {
   const [page, setPage] = useState<Page>("agents");
+  const [theme, setTheme] = useState<Theme>(readStoredTheme);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
@@ -89,6 +104,15 @@ function App() {
       setError(err instanceof Error ? err.message : String(err));
     }
   }, []);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      localStorage.setItem("smc-theme", theme);
+    } catch {
+      // A rejected write only costs the preference, not the theme itself.
+    }
+  }, [theme]);
 
   useEffect(() => {
     void api.auth
@@ -349,6 +373,13 @@ function App() {
           ))}
         </nav>
         <div className="sidebar-foot">
+          <button
+            className="theme-toggle"
+            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+            aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+          >
+            {theme === "dark" ? "☾ Dark" : "☀ Light"}
+          </button>
           <span>{user.email}</span>
           <button className="link-button" onClick={() => void api.auth.logout().then(() => setUser(null))}>
             Sign out

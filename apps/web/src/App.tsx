@@ -1,292 +1,381 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { api, type AuthUser } from "./api";
 import {
-  api, connectStream,
-  type ActivityEvent, type AnalysisResult, type ApiStatus, type BacktestResult,
-  type ChartPayload,
-  type Analytics, type TradeDetail,
-  type ExchangeConnection, type JournalEntry, type Position, type RiskConfig,
-  type RiskState, type StreamState, type TradingMode, type AuthUser, type ProviderHealth,
-} from "./api";
-import { SmcChart } from "./components/SmcChart";
-import { AnalysisExplanation, RejectedSetups, SetupCard } from "./components/SetupViews";
-import { AnalyticsView, TradeDetailView } from "./components/Analytics";
+  agentsApi,
+  type AgentSnapshot,
+  type AgentTrade,
+  type MarketCondition,
+  type NewsResult,
+  type Portfolio,
+} from "./agents-api";
+import {
+  AgentsView,
+  ConditionsView,
+  NewsView,
+  PortfolioView,
+  TradesView,
+  money,
+} from "./components/AgentViews";
 
-type Page = "dashboard" | "markets" | "chart" | "positions" | "trade" | "rejected" | "analytics" | "paper" | "backtest" | "journal" | "settings" | "exchange" | "account";
+type Page = "agents" | "portfolio" | "trades" | "conditions" | "news";
 
 const nav: Array<[Page, string, string]> = [
-  ["dashboard", "◫", "Overview"], ["markets", "⌁", "Market scanner"], ["chart", "◧", "Chart & analysis"],
-  ["positions", "◇", "Positions"], ["rejected", "⊘", "Rejected setups"], ["analytics", "▦", "Analytics"],
-  ["paper", "◉", "Paper trading"], ["backtest", "↗", "Backtesting"], ["journal", "▤", "Journal"],
-  ["settings", "⚙", "Strategy & risk"], ["exchange", "⇄", "Exchanges"],
+  ["agents", "◉", "Agents"],
+  ["portfolio", "◫", "Portfolio"],
+  ["trades", "▤", "Trades"],
+  ["conditions", "⌁", "Market conditions"],
+  ["news", "✽", "News"],
 ];
-nav.push(["account", "@", "Account"]);
 
-function money(n?: number) { return n == null ? "—" : `$${n.toLocaleString("en-US", { maximumFractionDigits: 2 })}`; }
-function number(n?: number, digits = 2) { return n == null ? "—" : n.toLocaleString("en-US", { maximumFractionDigits: digits }); }
-function time(ts?: number | null) { return ts ? new Date(ts).toLocaleString() : "—"; }
-function Badge({ good, children }: { good?: boolean; children: React.ReactNode }) { return <span className={`badge ${good === undefined ? "" : good ? "ok" : "bad"}`}>{children}</span>; }
-function Card({ title, action, children, className = "" }: { title: string; action?: React.ReactNode; children: React.ReactNode; className?: string }) { return <section className={`card ${className}`}><div className="card-head"><h2>{title}</h2>{action}</div>{children}</section>; }
-function Metric({ label, value, hint, tone }: { label: string; value: React.ReactNode; hint?: string; tone?: "good" | "bad" }) { return <div className="metric"><span>{label}</span><strong className={tone}>{value}</strong>{hint && <small>{hint}</small>}</div>; }
+const ENTRY_MODELS = ["CONFIRMATION", "SWEEP", "AGGRESSIVE", "COUNTER_TREND"];
+
+function PageTitle({ title, description, action }: { title: string; description: string; action?: React.ReactNode }) {
+  return (
+    <div className="page-title">
+      <div>
+        <p className="eyebrow">SMART MONEY AGENTS</p>
+        <h1>{title}</h1>
+        <p>{description}</p>
+      </div>
+      {action}
+    </div>
+  );
+}
 
 function App() {
-  const [page, setPage] = useState<Page>("dashboard");
-  const [status, setStatus] = useState<ApiStatus | null>(null);
-  const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
-  const [marketAnalyses, setMarketAnalyses] = useState<AnalysisResult[]>([]);
-  const [risk, setRisk] = useState<{ state: RiskState; limits: RiskConfig } | null>(null);
-  const [positions, setPositions] = useState<{ open: Position[]; all: Position[] }>({ open: [], all: [] });
-  const [journal, setJournal] = useState<JournalEntry[]>([]);
-  const [activity, setActivity] = useState<ActivityEvent[]>([]);
-  const [assets, setAssets] = useState<string[]>([]);
-  const [connections, setConnections] = useState<ExchangeConnection[]>([]);
-  const [exchangeSetupError, setExchangeSetupError] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [wsConnected, setWsConnected] = useState(false);
-  const ws = useRef(false);
-  const [riskForm, setRiskForm] = useState({ maxTrades: "10", riskPct: "1", dailyLoss: "3", drawdown: "10", minRr: "3" });
-  const [assetInput, setAssetInput] = useState("");
-  const [connectionForm, setConnectionForm] = useState({ exchange: "binance", label: "", apiKey: "", apiSecret: "" });
-  const [backtestForm, setBacktestForm] = useState({ start: "", end: "", equity: "10000" });
-  const [backtest, setBacktest] = useState<BacktestResult | null>(null);
-  const [providerHealth, setProviderHealth] = useState<ProviderHealth | null>(null);
-  const [equityHistory, setEquityHistory] = useState<{ timestamp: number; equity: number }[]>([]);
-  const [chart, setChart] = useState<ChartPayload | null>(null);
-  const [chartSymbol, setChartSymbol] = useState<string>("");
-  const [chartTf, setChartTf] = useState<string>("");
-  const [chartLoading, setChartLoading] = useState(false);
-  const [analytics, setAnalytics] = useState<Analytics | null>(null);
-  const [tradeDetail, setTradeDetail] = useState<TradeDetail | null>(null);
+  const [page, setPage] = useState<Page>("agents");
   const [user, setUser] = useState<AuthUser | null>(null);
-  const [auditEvents, setAuditEvents] = useState<{ action: string; detail: string; createdAt: number }[]>([]);
   const [authReady, setAuthReady] = useState(false);
   const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
 
+  const [agents, setAgents] = useState<AgentSnapshot[]>([]);
+  const [capital, setCapital] = useState({ total: 0, committed: 0 });
+  const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
+  const [trades, setTrades] = useState<AgentTrade[]>([]);
+  const [conditions, setConditions] = useState<{ conditions: MarketCondition[]; updatedAt: number | null }>({
+    conditions: [],
+    updatedAt: null,
+  });
+  const [news, setNews] = useState<NewsResult | null>(null);
+
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [form, setForm] = useState({
+    name: "",
+    mode: "PAPER" as "PAPER" | "LIVE",
+    allocatedCapital: "1000",
+    symbols: "BTCUSDT, ETHUSDT",
+    entryModels: ["CONFIRMATION", "SWEEP"] as string[],
+    riskPerTrade: "1",
+    minRr: "3",
+  });
+  const [capitalInput, setCapitalInput] = useState("");
+
   const refresh = useCallback(async () => {
     try {
-      const [s, a, marketResults, r, p, j, act, assetRes, health, equity] = await Promise.all([api.status(), api.analysis(), api.markets(), api.risk(), api.positions(), api.journal(), api.activity(), api.assets(), api.providerHealth(), api.equityHistory()]);
-      setStatus(s); setAnalysis(a); setMarketAnalyses(marketResults.analyses); setRisk(r); setPositions(p); setJournal(j.entries); setActivity(act.events); setAssets(assetRes.assets);
-      setRiskForm({ maxTrades: String(r.limits.maxTradesPerDay), riskPct: String(r.limits.riskPerTrade), dailyLoss: String(r.limits.maxDailyLossPct), drawdown: String(r.limits.maxDrawdownPct), minRr: "3" });
-      setProviderHealth(health);
-      setEquityHistory(equity.points);
-      void api.auth.savePaperState({ positions: p.all, journal: j.entries, activity: act.events, equity: r.state.equity });
+      const [agentList, portfolioResult, tradeResult] = await Promise.all([
+        agentsApi.list(),
+        agentsApi.portfolio(),
+        agentsApi.trades(),
+      ]);
+      setAgents(agentList.agents);
+      setCapital(agentList.capital);
+      setPortfolio(portfolioResult);
+      setTrades(tradeResult.trades);
       setError(null);
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
-  }, []);
-
-  const refreshConnections = useCallback(async () => { try { const result = await api.connections(); setConnections(result.connections); setExchangeSetupError(result.setupError ?? null); } catch (err) { setExchangeSetupError(err instanceof Error ? err.message : String(err)); } }, []);
-  const applyState = useCallback((state: StreamState) => { setStatus(state.status); setAnalysis(state.analysis); setRisk(state.risk); setPositions(state.positions); setJournal(state.journal.entries); setActivity(state.activity.events); setAssets(state.configuredAssets ?? []); }, []);
-  useEffect(() => {
-    if (!authReady || !user) return;
-    void refresh(); void refreshConnections();
-    const disconnect = connectStream({ onState: applyState, onActivity: (event) => setActivity((previous) => [event, ...previous].slice(0, 200)), onSystem: (_level, detail) => setError(detail), onStatus: (connected) => { ws.current = connected; setWsConnected(connected); } });
-    const timer = setInterval(() => { if (!ws.current) void refresh(); }, 5000);
-    return () => { clearInterval(timer); disconnect(); };
-  }, [authReady, user, refresh, refreshConnections, applyState]);
-  useEffect(() => { void api.auth.me().then((result) => setUser(result.user)).catch((err) => { setError(err instanceof Error ? err.message : "Authentication service is unavailable."); setUser(null); }).finally(() => setAuthReady(true)); }, []);
-  useEffect(() => {
-    if (!user) return;
-    void api.auth.account().then(async ({ account }) => {
-      // Only push settings the account actually has. Sending an empty or
-      // missing list made the Worker reject the whole load with
-      // "assets must be a string array".
-      if (Array.isArray(account.assets) && account.assets.length > 0) {
-        await api.updateAssets(account.assets);
-      }
-      if (account.risk && Object.keys(account.risk).length > 0) {
-        await api.updateConfig({ risk: account.risk });
-      }
-      const { state } = await api.auth.paperState();
-      if (state) await api.restorePaperState(state);
-      await refresh();
-    }).catch((err) => setError(err instanceof Error ? err.message : "Could not restore saved account settings."));
-  }, [user, refresh]);
-  useEffect(() => { if (user) void api.auth.audit().then(({ events }) => setAuditEvents(events)).catch(() => setAuditEvents([])); }, [user]);
-
-  const run = async (key: string, action: () => Promise<unknown>) => { setBusy(key); setError(null); setNotice(null); try { await action(); await refresh(); setNotice("Changes saved successfully."); } catch (err) { setError(err instanceof Error ? err.message : String(err)); } finally { setBusy(null); } };
-  const validSetups = analysis?.setups.filter((setup) => setup.status === "VALID") ?? [];
-  const mode: TradingMode = status?.mode ?? "PAPER";
-  const feedMessage = status?.feed?.lastError ? `Data feed unavailable: ${status.feed.lastError}` : status?.feed?.running ? "Market feed operating normally" : "Market feed is not running";
-  const safetyOk = !status?.safetyBlocked;
-  const addAsset = () => {
-    const pair = assetInput.trim().toUpperCase(); if (!pair || assets.includes(pair)) return;
-    void run("assets", async () => { await api.updateAssets([...assets, pair]); setAssetInput(""); });
-  };
-  const removeAsset = (asset: string) => void run("assets", () => api.updateAssets(assets.filter((item) => item !== asset)));
-  const changeMode = (next: TradingMode) => void run("mode", async () => { await api.setMode(next); });
-  const saveRisk = () => void run("risk", async () => { await api.updateConfig({ risk: { maxTradesPerDay: Number(riskForm.maxTrades), riskPerTrade: Number(riskForm.riskPct), maxDailyLossPct: Number(riskForm.dailyLoss), maxDrawdownPct: Number(riskForm.drawdown) }, strategy: { minRr: Number(riskForm.minRr) } }); });
-  const addConnection = () => void run("connection", async () => { await api.addConnection(connectionForm); setConnectionForm({ exchange: "binance", label: "", apiKey: "", apiSecret: "" }); await refreshConnections(); });
-  const runBacktest = () => void run("backtest", async () => { const startTime = Date.parse(backtestForm.start); const endTime = Date.parse(backtestForm.end); if (!Number.isFinite(startTime) || !Number.isFinite(endTime)) throw new Error("Use valid ISO timestamps for the backtest range."); setBacktest(await api.backtest({ startTime, endTime, startingEquity: Number(backtestForm.equity) || 10000 })); });
-  const signIn = (register: boolean) => void run("auth", async () => { const result = register ? await api.auth.register(authForm.email, authForm.password, authForm.name) : await api.auth.login(authForm.email, authForm.password); setUser(result.user); });
-  // Timeframe labels come from the engine's own top-down block so the chart
-  // always requests a timeframe the analysis engine actually tracks.
-  const chartTimeframes = [analysis?.topDown?.htf.timeframe, analysis?.topDown?.mtf.timeframe, analysis?.topDown?.ltf.timeframe]
-    .filter((tf): tf is string => Boolean(tf));
-  const activeChartSymbol = chartSymbol || analysis?.symbol || assets[0] || "BTCUSDT";
-  const activeChartTf = chartTf || chartTimeframes.at(-1) || "";
-
-  const loadChart = useCallback(async (symbol: string, tf?: string) => {
-    setChartLoading(true);
-    try {
-      setChart(await api.chart(symbol, tf || undefined));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setChartLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    if (page !== "chart" || !user) return;
-    void loadChart(activeChartSymbol, activeChartTf);
-  }, [page, user, activeChartSymbol, activeChartTf, loadChart]);
-
-  useEffect(() => {
-    if (page !== "analytics" || !user) return;
-    setAnalytics(null);
-    void api.analytics()
-      .then(setAnalytics)
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [page, user]);
-
-  const openTrade = useCallback((id: string) => {
-    setPage("trade");
-    setTradeDetail(null);
-    void api.trade(id)
-      .then(setTradeDetail)
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+    void api.auth
+      .me()
+      .then((result) => setUser(result.user))
+      .catch((err) => setError(err instanceof Error ? err.message : "Authentication is unavailable."))
+      .finally(() => setAuthReady(true));
   }, []);
 
-  // Every setup the engine produced across all scanned markets, tagged with its
-  // market so the rejected view can show where each one came from.
-  const allSetups = useMemo(() => {
-    const sources = marketAnalyses.length ? marketAnalyses : analysis ? [analysis] : [];
-    return sources.flatMap((result) =>
-      result.setups.map((setup) => ({ ...setup, symbol: setup.symbol ?? result.symbol })),
-    );
-  }, [marketAnalyses, analysis]);
+  useEffect(() => {
+    if (!user) return;
+    void refresh();
+    const timer = setInterval(() => void refresh(), 15_000);
+    return () => clearInterval(timer);
+  }, [user, refresh]);
 
-  const chartPage = <>
-    <PageTitle
-      title="Chart & analysis"
-      description="Candles with the structure, liquidity and points of interest the engine is actually using. Every overlay can be toggled."
-      action={<div className="inline-form">
-        <select value={activeChartSymbol} onChange={(e) => { setChartSymbol(e.target.value); setChart(null); }}>
-          {(assets.length ? assets : [activeChartSymbol]).map((asset) => (
-            <option key={asset} value={asset.replace("/", "")}>{asset}</option>
-          ))}
-        </select>
-      </div>}
-    />
-    <div className="chart-layout">
-      <Card title={`${activeChartSymbol} · ${activeChartTf || "chart"}`}>
-        <SmcChart
-          data={chart}
-          loading={chartLoading}
-          timeframe={activeChartTf}
-          timeframes={chartTimeframes}
-          onTimeframeChange={(tf) => { setChartTf(tf); setChart(null); }}
-        />
-      </Card>
-      <Card title="Current analysis">
-        <AnalysisExplanation analysis={analysis} />
-      </Card>
-    </div>
-    <Card title={`Setups on ${activeChartSymbol} (${chart?.setups?.length ?? 0})`}>
-      {chart?.setups?.length
-        ? <div className="setup-cards">{chart.setups.map((setup) => <SetupCard key={setup.id} setup={setup} />)}</div>
-        : <div className="empty">No setups on this market right now.<p>The engine reports zero setups as a valid outcome rather than forcing a trade.</p></div>}
-    </Card>
-  </>;
+  // Conditions and news are polled only while their page is open: both change
+  // far more slowly than positions and cost a request each.
+  useEffect(() => {
+    if (!user || page !== "conditions") return;
+    void agentsApi.conditions().then(setConditions).catch(() => undefined);
+  }, [user, page]);
 
-  const rejectedPage = <>
-    <PageTitle
-      title="Rejected setups"
-      description="Opportunities the engine identified and declined, with the exact reason each one was not traded."
-    />
-    <div className="metrics">
-      <Metric label="Setups seen" value={allSetups.length} hint="Across all scanned markets"/>
-      <Metric label="Valid" value={allSetups.filter((s) => s.status === "VALID").length} tone="good"/>
-      <Metric label="Executed" value={allSetups.filter((s) => s.status === "EXECUTED").length}/>
-      <Metric label="Rejected" value={allSetups.filter((s) => ["REJECTED", "INVALIDATED", "STALE"].includes(s.status)).length} tone="bad"/>
-    </div>
-    <Card title="Declined opportunities">
-      <RejectedSetups setups={allSetups}/>
-    </Card>
-  </>;
+  useEffect(() => {
+    if (!user || page !== "news") return;
+    void agentsApi.news().then(setNews).catch(() => undefined);
+  }, [user, page]);
 
-  const analyticsPage = <>
-    <PageTitle
-      title="Analytics"
-      description="Performance measured by the same code the backtester uses, so paper, live and historical results are directly comparable."
-    />
-    <AnalyticsView data={analytics}/>
-  </>;
+  const run = async (key: string, action: () => Promise<unknown>) => {
+    setBusy(key);
+    setError(null);
+    setNotice(null);
+    try {
+      await action();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
 
-  const tradePage = <TradeDetailView detail={tradeDetail} onBack={() => setPage("positions")}/>;
+  const createAgent = () =>
+    void run("create", async () => {
+      const symbols = form.symbols
+        .split(",")
+        .map((s) => s.trim().toUpperCase().replace("/", ""))
+        .filter(Boolean);
+      const result = await agentsApi.create({
+        name: form.name.trim() || "Agent",
+        mode: form.mode,
+        allocatedCapital: Number(form.allocatedCapital),
+        symbols,
+        entryModels: form.entryModels,
+        riskPerTrade: Number(form.riskPerTrade),
+        minRr: Number(form.minRr),
+      });
+      if (result.error) throw new Error(result.error);
+      setShowCreate(false);
+      setNotice(`Agent "${result.agent?.name}" created and funded.`);
+    });
 
-  const activeLabel = nav.find(([id]) => id === page)?.[2] ?? "Overview";
+  const updateAgent = (id: string, patch: Record<string, unknown>) =>
+    void run(id, async () => {
+      const result = await agentsApi.update(id, patch as never);
+      if (result.error) throw new Error(result.error);
+    });
 
-  if (!authReady) return <div className="auth-shell"><main><div className="empty">Checking secure session…</div></main></div>;
-  if (!user) return <div className="auth-shell"><main><div className="page-title"><div><p className="eyebrow">MIRAGE SMART MONEY OS</p><h1>Sign in to your workspace</h1><p>Your paper account and future exchange connections stay private.</p></div></div><div className="two-col"><Card title="Email and password"><div className="form-grid"><label>Name (registration)<input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}/></label><label>Email<input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}/></label><label>Password<input type="password" minLength={12} value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}/></label></div><div className="card-actions"><button className="primary" disabled={busy === "auth"} onClick={() => signIn(false)}>Sign in</button><button disabled={busy === "auth"} onClick={() => signIn(true)}>Create account</button></div>{error && <p className="helper bad">{error}</p>}<p className="helper">Passwords require at least 12 characters.</p></Card><Card title="Google sign-in"><p className="helper">Use your verified Google account.</p><button className="primary" onClick={() => api.auth.google()}>Continue with Google</button></Card></div></main></div>;
+  const removeAgent = (id: string) => void run(id, () => agentsApi.remove(id));
 
-  const overview = <>{providerHealth?.providers && <div className="alert success"><b>Exchange data</b>{providerHealth.providers.filter((provider) => provider.status === "healthy").length}/{providerHealth.providers.length} public data providers healthy.<span>Updated {time(providerHealth.checkedAt)}</span></div>}
-    <div className="hero"><div><p className="eyebrow">{status?.exchange ?? "EXCHANGE"} · {status?.symbol ?? "BTCUSDT"}</p><h1>Trading command center</h1><p>Rule-based Smart Money analysis, risk controls, and execution in one workspace.</p></div><div className="hero-actions"><button className="primary" onClick={() => void run("refresh", async () => { await refresh(); })}>{busy === "refresh" ? "Refreshing…" : "Refresh data"}</button><button className="danger" onClick={() => void run("stop", () => api.setAutoTrading(false))}>Emergency stop</button></div></div>
-    <div className="metrics"><Metric label="Account equity" value={money(risk?.state.equity)} hint="Paper account"/><Metric label="Today P&L" value={money(risk?.state.realizedPnlToday)} tone={(risk?.state.realizedPnlToday ?? 0) >= 0 ? "good" : "bad"} hint={`${risk?.state.tradesToday ?? 0}/${risk?.limits.maxTradesPerDay ?? 10} trades used`}/><Metric label="Open positions" value={positions.open.length} hint={`Limit ${risk?.limits.maxOpenPositions ?? 5}`}/><Metric label="Market bias" value={analysis?.bias ?? "UNCLEAR"} tone={analysis?.bias === "BULLISH" ? "good" : analysis?.bias === "BEARISH" ? "bad" : undefined} hint={analysis?.status ?? "Waiting for analysis"}/></div>
-    <div className="workspace-grid"><Card title="Automated trading" action={<Badge good={status?.autoTrading}>{status?.autoTrading ? "AUTOMATION ON" : "PAUSED"}</Badge>}><div className="mode-control">{(["ANALYSIS_ONLY", "PAPER", "LIVE"] as TradingMode[]).map((item) => <button key={item} className={mode === item ? "selected" : ""} onClick={() => changeMode(item)} disabled={busy === "mode"}>{item === "ANALYSIS_ONLY" ? "Analysis" : item === "PAPER" ? "Paper" : "Live"}</button>)}</div><p className="helper">Live mode requires a connected, trading-enabled exchange account. Paper mode uses the same strategy and risk engine without placing real orders.</p><div className="control-row"><span>Safety state</span><Badge good={safetyOk}>{safetyOk ? "CLEAR" : "SAFE MODE"}</Badge></div><div className="control-row"><span>Data connection</span><Badge good={!status?.feed?.lastError}>{status?.feed?.lastError ? "DEGRADED" : "HEALTHY"}</Badge></div><div className="card-actions"><button onClick={() => void run("auto", () => api.setAutoTrading(!status?.autoTrading))}>{status?.autoTrading ? "Pause automation" : "Enable automation"}</button><button onClick={() => void run("safe", () => status?.safetyBlocked ? api.exitSafeMode() : api.enterSafeMode("Manual safety stop"))}>{status?.safetyBlocked ? "Exit safe mode" : "Enter safe mode"}</button></div></Card>
-    <Card title="SMC analysis"><div className="bias-visual"><strong>{analysis?.bias ?? "UNCLEAR"}</strong><span>{analysis?.status ?? "Waiting for candles"}</span></div><div className="timeframes">{analysis?.topDown && ([["HTF", analysis.topDown.htf], ["MTF", analysis.topDown.mtf], ["LTF", analysis.topDown.ltf]] as Array<[string, { timeframe: string; trend: string }]>).map(([label, item]) => <div key={label}><span>{label}</span><b>{item.timeframe}</b><em>{item.trend}</em></div>)}</div><p className="helper">{analysis?.topDown?.conflict ?? "Top-down structure must align before a setup can execute."}</p></Card>
-    <Card title="System health"><div className={`health-dot ${status?.feed?.lastError ? "issue" : ""}`}><span></span>{feedMessage}</div><div className="health-list"><div><span>WebSocket</span><b>{wsConnected ? "Connected" : "Polling"}</b></div><div><span>Data source</span><b>{status?.marketDataSource ?? "unknown"}</b></div><div><span>Feed cycles</span><b>{status?.feed?.cyclesProcessed ?? 0}</b></div><div><span>Last poll</span><b>{time(status?.feed?.lastPollAt)}</b></div></div><button className="link-button" onClick={() => setPage("exchange")}>Open exchange connections →</button></Card></div>
-    <div className="workspace-grid lower"><Card title={`Qualified setups (${validSetups.length})`} action={<button className="link-button" onClick={() => setPage("markets")}>View scanner →</button>}><Setups setups={validSetups}/></Card><Card title="Recent activity" action={<button className="link-button" onClick={() => setPage("journal")}>Journal →</button>}><Activity items={activity.slice(0, 5)}/></Card></div>
-  </>;
+  const saveCapital = () =>
+    void run("capital", async () => {
+      const amount = Number(capitalInput);
+      if (!Number.isFinite(amount) || amount <= 0) throw new Error("Enter a capital amount greater than zero.");
+      await agentsApi.setCapital(amount);
+      setCapitalInput("");
+      setNotice("Paper capital updated.");
+    });
 
-  const markets = <><PageTitle title="Market scanner" description="Manage the markets the engine monitors and review current Smart Money context." action={<div className="inline-form"><input value={assetInput} onChange={(event) => setAssetInput(event.target.value)} onKeyDown={(event) => event.key === "Enter" && addAsset()} placeholder="BTCUSDT"/><button className="primary" onClick={addAsset} disabled={busy === "assets"}>Add market</button></div>}/><Card title="Watchlist"><div className="market-table"><div className="table-row heading"><span>Market</span><span>Bias</span><span>Provider</span><span>Status</span><span></span></div>{assets.map((asset) => { const result = marketAnalyses.find((item) => item.symbol === asset.replace("/", "")); return <div className="table-row" key={asset}><b>{asset}</b><span className={result?.bias === "BULLISH" ? "good" : result?.bias === "BEARISH" ? "bad" : ""}>{result?.bias ?? "PENDING"}</span><span title={result?.noTradeReason ?? undefined}>{result?.noTradeReason ? result.noTradeReason.slice(0, 60) + (result.noTradeReason.length > 60 ? "…" : "") : result?.exchange ?? "Awaiting scan"}</span><Badge good={result?.status === "READY"}>{(result?.status ?? "QUEUED").replace(/_/g, " ")}</Badge><button className="icon-button" onClick={() => removeAsset(asset)} disabled={assets.length === 1 || busy === "assets"}>×</button></div>})}</div><p className="helper">Every saved pair is scanned across the configured public exchange fallbacks. Results identify the provider that supplied the candles.</p></Card><div className="two-col"><Card title="Top-down thesis"><div className="thesis"><span>HTF</span><b>{analysis?.topDown?.htf.trend ?? "NEUTRAL"}</b><p>{analysis?.topDown?.htf.poi ?? "No active point of interest identified."}</p><span>Liquidity</span><b>{analysis?.topDown?.htf.liquidity ?? "Pending"}</b></div></Card><Card title="Setup queue"><Setups setups={marketAnalyses.flatMap((item) => item.setups)}/></Card></div></>;
-  const positionPage = <><PageTitle title="Positions" description="Open exposure and completed executions. Select a position to see its full decision and management timeline."/><Card title={`Open positions (${positions.open.length})`}><Positions positions={positions.open} onSelect={openTrade}/></Card><Card title="All position history"><Positions positions={positions.all} onSelect={openTrade}/></Card></>;
-  const paper = <><PageTitle title="Paper trading" description="Run the live strategy and risk rules against market data without placing real exchange orders." action={<Badge good={mode === "PAPER"}>CURRENT MODE: {mode}</Badge>}/><div className="two-col"><Card title="Paper account"><div className="large-number">{money(risk?.state.equity)}</div><p className="helper">Fees, adverse entry slippage, partial take-profits, exit fees, and drawdown controls are included in simulated P&amp;L.</p><div className="metrics compact"><Metric label="Risk / trade" value={`${risk?.limits.riskPerTrade ?? 1}%`}/><Metric label="Daily loss cap" value={`${risk?.limits.maxDailyLossPct ?? 3}%`}/></div><button className="primary" onClick={() => changeMode("PAPER")}>Switch to paper mode</button></Card><Card title="Paper execution status"><div className="control-row"><span>Auto trading</span><Badge good={status?.autoTrading}>{status?.autoTrading ? "ENABLED" : "PAUSED"}</Badge></div><div className="control-row"><span>Safety controls</span><Badge good={safetyOk}>{safetyOk ? "READY" : "BLOCKED"}</Badge></div><p className="helper">No live order can be sent while paper mode is selected.</p></Card></div><Card title="Balance history"><EquityChart points={equityHistory}/></Card><Card title="Paper trade activity"><Activity items={activity.filter((item) => /trade|position|execution/i.test(item.kind)).slice(0, 20)}/></Card></>;
-  const backtesting = <><PageTitle title="Backtesting" description="Replay historical candles using the identical deterministic SMC and risk engine."/><div className="two-col"><Card title="Configure a run"><div className="form-grid"><label>Start (ISO)<input value={backtestForm.start} onChange={(e) => setBacktestForm({ ...backtestForm, start: e.target.value })} placeholder="2024-01-01T00:00:00Z"/></label><label>End (ISO)<input value={backtestForm.end} onChange={(e) => setBacktestForm({ ...backtestForm, end: e.target.value })} placeholder="2024-02-01T00:00:00Z"/></label><label>Starting equity<input value={backtestForm.equity} onChange={(e) => setBacktestForm({ ...backtestForm, equity: e.target.value })}/></label></div><button className="primary" onClick={runBacktest} disabled={busy === "backtest"}>{busy === "backtest" ? "Running…" : "Run backtest"}</button></Card><Card title="Methodology"><ul className="check-list"><li>No look-ahead candle access</li><li>Risk and exchange-cost assumptions applied</li><li>Rejected setups recorded alongside trades</li><li>Position management and drawdown tracked</li></ul></Card></div>{backtest && <Card title="Backtest results"><div className="metrics"><Metric label="Trades" value={backtest.stats.totalTrades}/><Metric label="Win rate" value={`${number(backtest.stats.winRate)}%`}/><Metric label="Net P&L" value={money(backtest.stats.netPnl)} tone={backtest.stats.netPnl >= 0 ? "good" : "bad"}/><Metric label="Max drawdown" value={`${number(backtest.stats.maxDrawdown)}%`}/><Metric label="Profit factor" value={number(backtest.stats.profitFactor)}/></div><p className="helper">{backtest.message}</p></Card>}</>;
-  const journalPage = <><PageTitle title="Trading journal" description="Auditable timeline of system decisions, safety events, and configuration changes."/><div className="two-col"><Card title={`System events (${journal.length})`}><div className="timeline">{journal.map((entry, index) => <div className="timeline-item" key={`${entry.timestamp}-${index}`}><span></span><div><b>{entry.category} · {entry.title}</b><p>{entry.body}</p><small>{time(entry.timestamp)}</small></div></div>)}</div></Card><Card title={`Live activity (${activity.length})`}><Activity items={activity}/></Card></div></>;
-  const settings = <><PageTitle title="Strategy & risk settings" description="These values are validated by the backend and applied to the live strategy engine."/><div className="two-col"><Card title="Risk controls"><div className="form-grid"><label>Max trades / day<input type="number" min={1} max={15} value={riskForm.maxTrades} onChange={(e) => setRiskForm({ ...riskForm, maxTrades: e.target.value })}/></label><label>Risk per trade (%)<input type="number" min={0.1} max={5} step={0.1} value={riskForm.riskPct} onChange={(e) => setRiskForm({ ...riskForm, riskPct: e.target.value })}/></label><label>Daily loss limit (%)<input type="number" min={0.5} max={10} step={0.5} value={riskForm.dailyLoss} onChange={(e) => setRiskForm({ ...riskForm, dailyLoss: e.target.value })}/></label><label>Maximum drawdown (%)<input type="number" min={2} max={50} value={riskForm.drawdown} onChange={(e) => setRiskForm({ ...riskForm, drawdown: e.target.value })}/></label><label>Minimum R:R<input type="number" min={1} step={0.5} value={riskForm.minRr} onChange={(e) => setRiskForm({ ...riskForm, minRr: e.target.value })}/></label></div><button className="primary" onClick={saveRisk} disabled={busy === "risk"}>{busy === "risk" ? "Saving…" : "Save risk settings"}</button><p className="helper">Hard platform ceilings: 15 trades/day, 5% risk/trade, 10% daily loss, 50% drawdown.</p></Card><Card title="Execution safeguards"><div className="guard"><b>Duplicate trade protection</b><span>Enabled</span></div><div className="guard"><b>Correlated exposure limit</b><span>{risk?.limits.maxCorrelatedExposurePct ?? 100}%</span></div><div className="guard"><b>Break-even management</b><span>Strategy controlled</span></div><div className="guard"><b>Emergency safety stop</b><button onClick={() => void run("safe", () => api.enterSafeMode("Triggered in settings"))}>Engage</button></div></Card></div></>;
-  const exchange = <><PageTitle title="Exchange connections" description="Credentials are validated server-side and encrypted at rest. Never enable withdrawal permissions."/><div className="two-col"><Card title="Connect an exchange"><div className="form-grid"><label>Exchange<select value={connectionForm.exchange} onChange={(e) => setConnectionForm({ ...connectionForm, exchange: e.target.value })}><option value="binance">Binance · private validation</option><option value="bybit">Bybit · market data</option><option value="bitget">Bitget · market data</option><option value="okx">OKX · market data</option><option value="kucoin">KuCoin · market data</option></select></label><label>Account label<input value={connectionForm.label} onChange={(e) => setConnectionForm({ ...connectionForm, label: e.target.value })} placeholder="My trading account"/></label><label>API key<input value={connectionForm.apiKey} onChange={(e) => setConnectionForm({ ...connectionForm, apiKey: e.target.value })} autoComplete="off"/></label><label>API secret<input value={connectionForm.apiSecret} onChange={(e) => setConnectionForm({ ...connectionForm, apiSecret: e.target.value })} type="password" autoComplete="new-password"/></label></div><div className="warning">Public analysis uses Binance, Bybit, Coinbase, OKX, Bitget, and KuCoin automatically. Private credential validation is currently enabled only for Binance; unsupported credentials are rejected and never stored.</div><button className="primary" onClick={addConnection} disabled={busy === "connection"}>Validate & connect</button></Card><Card title="Connected accounts">{connections.length === 0 ? <div className="empty">No exchange account connected.<p>Paper trading is available without credentials. Live order placement remains locked until a supported, trading-enabled account and execution adapter pass every approval gate.</p></div> : <div className="connection-list">{connections.map((connection) => <div className="connection" key={connection.id}><div><b>{connection.label}</b><span>{connection.exchange} · {connection.apiKeyMasked}</span></div><Badge good={connection.permissions.tradingEnabled}>TRADING {connection.permissions.tradingEnabled ? "READY" : "DISABLED"}</Badge><button className="icon-button" onClick={() => void run("remove-connection", async () => { await api.removeConnection(connection.id); await refreshConnections(); })}>×</button></div>)}</div>}</Card></div></>;
+  const signIn = (register: boolean) =>
+    void run("auth", async () => {
+      const result = register
+        ? await api.auth.register(authForm.email, authForm.password, authForm.name)
+        : await api.auth.login(authForm.email, authForm.password);
+      setUser(result.user);
+    });
 
-  const account = <><PageTitle title="Account" description="Use a private account for this trading workspace."/>{user ? <><Card title="Signed in"><div className="empty"><b>{user.name}</b><p>{user.email}</p><button onClick={() => void run("logout", async () => { await api.auth.logout(); setUser(null); })}>Sign out</button></div></Card><Card title="Security activity"><div className="timeline">{auditEvents.map((event, index) => <div className="timeline-item" key={`${event.createdAt}-${index}`}><span></span><div><b>{event.action}</b><p>{event.detail}</p><small>{time(event.createdAt)}</small></div></div>)}</div></Card></> : <div className="two-col"><Card title="Email and password"><div className="form-grid"><label>Name (registration)<input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}/></label><label>Email<input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}/></label><label>Password<input type="password" minLength={12} value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}/></label></div><div className="card-actions"><button className="primary" onClick={() => signIn(false)}>Sign in</button><button onClick={() => signIn(true)}>Create account</button></div><p className="helper">Passwords require at least 12 characters.</p></Card><Card title="Google"><p className="helper">Sign in with your verified Google account.</p><button className="primary" onClick={() => api.auth.google()}>Continue with Google</button></Card></div>}</>;
-  const content = ({ dashboard: overview, markets, chart: chartPage, positions: positionPage, trade: tradePage, rejected: rejectedPage, analytics: analyticsPage, paper, backtest: backtesting, journal: journalPage, settings, exchange, account } as Record<Page, React.ReactNode>)[page];
-  return <div className="shell"><aside className="sidebar"><div className="brand"><span>m</span><div><b>Mirage</b><small>SMART MONEY OS</small></div></div><nav>{nav.map(([id, icon, label]) => <button key={id} className={page === id ? "active" : ""} onClick={() => setPage(id)}><i>{icon}</i>{label}</button>)}</nav><div className="sidebar-foot"><Badge good={wsConnected}>{wsConnected ? "SYSTEM ONLINE" : "RECONNECTING"}</Badge><span>v{status?.strategyVersion ?? "1.0.0"}</span></div></aside><main><header className="mobile-head"><button className="brand-mobile" onClick={() => setPage("dashboard")}>m</button><span>{activeLabel}</span><Badge good={wsConnected}>{wsConnected ? "LIVE" : "POLLING"}</Badge></header>{error && <div className="alert error"><b>Action required</b>{error}<button onClick={() => setError(null)}>×</button></div>}{notice && <div className="alert success"><b>Updated</b>{notice}<button onClick={() => setNotice(null)}>×</button></div>}{content}</main></div>;
-}
-
-function PageTitle({ title, description, action }: { title: string; description: string; action?: React.ReactNode }) { return <div className="page-title"><div><p className="eyebrow">WORKSPACE</p><h1>{title}</h1><p>{description}</p></div>{action}</div>; }
-function Setups({ setups }: { setups: AnalysisResult["setups"] }) { return setups.length === 0 ? <div className="empty">No qualified setups yet.<p>The engine waits for valid market structure, POI, confirmation, risk approval, and acceptable reward-to-risk.</p></div> : <div className="setup-list">{setups.slice(0, 10).map((setup) => <div className="setup" key={setup.id}><div><b>{setup.direction} · {setup.entryModel}</b><span>{setup.timeframe} · Score {setup.score}</span></div><Badge good={setup.status === "VALID"}>{setup.status}</Badge><p>Entry {number(setup.entry)} · SL {number(setup.stopLoss)} · R:R {setup.rr.map((ratio) => `1:${number(ratio, 1)}`).join(" / ")}</p>{setup.rejectionReasons.length > 0 && <small>{setup.rejectionReasons.join(" · ")}</small>}</div>)}</div>; }
-function Positions({ positions, onSelect }: { positions: Position[]; onSelect?: (id: string) => void }) {
-  if (positions.length === 0) {
-    return <div className="empty">No positions to show.<p>Positions only appear after a setup passes every strategy and risk gate.</p></div>;
+  if (!authReady) {
+    return <div className="auth-shell"><main><div className="empty">Checking secure session…</div></main></div>;
   }
-  return <div className="market-table">
-    <div className="table-row heading"><span>Position</span><span>Entry / mark</span><span>Stop loss</span><span>P&L</span><span>Status</span></div>
-    {positions.map((position) => {
-      // Prefer the position id; older stored positions only carry a setup id.
-      const id = (position as Position & { id?: string }).id ?? position.setupId;
-      return <div
-        className={`table-row ${onSelect ? "selectable" : ""}`}
-        key={id}
-        role={onSelect ? "button" : undefined}
-        tabIndex={onSelect ? 0 : undefined}
-        onClick={onSelect ? () => onSelect(id) : undefined}
-        onKeyDown={onSelect ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(id); } } : undefined}
-      >
-        <b>{position.symbol} <small>{position.direction}</small></b>
-        <span>{number(position.entry)} / {number(position.currentPrice)}</span>
-        <span>{number(position.stopLoss)}</span>
-        <span className={position.unrealizedPnl >= 0 ? "good" : "bad"}>{money(position.unrealizedPnl)}</span>
-        <Badge good={position.status === "OPEN"}>{position.status}</Badge>
-      </div>;
-    })}
-  </div>;
-}
-function Activity({ items }: { items: ActivityEvent[] }) { return items.length === 0 ? <div className="empty">No activity yet.</div> : <div className="activity-list">{items.map((item, index) => <div className={`activity ${item.level}`} key={`${item.timestamp}-${index}`}><span></span><div><b>{item.kind}</b><p>{item.detail}</p></div><small>{time(item.timestamp)}</small></div>)}</div>; }
-function EquityChart({ points }: { points: { timestamp: number; equity: number }[] }) {
-  if (!points.length) return <div className="empty">Balance history will appear after the first paper-account refresh.</div>;
-  const values = points.map((point) => point.equity); const min = Math.min(...values); const max = Math.max(...values); const range = Math.max(max - min, 1);
-  const coords = points.map((point, index) => `${points.length === 1 ? 50 : (index / (points.length - 1)) * 100},${38 - ((point.equity - min) / range) * 34}`).join(" ");
-  return <div className="equity-chart"><div><b>{money(values.at(-1))}</b><span>{points.length} balance point{points.length === 1 ? "" : "s"} · {time(points.at(-1)?.timestamp)}</span></div><svg viewBox="0 0 100 42" preserveAspectRatio="none" role="img" aria-label="Paper account balance history"><polyline points={coords}/></svg><small>{money(min)} low · {money(max)} high</small></div>;
+
+  if (!user) {
+    return (
+      <div className="auth-shell">
+        <main>
+          <div className="page-title">
+            <div>
+              <p className="eyebrow">SMART MONEY AGENTS</p>
+              <h1>Sign in</h1>
+              <p>Your agents, capital and trade history stay private to your account.</p>
+            </div>
+          </div>
+          <section className="card">
+            <div className="card-head"><h2>Email and password</h2></div>
+            <div className="form-grid">
+              <label>Name (registration)
+                <input value={authForm.name} onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })}/>
+              </label>
+              <label>Email
+                <input type="email" value={authForm.email} onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}/>
+              </label>
+              <label>Password
+                <input type="password" minLength={12} value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}/>
+              </label>
+            </div>
+            <div className="card-actions">
+              <button className="primary" disabled={busy === "auth"} onClick={() => signIn(false)}>Sign in</button>
+              <button disabled={busy === "auth"} onClick={() => signIn(true)}>Create account</button>
+              <button onClick={() => api.auth.google()}>Continue with Google</button>
+            </div>
+            {error && <p className="helper bad">{error}</p>}
+            <p className="helper">Passwords require at least 12 characters.</p>
+          </section>
+        </main>
+      </div>
+    );
+  }
+
+  const createPanel = showCreate && (
+    <section className="card">
+      <div className="card-head"><h2>New agent</h2></div>
+      <div className="form-grid">
+        <label>Name
+          <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Trend follower"/>
+        </label>
+        <label>Mode
+          <select value={form.mode} onChange={(e) => setForm({ ...form, mode: e.target.value as "PAPER" | "LIVE" })}>
+            <option value="PAPER">Paper</option>
+            <option value="LIVE" disabled>Live (not enabled on this deployment)</option>
+          </select>
+        </label>
+        <label>Capital to assign
+          <input value={form.allocatedCapital} onChange={(e) => setForm({ ...form, allocatedCapital: e.target.value })}/>
+        </label>
+        <label>Markets (comma separated)
+          <input value={form.symbols} onChange={(e) => setForm({ ...form, symbols: e.target.value })}/>
+        </label>
+        <label>Risk per trade (%)
+          <input value={form.riskPerTrade} onChange={(e) => setForm({ ...form, riskPerTrade: e.target.value })}/>
+        </label>
+        <label>Minimum R:R
+          <input value={form.minRr} onChange={(e) => setForm({ ...form, minRr: e.target.value })}/>
+        </label>
+      </div>
+      <div className="layer-toggles">
+        {ENTRY_MODELS.map((model) => (
+          <label key={model} className={form.entryModels.includes(model) ? "on" : ""}>
+            <input
+              type="checkbox"
+              checked={form.entryModels.includes(model)}
+              onChange={(e) =>
+                setForm({
+                  ...form,
+                  entryModels: e.target.checked
+                    ? [...form.entryModels, model]
+                    : form.entryModels.filter((m) => m !== model),
+                })
+              }
+            />
+            {model.replace(/_/g, " ")}
+          </label>
+        ))}
+      </div>
+      <p className="helper">
+        {money(Math.max(0, capital.total - capital.committed))} is free to allocate.
+      </p>
+      <div className="card-actions">
+        <button className="primary" disabled={busy === "create"} onClick={createAgent}>
+          {busy === "create" ? "Creating…" : "Create and fund"}
+        </button>
+        <button onClick={() => setShowCreate(false)}>Cancel</button>
+      </div>
+    </section>
+  );
+
+  const pages: Record<Page, React.ReactNode> = {
+    agents: (
+      <>
+        <PageTitle
+          title="Agents"
+          description="Each agent trades its own capital on its own markets, and is supervised independently."
+          action={
+            <button className="primary" onClick={() => setShowCreate(!showCreate)}>
+              {showCreate ? "Close" : "New agent"}
+            </button>
+          }
+        />
+        {createPanel}
+        <section className="card">
+          <div className="card-head"><h2>Paper capital</h2></div>
+          <p className="helper">
+            Paper capital is the pool agents draw allocations from. Live capital would come
+            from a connected exchange balance; live trading is not enabled on this
+            deployment, so no exchange balance is reported.
+          </p>
+          <div className="inline-form">
+            <input
+              value={capitalInput}
+              onChange={(e) => setCapitalInput(e.target.value)}
+              placeholder={String(capital.total)}
+            />
+            <button disabled={busy === "capital"} onClick={saveCapital}>Set pool</button>
+          </div>
+        </section>
+        <AgentsView agents={agents} capital={capital} onUpdate={updateAgent} onRemove={removeAgent} busy={busy}/>
+      </>
+    ),
+    portfolio: (
+      <>
+        <PageTitle title="Portfolio" description="Capital, equity and realised results across every agent." />
+        <PortfolioView portfolio={portfolio}/>
+      </>
+    ),
+    trades: (
+      <>
+        <PageTitle title="Trades" description="Every position an agent has opened, with how it was closed." />
+        <TradesView trades={trades}/>
+      </>
+    ),
+    conditions: (
+      <>
+        <PageTitle title="Market conditions" description="How each market is behaving, classified from structure and directional efficiency." />
+        <ConditionsView conditions={conditions.conditions} updatedAt={conditions.updatedAt}/>
+      </>
+    ),
+    news: (
+      <>
+        <PageTitle title="Crypto news" description="Headlines that bear on the markets your agents trade." />
+        <NewsView news={news}/>
+      </>
+    ),
+  };
+
+  const activeLabel = nav.find(([id]) => id === page)?.[2] ?? "Agents";
+
+  return (
+    <div className="shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <span>m</span>
+          <div><b>Mirage</b><small>SMART MONEY AGENTS</small></div>
+        </div>
+        <nav>
+          {nav.map(([id, icon, label]) => (
+            <button key={id} className={page === id ? "active" : ""} onClick={() => setPage(id)}>
+              <i>{icon}</i>{label}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-foot">
+          <span>{user.email}</span>
+          <button className="link-button" onClick={() => void api.auth.logout().then(() => setUser(null))}>
+            Sign out
+          </button>
+        </div>
+      </aside>
+      <main>
+        <header className="mobile-head">
+          <button className="brand-mobile" onClick={() => setPage("agents")}>m</button>
+          <span>{activeLabel}</span>
+        </header>
+        {error && (
+          <div className="alert error">
+            <b>Action required</b>{error}
+            <button onClick={() => setError(null)}>×</button>
+          </div>
+        )}
+        {notice && (
+          <div className="alert success">
+            <b>Done</b>{notice}
+            <button onClick={() => setNotice(null)}>×</button>
+          </div>
+        )}
+        {pages[page]}
+      </main>
+    </div>
+  );
 }
 
 export { App };

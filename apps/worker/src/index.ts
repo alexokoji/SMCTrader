@@ -17,6 +17,8 @@ import {
   type RuntimeStorage,
 } from "./runtime.js";
 import { sendIngest } from "./ingest.js";
+import { AgentRuntime, defaultAgentConfig } from "./agents.js";
+import { cautionSymbols, fetchNews, type NewsResult } from "./news.js";
 
 interface Env {
   TRADING_SESSION: DurableObjectNamespace<TradingSession>;
@@ -122,6 +124,137 @@ export class TradingSession extends DurableObject<Env> {
   /** Guards against rewriting unchanged engine output every tick. */
   private lastEngineSignature = "";
   private lastAnyWarming?: boolean;
+  private agentRuntimeInstance?: AgentRuntime;
+
+  /** Agents are held on the instance so their engines stay warm between ticks. */
+  private agents(): AgentRuntime {
+    if (!this.agentRuntimeInstance) {
+      this.agentRuntimeInstance = new AgentRuntime({
+        get: <T,>(key: string) => this.ctx.storage.get<T>(key),
+        put: (entries: Record<string, unknown>) => this.ctx.storage.put(entries),
+      });
+    }
+    return this.agentRuntimeInstance;
+  }
+
+  // ---- agents ------------------------------------------------------------
+
+  async listAgents(): Promise<Record<string, unknown>> {
+    const snapshots = await this.agents().snapshots();
+    const committed = snapshots
+      .filter((s) => s.config.status !== "STOPPED")
+      .reduce((sum, s) => sum + s.config.allocatedCapital, 0);
+    return {
+      agents: snapshots,
+      capital: { total: await this.totalCapital(), committed },
+    };
+  }
+
+  /**
+   * Capital an operator may allocate. Paper capital is whatever they nominate;
+   * live capital would come from the exchange balance, which is not connected,
+   * so it is reported as zero rather than invented.
+   */
+  async totalCapital(): Promise<number> {
+    return (await this.ctx.storage.get<number>("paperCapital")) ?? STARTING_EQUITY;
+  }
+
+  async setPaperCapital(amount: number): Promise<{ total: number }> {
+    const total = Math.max(0, amount);
+    await this.ctx.storage.put({ paperCapital: total });
+    return { total };
+  }
+
+  async createAgent(input: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const symbols = Array.isArray(input.symbols)
+      ? (input.symbols as string[]).map((s) => String(s).toUpperCase().replace("/", ""))
+      : [];
+    const result = await this.agents().create(
+      {
+        id: `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        name: String(input.name ?? "Agent").slice(0, 60),
+        mode: input.mode === "LIVE" ? "LIVE" : "PAPER",
+        allocatedCapital: Number(input.allocatedCapital),
+        symbols,
+        entryModels: Array.isArray(input.entryModels) ? (input.entryModels as never) : undefined,
+        riskPerTrade: input.riskPerTrade === undefined ? undefined : Number(input.riskPerTrade),
+        minRr: input.minRr === undefined ? undefined : Number(input.minRr),
+        requiredRegimes: Array.isArray(input.requiredRegimes) ? (input.requiredRegimes as string[]) : undefined,
+      },
+      await this.totalCapital(),
+    );
+    if (result.error) return { error: result.error };
+    await this.ensureAnalysisAlarm();
+    return { agent: result.agent };
+  }
+
+  async updateAgent(id: string, patch: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const result = await this.agents().update(id, patch as never, await this.totalCapital());
+    return result.error ? { error: result.error } : { agent: result.agent };
+  }
+
+  async deleteAgent(id: string): Promise<Record<string, unknown>> {
+    return { removed: await this.agents().remove(id) };
+  }
+
+  async agentTrades(): Promise<Record<string, unknown>> {
+    return { trades: await this.agents().trades() };
+  }
+
+  /** Portfolio across every agent: what is committed, held and realised. */
+  async portfolio(): Promise<Record<string, unknown>> {
+    const snapshots = await this.agents().snapshots();
+    const total = await this.totalCapital();
+    const committed = snapshots
+      .filter((s) => s.config.status !== "STOPPED")
+      .reduce((sum, s) => sum + s.config.allocatedCapital, 0);
+    const equity = snapshots.reduce((sum, s) => sum + s.performance.equity, 0);
+    const realised = snapshots.reduce((sum, s) => sum + s.performance.netPnl, 0);
+    const openPositions = snapshots.reduce((sum, s) => sum + s.performance.openPositions, 0);
+    const closedTrades = snapshots.reduce((sum, s) => sum + s.performance.closedTrades, 0);
+    const wins = snapshots.reduce((sum, s) => sum + s.performance.wins, 0);
+
+    return {
+      totalCapital: total,
+      committed,
+      uncommitted: Math.max(0, total - committed),
+      equity: equity + Math.max(0, total - committed),
+      realisedPnl: realised,
+      openPositions,
+      closedTrades,
+      winRate: closedTrades ? (wins / closedTrades) * 100 : 0,
+      agents: snapshots.map((s) => ({
+        id: s.config.id,
+        name: s.config.name,
+        mode: s.config.mode,
+        status: s.config.status,
+        allocated: s.config.allocatedCapital,
+        equity: s.performance.equity,
+        netPnl: s.performance.netPnl,
+        openPositions: s.performance.openPositions,
+      })),
+      updatedAt: Date.now(),
+    };
+  }
+
+  async marketConditions(): Promise<Record<string, unknown>> {
+    return (await this.ctx.storage.get<Record<string, unknown>>("marketConditions")) ?? {
+      conditions: [],
+      updatedAt: null,
+    };
+  }
+
+  /** Cached so the feeds are polled on the analysis cadence, not per request. */
+  async news(): Promise<NewsResult> {
+    const cached = await this.ctx.storage.get<NewsResult>("news");
+    if (cached && Date.now() - cached.fetchedAt < 15 * 60_000) return cached;
+    const assets = await this.getAssets();
+    const fresh = await fetchNews(assets);
+    // A failed fetch must not overwrite a good cache with an empty list.
+    if (fresh.unavailable && cached) return cached;
+    await this.ctx.storage.put({ news: fresh });
+    return fresh;
+  }
 
   /**
    * The runtime is held on the Durable Object instance so engines stay warm
@@ -191,6 +324,7 @@ export class TradingSession extends DurableObject<Env> {
     let nextDelay = STEADY_TICK_MS;
     try {
       await this.runAnalysis();
+      await this.tickAgents();
       // While any market is still replaying history, come back quickly. Warm-up
       // is limited by CPU per invocation, not wall-clock, so short intervals
       // shorten it from tens of minutes to about a minute.
@@ -201,6 +335,56 @@ export class TradingSession extends DurableObject<Env> {
       if (nextDelay === STEADY_TICK_MS) await this.probeProviderHealth();
     } finally {
       await this.ctx.storage.setAlarm(Date.now() + nextDelay);
+    }
+  }
+
+  /**
+   * Advance every active agent and record the conditions they observed. Agent
+   * failures are contained: one agent erroring must not stop the others or the
+   * alarm from rescheduling.
+   */
+  async tickAgents(): Promise<void> {
+    let results;
+    try {
+      results = await this.agents().tickAll();
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "agent_tick_failed",
+        message: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+      }));
+      return;
+    }
+    if (!results.length) return;
+
+    const conditions: Record<string, unknown>[] = [];
+    for (const result of results) {
+      for (const [symbol, reading] of Object.entries(result.regimes)) {
+        conditions.push({ symbol, ...reading });
+      }
+      console.log(JSON.stringify({
+        event: "agent_tick",
+        agent: result.name,
+        supervisor: result.supervisor.state,
+        headline: result.supervisor.headline,
+        applied: result.applied.map((a) => `${a.field} ${a.from}->${a.to}`),
+        closedTrades: result.performance.closedTrades,
+        winRate: Number(result.performance.winRate.toFixed(1)),
+        netPnl: Number(result.performance.netPnl.toFixed(2)),
+        openPositions: result.performance.openPositions,
+        timestamp: Date.now(),
+      }));
+    }
+
+    if (conditions.length) {
+      const previous = (await this.ctx.storage.get<{ conditions: Record<string, unknown>[] }>("marketConditions"))?.conditions ?? [];
+      // Merge by symbol so a rotated tick does not erase conditions for the
+      // markets it did not reach this time.
+      const merged = new Map(previous.map((c) => [c.symbol as string, c]));
+      for (const condition of conditions) merged.set(condition.symbol as string, condition);
+      await this.ctx.storage.put({
+        marketConditions: { conditions: [...merged.values()], updatedAt: Date.now() },
+      });
     }
   }
 
@@ -784,6 +968,32 @@ export default {
     }
 
     if (url.pathname === "/api/analysis" && request.method === "GET") return json(request, env, await session.getAnalysis());
+    if (url.pathname === "/api/agents") {
+      if (request.method === "GET") return json(request, env, await session.listAgents());
+      if (request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = (await session.createAgent(body)) as { error?: string };
+        return json(request, env, result, result.error ? 400 : 201);
+      }
+    }
+    if (url.pathname.startsWith("/api/agents/")) {
+      const id = decodeURIComponent(url.pathname.slice("/api/agents/".length));
+      if (request.method === "PATCH") {
+        const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+        const result = (await session.updateAgent(id, body)) as { error?: string };
+        return json(request, env, result, result.error ? 400 : 200);
+      }
+      if (request.method === "DELETE") return json(request, env, await session.deleteAgent(id));
+    }
+    if (url.pathname === "/api/portfolio" && request.method === "GET") return json(request, env, await session.portfolio());
+    if (url.pathname === "/api/trades" && request.method === "GET") return json(request, env, await session.agentTrades());
+    if (url.pathname === "/api/market-conditions" && request.method === "GET") return json(request, env, await session.marketConditions());
+    if (url.pathname === "/api/news" && request.method === "GET") return json(request, env, await session.news());
+    if (url.pathname === "/api/capital" && request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as { amount?: number };
+      if (!Number.isFinite(body.amount)) return json(request, env, { error: "A numeric amount is required." }, 400);
+      return json(request, env, await session.setPaperCapital(Number(body.amount)));
+    }
     if (url.pathname === "/api/analytics" && request.method === "GET") return json(request, env, await session.getAnalytics());
     if (url.pathname === "/api/trade" && request.method === "GET") {
       const id = url.searchParams.get("id");

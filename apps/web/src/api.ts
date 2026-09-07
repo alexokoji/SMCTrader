@@ -461,7 +461,7 @@ async function ensureWorkerToken(): Promise<string> {
   return workerToken.value;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = await ensureWorkerToken();
   const res = await fetch(apiUrl(path), {
     headers: { "content-type": "application/json", authorization: `Bearer ${token}` },

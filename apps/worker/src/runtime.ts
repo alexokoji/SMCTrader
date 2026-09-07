@@ -92,8 +92,8 @@ function candleKey(symbol: string, tf: Timeframe): string {
   return `candles:${symbol}:${tf}`;
 }
 
-function snapshotKey(symbol: string): string {
-  return `engine:${symbol}`;
+function snapshotKey(symbol: string, namespace: string): string {
+  return namespace ? `engine:${namespace}:${symbol}` : `engine:${symbol}`;
 }
 
 /**
@@ -137,10 +137,20 @@ export class TradingRuntime {
   private lastProvider = "unknown";
 
   private readonly hydrationBudget: number;
+  /**
+   * Scopes engine state to one owner. Candle buffers are deliberately left
+   * unscoped: market data is the same for everyone, so agents share it rather
+   * than each storing their own copy of the same bars.
+   */
+  private readonly namespace: string;
 
-  constructor(storage: RuntimeStorage, opts: { fetchFn?: typeof fetch; hydrationBudget?: number } = {}) {
+  constructor(
+    storage: RuntimeStorage,
+    opts: { fetchFn?: typeof fetch; hydrationBudget?: number; namespace?: string } = {},
+  ) {
     this.storage = storage;
     this.hydrationBudget = opts.hydrationBudget ?? HYDRATION_BUDGET;
+    this.namespace = opts.namespace ?? "";
     this.marketData = new MultiExchangeMarketData({
       fetchFn: opts.fetchFn,
       timeoutMs: 8_000,
@@ -232,6 +242,9 @@ export class TradingRuntime {
       strategy?: Partial<StrategyConfig>;
       autoTrading: boolean;
       safetyBlocked: boolean;
+      /** Capital this engine sizes against. An agent risks a percent of its
+       * own allocation, not of a shared account balance. */
+      startingEquity?: number;
       now?: number;
     },
   ): Promise<AnalysisTick> {
@@ -245,9 +258,10 @@ export class TradingRuntime {
         strategy: strategyCfg,
         risk: riskCfg,
         mode: opts.mode,
+        startingEquity: opts.startingEquity,
         analysis: new AnalysisEngine(symbol, "multi-exchange", strategyCfg),
       });
-      const stored = await this.storage.get<PersistedEngine | StrategyEngineSnapshot>(snapshotKey(symbol));
+      const stored = await this.storage.get<PersistedEngine | StrategyEngineSnapshot>(snapshotKey(symbol, this.namespace));
       // Older deployments stored the bare snapshot under this key.
       const persisted: PersistedEngine | undefined = stored
         ? ("snapshot" in stored ? (stored as PersistedEngine) : { snapshot: stored as StrategyEngineSnapshot })
@@ -380,7 +394,7 @@ export class TradingRuntime {
       state.lastPersistAt = now;
     }
     const payload: PersistedEngine = { snapshot };
-    await this.storage.put({ [snapshotKey(symbol)]: payload });
+    await this.storage.put({ [snapshotKey(symbol, this.namespace)]: payload });
   }
 
   engineFor(symbol: string): StrategyEngine | undefined {

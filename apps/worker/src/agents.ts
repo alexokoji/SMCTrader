@@ -309,11 +309,29 @@ export class AgentRuntime {
       const ticks: AnalysisTick[] = [];
       const regimes: Record<string, RegimeReading> = {};
 
+      // Limits such as maximum open positions describe the agent, not one of
+      // its markets. Each market runs its own engine, so every engine is told
+      // what the others hold; otherwise an agent with ten markets could hold
+      // ten times its configured maximum.
+      const openAcrossAgent = (await this.positionsOf(agent)).filter((p) => p.status === "OPEN");
+      const group = DEFAULT_RISK_CONFIG.correlationGroups;
+
       for (const symbol of symbols) {
+        const elsewhere = openAcrossAgent.filter((p) => p.symbol !== symbol);
+        const correlatedElsewhere = elsewhere.filter(
+          (p) => group[p.symbol] !== undefined && group[p.symbol] === group[symbol],
+        );
+        const context = {
+          openPositions: elsewhere.length,
+          exposure: elsewhere.reduce((sum, p) => sum + p.notional, 0),
+          correlatedExposure: correlatedElsewhere.reduce((sum, p) => sum + p.notional, 0),
+        };
+
         // One market's feed failing must not abandon the agent's other markets,
         // nor the supervision pass that follows.
         try {
           const tick = await runtime.tick(symbol, {
+            portfolio: context,
             mode: agent.mode === "LIVE" ? "LIVE" : "PAPER",
           risk: {
             ...DEFAULT_RISK_CONFIG,

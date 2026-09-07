@@ -133,6 +133,18 @@ export class StrategyEngine {
     return this.riskEngine.getState();
   }
 
+  /**
+   * Tell this engine what the rest of its portfolio is holding, so limits that
+   * are meant to apply to an account are not enforced once per market.
+   */
+  setPortfolioContext(context: {
+    openPositions?: number;
+    exposure?: number;
+    correlatedExposure?: number;
+  }): void {
+    this.riskEngine.setPortfolioContext(context);
+  }
+
   get riskLimits() {
     return this.riskCfg;
   }
@@ -148,6 +160,7 @@ export class StrategyEngine {
   updateRiskConfig(cfg: RiskConfig): void {
     const next = validateRiskConfig(cfg);
     const state = this.riskEngine.getState();
+    const portfolio = this.riskEngine.getPortfolioContext();
     this.riskCfg = next;
     this.riskEngine = new RiskEngine(next, {
       equity: state.equity,
@@ -161,6 +174,9 @@ export class StrategyEngine {
       dailyLossReached: state.dailyLossReached,
       drawdownReached: state.drawdownReached,
     });
+    // Rebuilding the risk engine would otherwise discard what the rest of the
+    // portfolio is holding, briefly letting limits be enforced per market again.
+    this.riskEngine.setPortfolioContext(portfolio);
     this.positionManager.updateOptions({
       breakEvenOnTp1: this.strategyCfg.breakEvenOnTp1,
       partialPlan: this.strategyCfg.partialClosePlan,

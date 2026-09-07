@@ -247,6 +247,12 @@ export class TradingRuntime {
       /** Capital this engine sizes against. An agent risks a percent of its
        * own allocation, not of a shared account balance. */
       startingEquity?: number;
+      /**
+       * What the rest of this engine's portfolio holds. Applied before any
+       * decision is taken, because a rebuilt engine would otherwise decide its
+       * first tick believing it is the only market the owner trades.
+       */
+      portfolio?: { openPositions?: number; exposure?: number; correlatedExposure?: number };
       now?: number;
     },
   ): Promise<AnalysisTick> {
@@ -283,6 +289,7 @@ export class TradingRuntime {
     }
 
     const engine = state.engine;
+    if (opts.portfolio) engine.setPortfolioContext(opts.portfolio);
     engine.setMode(opts.mode);
     engine.updateRiskConfig(riskCfg);
     if (engine.isAutoTrading() !== opts.autoTrading) engine.setAutoTrading(opts.autoTrading);

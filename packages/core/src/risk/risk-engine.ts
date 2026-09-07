@@ -79,6 +79,32 @@ export class RiskEngine {
     };
   }
 
+  /**
+   * Positions and exposure held elsewhere in the same portfolio.
+   *
+   * An agent runs one engine per market, and each engine only knows its own
+   * positions. Without this every market enforced the account-wide limits
+   * alone, so an agent with ten markets could hold ten times the configured
+   * maximum open positions.
+   */
+  private portfolio = { openPositions: 0, exposure: 0, correlatedExposure: 0 };
+
+  setPortfolioContext(context: {
+    openPositions?: number;
+    exposure?: number;
+    correlatedExposure?: number;
+  }): void {
+    this.portfolio = {
+      openPositions: Math.max(0, context.openPositions ?? 0),
+      exposure: Math.max(0, context.exposure ?? 0),
+      correlatedExposure: Math.max(0, context.correlatedExposure ?? 0),
+    };
+  }
+
+  getPortfolioContext(): { openPositions: number; exposure: number; correlatedExposure: number } {
+    return { ...this.portfolio };
+  }
+
   getState(): RiskState {
     return { ...this.state };
   }
@@ -202,17 +228,19 @@ export class RiskEngine {
     }
 
     // 4. Max open positions
+    // Counted across the whole portfolio, not just this market.
+    const openCount = this.state.openPositions.length + this.portfolio.openPositions;
     limits.push({
       kind: "MAX_OPEN_POSITIONS",
       limit: this.cfg.maxOpenPositions,
-      current: this.state.openPositions.length,
-      allowed: this.state.openPositions.length < this.cfg.maxOpenPositions,
-      detail: `${this.state.openPositions.length} of ${this.cfg.maxOpenPositions} positions open.`,
+      current: openCount,
+      allowed: openCount < this.cfg.maxOpenPositions,
+      detail: `${openCount} of ${this.cfg.maxOpenPositions} positions open across all markets.`,
     });
-    if (this.state.openPositions.length >= this.cfg.maxOpenPositions) {
+    if (openCount >= this.cfg.maxOpenPositions) {
       reasons.push({
         kind: "MAX_OPEN_POSITIONS",
-        message: `Maximum open positions reached (${this.cfg.maxOpenPositions}).`,
+        message: `Maximum open positions reached (${this.cfg.maxOpenPositions} across all markets).`,
       });
     }
 
@@ -239,8 +267,8 @@ export class RiskEngine {
       Math.max(0, (equity * limitPct) / 100 - usedNotional);
     const notionalCap = Math.min(
       headroom(this.cfg.maxSymbolExposurePct, 0),
-      headroom(this.cfg.maxPortfolioExposurePct, this.state.usedExposure),
-      headroom(this.cfg.maxCorrelatedExposurePct, this.state.usedCorrelatedExposure),
+      headroom(this.cfg.maxPortfolioExposurePct, this.state.usedExposure + this.portfolio.exposure),
+      headroom(this.cfg.maxCorrelatedExposurePct, this.state.usedCorrelatedExposure + this.portfolio.correlatedExposure),
     );
 
     let sizing = requested;

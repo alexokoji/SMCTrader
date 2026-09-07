@@ -31,10 +31,23 @@ import {
 } from "@smc/core";
 import { TradingRuntime, type AnalysisTick, type RuntimeStorage } from "./runtime.js";
 
-/** Symbols analysed per invocation across all agents, to bound CPU per alarm. */
-export const SYMBOL_BUDGET_PER_TICK = 6;
+/**
+ * Upper bound on markets analysed per invocation, as a runaway guard only.
+ *
+ * Every market an active agent selected is analysed on every tick. An earlier
+ * version rotated through a small budget, which was the wrong trade: a rebuilt
+ * engine costs about 62ms per market, so covering a realistic set of agents is
+ * around a second of CPU, while rotating left each market analysed only once
+ * every twenty minutes and agents acting on stale structure.
+ *
+ * This cap exists so an account that selects an implausible number of markets
+ * cannot make one invocation unbounded; reaching it is reported, not silent.
+ */
+export const MAX_MARKETS_PER_TICK = 80;
 
 export interface AgentTickResult {
+  /** Markets still waiting for this rotation to reach them. */
+  pendingMarkets?: number;
   agentId: string;
   name: string;
   ticks: AnalysisTick[];
@@ -92,13 +105,6 @@ export class AgentRuntime {
   private readonly storage: RuntimeStorage;
   private readonly runtimes = new Map<string, TradingRuntime>();
   private readonly fetchFn?: typeof fetch;
-  /**
-   * Rotates which symbols are analysed when more exist than the budget allows.
-   * Held in storage, not memory: the Durable Object is evicted between alarms,
-   * so an in-memory cursor restarted at zero every tick and the same first few
-   * markets were analysed forever while the rest were never reached.
-   */
-  private static readonly CURSOR_KEY = "agentCursor";
 
   constructor(storage: RuntimeStorage, opts: { fetchFn?: typeof fetch } = {}) {
     this.storage = storage;
@@ -270,23 +276,25 @@ export class AgentRuntime {
     const active = agents.filter((a) => a.status === "ACTIVE");
     const results: AgentTickResult[] = [];
 
-    // Build a flat, rotating work list so every symbol is reached in turn.
+    // Every market of every active agent, analysed on this tick.
     const work: { agent: AgentConfig; symbol: string }[] = active.flatMap((agent) =>
       agent.symbols.map((symbol) => ({ agent, symbol })),
     );
     if (work.length === 0) return results;
 
-    const cursor = (await this.storage.get<number>(AgentRuntime.CURSOR_KEY)) ?? 0;
-    const slice: typeof work = [];
-    for (let i = 0; i < Math.min(SYMBOL_BUDGET_PER_TICK, work.length); i++) {
-      slice.push(work[(cursor + i) % work.length]);
+    const covered = work.slice(0, MAX_MARKETS_PER_TICK);
+    if (covered.length < work.length) {
+      console.warn(JSON.stringify({
+        event: "market_cap_reached",
+        selected: work.length,
+        analysed: covered.length,
+        cap: MAX_MARKETS_PER_TICK,
+        timestamp: now,
+      }));
     }
-    await this.storage.put({
-      [AgentRuntime.CURSOR_KEY]: (cursor + slice.length) % work.length,
-    });
 
     const byAgent = new Map<string, string[]>();
-    for (const item of slice) {
+    for (const item of covered) {
       byAgent.set(item.agent.id, [...(byAgent.get(item.agent.id) ?? []), item.symbol]);
     }
 
@@ -389,6 +397,7 @@ export class AgentRuntime {
       }
 
       results.push({
+        pendingMarkets: Math.max(0, work.length - covered.length),
         agentId: agent.id,
         name: agent.name,
         ticks,

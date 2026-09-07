@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Timeframe } from "@smc/core";
-import { AgentRuntime, SYMBOL_BUDGET_PER_TICK, defaultAgentConfig } from "../src/agents.js";
+import { AgentRuntime, MAX_MARKETS_PER_TICK, defaultAgentConfig } from "../src/agents.js";
 import type { RuntimeStorage } from "../src/runtime.js";
 
 /**
@@ -155,7 +155,7 @@ describe("agent lifecycle", () => {
     expect(agents.engineRuntimeFor("agent-1")?.engineFor("ETHUSDT")).toBeUndefined();
   });
 
-  it("bounds the work one invocation can do however many agents exist", async () => {
+  it("caps one invocation so an implausible number of markets cannot run away", async () => {
     const { agents } = runtime();
     for (let i = 0; i < 5; i++) {
       await agents.create(
@@ -172,11 +172,12 @@ describe("agent lifecycle", () => {
 
     const results = await agents.tickAll(NOW);
     const analysed = results.reduce((sum, r) => sum + r.ticks.length, 0);
-    // 15 symbols exist; only the budget is analysed per invocation.
-    expect(analysed).toBeLessThanOrEqual(SYMBOL_BUDGET_PER_TICK);
+    // 15 markets is well inside the cap, so all of them are analysed.
+    expect(analysed).toBe(15);
+    expect(analysed).toBeLessThanOrEqual(MAX_MARKETS_PER_TICK);
   });
 
-  it("keeps rotating across evictions, so every agent is reached", async () => {
+  it("analyses every market of every active agent on each tick", async () => {
     const storage = memoryStorage();
     const first = new AgentRuntime(storage, { fetchFn: stubFetch(NOW) });
     await first.create({ ...baseInput, symbols: ["A1USDT", "A2USDT", "A3USDT", "A4USDT", "A5USDT"] }, 20_000);
@@ -191,39 +192,30 @@ describe("agent lifecycle", () => {
       20_000,
     );
 
-    // Each tick uses a fresh runtime, which is what an eviction between alarms
-    // produces. An in-memory cursor restarts at zero here and the second agent
-    // is never reached.
+    // A single tick, from a fresh runtime as an eviction produces, must cover
+    // everything. Rotating a small budget left later markets starved and agents
+    // acting on structure that was up to twenty minutes old.
+    const revived = new AgentRuntime(storage, { fetchFn: stubFetch(NOW) });
     const analysed = new Set<string>();
-    for (let i = 0; i < 4; i++) {
-      const revived = new AgentRuntime(storage, { fetchFn: stubFetch(NOW) });
-      for (const result of await revived.tickAll(NOW)) {
-        for (const tick of result.ticks) analysed.add(`${result.agentId}:${tick.symbol}`);
-      }
+    for (const result of await revived.tickAll(NOW)) {
+      for (const tick of result.ticks) analysed.add(`${result.agentId}:${tick.symbol}`);
     }
 
-    // A cursor that restarts at zero reaches only the first budget's worth of
-    // work, so the later markets are starved however long it runs. Every market
-    // of both agents must be analysed.
     expect(analysed.size).toBe(10);
-    const secondAgentMarkets = [...analysed].filter((entry) => entry.startsWith("agent-2:"));
-    expect(secondAgentMarkets).toHaveLength(5);
+    expect([...analysed].filter((e) => e.startsWith("agent-1:"))).toHaveLength(5);
+    expect([...analysed].filter((e) => e.startsWith("agent-2:"))).toHaveLength(5);
   });
 
-  it("rotates which markets are analysed so none is starved", async () => {
+  it("covers a wide market list in a single tick", async () => {
     const { agents } = runtime();
     await agents.create(
       { ...baseInput, symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"] },
       10_000,
     );
 
-    const seen = new Set<string>();
-    for (let i = 0; i < 3; i++) {
-      const results = await agents.tickAll(NOW);
-      for (const tick of results[0]?.ticks ?? []) seen.add(tick.symbol);
-    }
-    // Rotation reaches markets beyond the first budget's worth.
-    expect(seen.size).toBeGreaterThan(SYMBOL_BUDGET_PER_TICK);
+    const results = await agents.tickAll(NOW);
+    const seen = new Set((results[0]?.ticks ?? []).map((tick) => tick.symbol));
+    expect(seen.size).toBe(7);
   });
 
   it("skips agents that are not active", async () => {

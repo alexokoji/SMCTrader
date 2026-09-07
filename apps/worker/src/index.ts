@@ -354,7 +354,10 @@ export class TradingSession extends DurableObject<Env> {
       // While any market is still replaying history, come back quickly. Warm-up
       // is limited by CPU per invocation, not wall-clock, so short intervals
       // shorten it from tens of minutes to about a minute.
-      nextDelay = (await this.ctx.storage.get<boolean>("anyWarming"))
+      // Markets left over only when the per-invocation cap was reached; come
+      // back sooner so they are not left behind for a full interval.
+      const uncovered = (await this.ctx.storage.get<number>("agentBacklog")) ?? 0;
+      nextDelay = (await this.ctx.storage.get<boolean>("anyWarming")) || uncovered > 0
         ? WARMING_TICK_MS
         : STEADY_TICK_MS;
       // Provider probes are only useful at the steady cadence.
@@ -400,6 +403,11 @@ export class TradingSession extends DurableObject<Env> {
         openPositions: result.performance.openPositions,
         timestamp: Date.now(),
       }));
+    }
+
+    const pending = results[0]?.pendingMarkets ?? 0;
+    if (pending !== ((await this.ctx.storage.get<number>("agentBacklog")) ?? 0)) {
+      await this.ctx.storage.put({ agentBacklog: pending });
     }
 
     if (conditions.length) {

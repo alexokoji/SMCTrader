@@ -57,3 +57,8 @@ export * from "./backtest/stats.js";
 
 // ---- analytics ----
 export * from "./analytics/performance.js";
+
+// ---- agents ----
+export * from "./agents/types.js";
+export * from "./agents/regime.js";
+export * from "./agents/supervisor.js";

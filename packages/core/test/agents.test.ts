@@ -100,6 +100,38 @@ describe("supervisor", () => {
     }
   });
 
+  it("does not re-tighten a profitable agent that is merely in a losing streak", () => {
+    // 45% win rate at a 1:3 minimum is profitable by the framework's own
+    // arithmetic, so a streak alone must not ratchet the agent toward zero.
+    const verdict = reviewAgent(perf({ winRate: 45, netPnl: 77, profitFactor: 1.3, consecutiveLosses: 4 }), current);
+    expect(verdict.state).toBe("TIGHTENING");
+    // It tightens once for the streak, and the caller gates repeat application
+    // on new evidence; what matters here is that it is a single step.
+    const rr = verdict.adjustments.find((a) => a.field === "minRr");
+    expect(rr!.to).toBeCloseTo(3.5, 6);
+  });
+
+  it("releases constraints for a profitable agent below a 50% win rate", () => {
+    const baseline = { minRr: 3, minScore: 60, riskPerTrade: 1 };
+    const tightened = { minRr: 5, minScore: 80, riskPerTrade: 0.32 };
+    // The observed case: profitable at 45%, previously ratcheted, no live concern.
+    const adjustments = relaxAgent(
+      perf({ winRate: 45, netPnl: 77.31, profitFactor: 1.3, consecutiveLosses: 1 }),
+      tightened,
+      baseline,
+    );
+    expect(adjustments.length).toBeGreaterThan(0);
+    expect(adjustments.find((a) => a.field === "riskPerTrade")!.to).toBeGreaterThan(0.32);
+  });
+
+  it("holds constraints while a concern is still live, even when profitable", () => {
+    const baseline = { minRr: 3, minScore: 60, riskPerTrade: 1 };
+    const tightened = { minRr: 5, minScore: 80, riskPerTrade: 0.32 };
+    expect(
+      relaxAgent(perf({ winRate: 45, netPnl: 77, consecutiveLosses: 5 }), tightened, baseline),
+    ).toEqual([]);
+  });
+
   it("releases constraints once results recover, never past the baseline", () => {
     const baseline = { minRr: 3, minScore: 60, riskPerTrade: 1 };
     const tightened = { minRr: 4.5, minScore: 75, riskPerTrade: 0.5 };

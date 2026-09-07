@@ -319,15 +319,22 @@ export class AgentRuntime {
       const verdict = reviewAgent(performance, agent.working);
       const applied: AgentAdjustment[] = [];
 
+      // The supervisor is stateless, so it reaches the same verdict on the same
+      // evidence every tick. Only act when a trade has closed since the last
+      // change, otherwise one losing streak compounds a fresh tightening every
+      // few minutes and throttles a working agent toward zero.
+      const seenEvidence = agent.lastSupervisedAtTrades ?? -1;
+      const hasNewEvidence = performance.closedTrades > seenEvidence;
+
       if (verdict.state === "PAUSED") {
         const index = next.findIndex((a) => a.id === agent.id);
         if (index >= 0) {
           next[index] = { ...next[index], status: "SUPERVISOR_PAUSED", updatedAt: now };
           mutated = true;
         }
-      } else if (verdict.adjustments.length) {
+      } else if (hasNewEvidence && verdict.adjustments.length) {
         applied.push(...verdict.adjustments);
-      } else {
+      } else if (hasNewEvidence) {
         applied.push(...relaxAgent(performance, agent.working, agent.baseline));
       }
 
@@ -336,7 +343,12 @@ export class AgentRuntime {
         if (index >= 0) {
           const working = { ...next[index].working };
           for (const adjustment of applied) working[adjustment.field] = adjustment.to;
-          next[index] = { ...next[index], working, updatedAt: now };
+          next[index] = {
+            ...next[index],
+            working,
+            lastSupervisedAtTrades: performance.closedTrades,
+            updatedAt: now,
+          };
           mutated = true;
         }
         const history = (await this.storage.get<(AgentAdjustment & { at: number })[]>(agentKey(agent.id))) ?? [];

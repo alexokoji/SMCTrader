@@ -47,6 +47,12 @@ export interface AgentConfig {
   maxDailyLossPct: number;
   maxDrawdownPct: number;
   status: AgentStatus;
+  /**
+   * Closed-trade count when the supervisor last changed a setting. Adjustments
+   * are only made on new evidence: without this the same losing streak is
+   * re-judged every tick and the agent is tightened again and again for it.
+   */
+  lastSupervisedAtTrades?: number;
   createdAt: number;
   updatedAt: number;
 }

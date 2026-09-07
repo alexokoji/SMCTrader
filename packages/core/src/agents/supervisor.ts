@@ -23,7 +23,12 @@ export interface SupervisorThresholds {
   pauseDrawdownPct: number;
   /** Profit factor below which the agent is tightened. */
   poorProfitFactor: number;
-  /** Win rate above which constraints are released again. */
+  /**
+   * Win rate above which constraints are released again. The framework's own
+   * arithmetic is the reference: at a 1:3 minimum, a 40% win rate is enough to
+   * stay profitable, so demanding more than that would leave a profitable agent
+   * permanently throttled.
+   */
   healthyWinRate: number;
 }
 
@@ -33,8 +38,36 @@ export const DEFAULT_SUPERVISOR_THRESHOLDS: SupervisorThresholds = {
   losingStreak: 4,
   pauseDrawdownPct: 10,
   poorProfitFactor: 0.9,
-  healthyWinRate: 50,
+  healthyWinRate: 40,
 };
+
+/**
+ * What is wrong with an agent's results, if anything. Shared by tightening and
+ * relaxation so releasing constraints is the exact inverse of applying them.
+ */
+export function concernsFor(
+  performance: AgentPerformance,
+  thresholds: SupervisorThresholds = DEFAULT_SUPERVISOR_THRESHOLDS,
+): string[] {
+  const observations: string[] = [];
+
+  if (performance.consecutiveLosses >= thresholds.losingStreak) {
+    observations.push(
+      `${performance.consecutiveLosses} losses in a row. The setups being accepted are not behaving as analysed.`,
+    );
+  }
+  if (performance.winRate < thresholds.poorWinRate) {
+    observations.push(
+      `Win rate is ${performance.winRate.toFixed(1)}%, below the ${thresholds.poorWinRate}% the analysis needs to justify its reward-to-risk.`,
+    );
+  }
+  if (Number.isFinite(performance.profitFactor) && performance.profitFactor < thresholds.poorProfitFactor) {
+    observations.push(
+      `Profit factor is ${performance.profitFactor.toFixed(2)}: losses are outweighing wins.`,
+    );
+  }
+  return observations;
+}
 
 /** Bounds on how far the supervisor may move an agent's settings. */
 export const ADJUSTMENT_BOUNDS = {
@@ -80,28 +113,9 @@ export function reviewAgent(
     };
   }
 
-  let concerns = 0;
-
-  if (performance.consecutiveLosses >= thresholds.losingStreak) {
-    concerns++;
-    observations.push(
-      `${performance.consecutiveLosses} losses in a row. The setups being accepted are not behaving as analysed.`,
-    );
-  }
-
-  if (performance.winRate < thresholds.poorWinRate) {
-    concerns++;
-    observations.push(
-      `Win rate is ${performance.winRate.toFixed(1)}%, below the ${thresholds.poorWinRate}% the analysis needs to justify its reward-to-risk.`,
-    );
-  }
-
-  if (Number.isFinite(performance.profitFactor) && performance.profitFactor < thresholds.poorProfitFactor) {
-    concerns++;
-    observations.push(
-      `Profit factor is ${performance.profitFactor.toFixed(2)}: losses are outweighing wins.`,
-    );
-  }
+  const found = concernsFor(performance, thresholds);
+  const concerns = found.length;
+  observations.push(...found);
 
   if (concerns === 0) {
     const healthy = performance.winRate >= thresholds.healthyWinRate && performance.netPnl > 0;
@@ -166,7 +180,11 @@ export function relaxAgent(
   thresholds: SupervisorThresholds = DEFAULT_SUPERVISOR_THRESHOLDS,
 ): AgentAdjustment[] {
   if (performance.closedTrades < thresholds.minimumSample) return [];
-  if (performance.winRate < thresholds.healthyWinRate || performance.netPnl <= 0) return [];
+  // Release constraints when the agent is making money and nothing is currently
+  // wrong. Requiring a win rate the strategy does not need to be profitable
+  // left a profitable agent tightened permanently.
+  if (performance.netPnl <= 0) return [];
+  if (concernsFor(performance, thresholds).length > 0) return [];
 
   const adjustments: AgentAdjustment[] = [];
   if (current.minRr > baseline.minRr) {

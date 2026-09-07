@@ -16,6 +16,18 @@ import { AnalysisEngine } from "./analysis-engine.js";
 
 export type TradingMode = "ANALYSIS_ONLY" | "PAPER" | "LIVE";
 
+/**
+ * How long a traded point of interest stays blocked from being traded again.
+ *
+ * The framework's rule is not to re-enter the same setup, but a zone remains in
+ * the candle buffer for days. Blocking permanently meant an agent exhausted the
+ * setups available to it and then sat idle indefinitely.
+ */
+export const DUPLICATE_BLOCK_MS = 12 * 60 * 60 * 1000;
+
+/** Upper bound on tracked fingerprints, since they are persisted. */
+export const MAX_TRACKED_FINGERPRINTS = 500;
+
 export interface StrategyCycleResult {
   symbol: string;
   exchange: string;
@@ -337,8 +349,9 @@ export class StrategyEngine {
       drawdownReached: snapshot.risk.drawdownReached,
     });
     this.executedFingerprints = new Map(snapshot.executedFingerprints ?? []);
-    this.dailyCounter = { ...snapshot.dailyCounter };
     this.lastSeenTs = snapshot.lastSeenTs ?? 0;
+    this.pruneFingerprints();
+    this.dailyCounter = { ...snapshot.dailyCounter };
     this.autoTrading = snapshot.autoTrading;
     this.safetyBlocked = snapshot.safetyBlocked;
   }
@@ -752,11 +765,18 @@ export class StrategyEngine {
   private isDuplicate(setup: Setup): boolean {
     const key = this.fingerprintOf(setup);
     if (this.pendingKeys.has(key)) return true;
+
+    // A traded point of interest is blocked for a while, not forever. Zones
+    // stay in the candle buffer for days, so a permanent block meant an agent
+    // worked through the setups available to it and then never traded again.
     const last = this.executedFingerprints.get(key);
-    if (last !== undefined) {
+    if (last !== undefined && this.nowMs() - last < DUPLICATE_BLOCK_MS) {
       return true;
     }
-    // also block if the same POI is already open as a position
+    if (last !== undefined) this.executedFingerprints.delete(key);
+
+    // Also block while a position on the same market and side is still open,
+    // so one thesis is not entered twice.
     return this.positionManager
       .getOpenPositions()
       .some((p) => p.symbol === setup.symbol && p.direction === setup.direction && p.setupId !== setup.id);
@@ -792,7 +812,27 @@ export class StrategyEngine {
   }
 
   private recordFingerprint(setup: Setup): void {
-    this.executedFingerprints.set(this.fingerprintOf(setup), Date.now());
+    // Recorded on engine time, so a replayed history is judged consistently
+    // rather than against the wall clock of whichever tick replayed it.
+    this.executedFingerprints.set(this.fingerprintOf(setup), this.nowMs());
+    this.pruneFingerprints();
+  }
+
+  /**
+   * Drop expired entries and bound the map. It is persisted with the engine, so
+   * without this it grows for the life of the account.
+   */
+  private pruneFingerprints(): void {
+    const cutoff = this.nowMs() - DUPLICATE_BLOCK_MS;
+    for (const [key, at] of this.executedFingerprints) {
+      if (at < cutoff) this.executedFingerprints.delete(key);
+    }
+    if (this.executedFingerprints.size > MAX_TRACKED_FINGERPRINTS) {
+      const oldestFirst = [...this.executedFingerprints.entries()].sort((a, b) => a[1] - b[1]);
+      for (const [key] of oldestFirst.slice(0, this.executedFingerprints.size - MAX_TRACKED_FINGERPRINTS)) {
+        this.executedFingerprints.delete(key);
+      }
+    }
   }
 
   private describeSetup(setup: Setup, price: number): string {

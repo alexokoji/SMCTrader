@@ -19,6 +19,14 @@ export interface OrderRequest {
   stopLoss?: number;
   takeProfits?: number[];
   reduceOnly?: boolean;
+  /**
+   * What the order is for. Execution cost differs sharply: an entry crosses the
+   * spread, a stop is a market order into an adverse move, and a resting target
+   * pays the maker fee.
+   */
+  kind?: "ENTRY" | "TARGET" | "STOP";
+  /** Recent volatility as a fraction of price, which widens slippage. */
+  volatilityPct?: number;
 }
 
 export interface OrderResult {

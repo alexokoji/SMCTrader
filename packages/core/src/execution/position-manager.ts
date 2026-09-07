@@ -1,4 +1,5 @@
 import type { Direction } from "../types/candles.js";
+import { DEFAULT_MARKET_MODEL, fundingCost, type MarketModelConfig } from "./market-model.js";
 import type { PartialClosePlanItem, PortfolioPosition } from "../types/risk.js";
 import { hashString, round } from "../util.js";
 
@@ -34,6 +35,8 @@ export interface ManagedPosition extends PortfolioPosition {
   plannedRr?: number[];
   /** Set when the position fully closes. */
   closedAt?: number;
+  /** Funding paid while the position was held. */
+  fundingPaid?: number;
   sl: number;
   quantityRemaining: number;
   closedQuantity: number;
@@ -54,6 +57,8 @@ export interface PositionManagerOptions {
   slippagePct: number;
   breakEvenOnTp1: boolean;
   partialPlan: PartialClosePlanItem[];
+  /** Cost model used for funding on positions held across intervals. */
+  market?: MarketModelConfig;
 }
 
 export class PositionManager {
@@ -263,7 +268,15 @@ export class PositionManager {
       pos.status = "CLOSED";
       pos.closeReason = reason;
       pos.closedAt = timestamp;
-      pos.finalPnl = pos.realizedPnl - pos.entryFee;
+      // A perpetual position pays funding for every interval it is held, which
+      // is a real cost of holding and is charged whichever way it points.
+      const funding = fundingCost(
+        pos.notional,
+        Math.max(0, timestamp - pos.openedAt),
+        this.opts.market ?? DEFAULT_MARKET_MODEL,
+      );
+      pos.fundingPaid = funding;
+      pos.finalPnl = pos.realizedPnl - pos.entryFee - funding;
       pos.events.push({
         type: "CLOSED",
         timestamp,

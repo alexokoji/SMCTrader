@@ -38,6 +38,7 @@ export * from "./explain/explanation.js";
 
 // ---- execution ----
 export * from "./execution/types.js";
+export * from "./execution/market-model.js";
 export * from "./execution/paper.js";
 export * from "./execution/binance.js";
 export * from "./execution/position-manager.js";

@@ -1,5 +1,11 @@
 import type { Candle, Side, Timeframe } from "../types/candles.js";
 import { hashString } from "../util.js";
+import {
+  DEFAULT_MARKET_MODEL,
+  meetsExchangeMinimums,
+  simulateFill,
+  type MarketModelConfig,
+} from "./market-model.js";
 import type {
   Balance,
   ConnectionStatus,
@@ -10,9 +16,12 @@ import type {
 } from "./types.js";
 
 /**
- * Paper / simulation execution adapter. Uses the same code paths as live
- * trading; the only difference is that fills are simulated on a virtual
- * account with configured fees and slippage.
+ * Simulated execution.
+ *
+ * Fills are priced through the market model rather than at the reference
+ * price, so paper results carry the spread, size-dependent slippage, the extra
+ * cost of a stop and the correct fee tier. Anything the model cannot represent
+ * is listed in market-model.ts rather than quietly assumed away.
  */
 export class PaperExecutionAdapter implements ExchangeAdapter {
   readonly name = "paper";
@@ -22,11 +31,15 @@ export class PaperExecutionAdapter implements ExchangeAdapter {
   private priceProvider: (symbol: string) => number | undefined;
   private orderCounter = 0;
 
+  private readonly market: MarketModelConfig;
+
   constructor(opts: {
     initialBalance?: number;
     feePct?: number;
     slippagePct?: number;
     priceProvider?: (symbol: string) => number | undefined;
+    /** Overrides for thin markets, which are worse than the defaults. */
+    market?: Partial<MarketModelConfig>;
   }) {
     this.balance = {
       totalEquity: opts.initialBalance ?? 10000,
@@ -35,6 +48,15 @@ export class PaperExecutionAdapter implements ExchangeAdapter {
     };
     this.fees = { makerPct: opts.feePct ?? 0.04, takerPct: opts.feePct ?? 0.04 };
     this.slippagePct = opts.slippagePct ?? 0.05;
+    // Explicit fee and slippage settings still win, so existing configuration
+    // and the backtester keep their meaning; everything else comes from the
+    // market model.
+    this.market = {
+      ...DEFAULT_MARKET_MODEL,
+      ...(opts.feePct !== undefined ? { makerFeePct: opts.feePct, takerFeePct: opts.feePct } : {}),
+      ...(opts.slippagePct !== undefined ? { baseSlippagePct: opts.slippagePct } : {}),
+      ...opts.market,
+    };
     this.priceProvider =
       opts.priceProvider ?? (() => {
         throw new Error("No price provider configured for paper adapter");
@@ -101,9 +123,31 @@ export class PaperExecutionAdapter implements ExchangeAdapter {
         rejectionReason: "No reference price available",
       };
     }
-    const slip = order.side === "BUY" ? 1 + this.slippagePct / 100 : 1 - this.slippagePct / 100;
-    const fillPrice = ref * slip;
-    const fee = (fillPrice * order.quantity * this.fees.takerPct) / 100;
+    const minimums = meetsExchangeMinimums(order.quantity, ref, this.market);
+    if (!minimums.ok) {
+      return {
+        orderId: `P${this.orderCounter}`,
+        symbol: order.symbol,
+        side: order.side,
+        filledPrice: 0,
+        filledQuantity: 0,
+        status: "REJECTED",
+        rejectionReason: minimums.reason,
+      };
+    }
+
+    const fill = simulateFill(
+      {
+        side: order.side,
+        referencePrice: ref,
+        quantity: order.quantity,
+        kind: order.kind ?? "ENTRY",
+        volatilityPct: order.volatilityPct,
+      },
+      this.market,
+    );
+    const fillPrice = fill.price;
+    const fee = fill.fee;
     const notional = fillPrice * order.quantity;
     if (order.side === "BUY") {
       this.balance.available -= notional + fee;

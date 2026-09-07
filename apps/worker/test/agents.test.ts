@@ -176,6 +176,40 @@ describe("agent lifecycle", () => {
     expect(analysed).toBeLessThanOrEqual(SYMBOL_BUDGET_PER_TICK);
   });
 
+  it("keeps rotating across evictions, so every agent is reached", async () => {
+    const storage = memoryStorage();
+    const first = new AgentRuntime(storage, { fetchFn: stubFetch(NOW) });
+    await first.create({ ...baseInput, symbols: ["A1USDT", "A2USDT", "A3USDT", "A4USDT", "A5USDT"] }, 20_000);
+    await first.create(
+      {
+        ...baseInput,
+        id: "agent-2",
+        name: "Second",
+        allocatedCapital: 4_000,
+        symbols: ["B1USDT", "B2USDT", "B3USDT", "B4USDT", "B5USDT"],
+      },
+      20_000,
+    );
+
+    // Each tick uses a fresh runtime, which is what an eviction between alarms
+    // produces. An in-memory cursor restarts at zero here and the second agent
+    // is never reached.
+    const analysed = new Set<string>();
+    for (let i = 0; i < 4; i++) {
+      const revived = new AgentRuntime(storage, { fetchFn: stubFetch(NOW) });
+      for (const result of await revived.tickAll(NOW)) {
+        for (const tick of result.ticks) analysed.add(`${result.agentId}:${tick.symbol}`);
+      }
+    }
+
+    // A cursor that restarts at zero reaches only the first budget's worth of
+    // work, so the later markets are starved however long it runs. Every market
+    // of both agents must be analysed.
+    expect(analysed.size).toBe(10);
+    const secondAgentMarkets = [...analysed].filter((entry) => entry.startsWith("agent-2:"));
+    expect(secondAgentMarkets).toHaveLength(5);
+  });
+
   it("rotates which markets are analysed so none is starved", async () => {
     const { agents } = runtime();
     await agents.create(
@@ -186,7 +220,7 @@ describe("agent lifecycle", () => {
     const seen = new Set<string>();
     for (let i = 0; i < 3; i++) {
       const results = await agents.tickAll(NOW);
-      for (const tick of results[0].ticks) seen.add(tick.symbol);
+      for (const tick of results[0]?.ticks ?? []) seen.add(tick.symbol);
     }
     // Rotation reaches markets beyond the first budget's worth.
     expect(seen.size).toBeGreaterThan(SYMBOL_BUDGET_PER_TICK);

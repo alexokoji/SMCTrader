@@ -92,8 +92,13 @@ export class AgentRuntime {
   private readonly storage: RuntimeStorage;
   private readonly runtimes = new Map<string, TradingRuntime>();
   private readonly fetchFn?: typeof fetch;
-  /** Rotates which symbols are analysed when more exist than the budget allows. */
-  private cursor = 0;
+  /**
+   * Rotates which symbols are analysed when more exist than the budget allows.
+   * Held in storage, not memory: the Durable Object is evicted between alarms,
+   * so an in-memory cursor restarted at zero every tick and the same first few
+   * markets were analysed forever while the rest were never reached.
+   */
+  private static readonly CURSOR_KEY = "agentCursor";
 
   constructor(storage: RuntimeStorage, opts: { fetchFn?: typeof fetch } = {}) {
     this.storage = storage;
@@ -271,11 +276,14 @@ export class AgentRuntime {
     );
     if (work.length === 0) return results;
 
+    const cursor = (await this.storage.get<number>(AgentRuntime.CURSOR_KEY)) ?? 0;
     const slice: typeof work = [];
     for (let i = 0; i < Math.min(SYMBOL_BUDGET_PER_TICK, work.length); i++) {
-      slice.push(work[(this.cursor + i) % work.length]);
+      slice.push(work[(cursor + i) % work.length]);
     }
-    this.cursor = (this.cursor + slice.length) % work.length;
+    await this.storage.put({
+      [AgentRuntime.CURSOR_KEY]: (cursor + slice.length) % work.length,
+    });
 
     const byAgent = new Map<string, string[]>();
     for (const item of slice) {

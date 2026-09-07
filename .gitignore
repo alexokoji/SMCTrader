@@ -15,3 +15,6 @@ Thumbs.db
 
 # Local-only Worker variables (never committed)
 .dev.vars
+
+# Wrangler build artifacts
+.wrangler/

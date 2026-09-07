@@ -130,7 +130,7 @@ describe("agent lifecycle", () => {
     await agents.create({ ...baseInput, allocatedCapital: 2_500 }, 10_000);
     await agents.tickAll(NOW);
 
-    const performance = agents.performanceOf((await agents.list())[0]);
+    const performance = await agents.performanceOf((await agents.list())[0]);
     // With nothing closed, equity is exactly the allocation.
     expect(performance.equity).toBe(2_500);
     expect(performance.closedTrades).toBe(0);
@@ -146,8 +146,8 @@ describe("agent lifecycle", () => {
 
     await agents.tickAll(NOW);
     const list = await agents.list();
-    const first = agents.performanceOf(list[0]);
-    const second = agents.performanceOf(list[1]);
+    const first = await agents.performanceOf(list[0]);
+    const second = await agents.performanceOf(list[1]);
 
     expect(first.equity).toBe(5_000);
     expect(second.equity).toBe(4_000);
@@ -228,6 +228,79 @@ describe("agent lifecycle", () => {
     // No trades yet, so the supervisor withholds judgement rather than guessing.
     expect(snapshots[0].supervisor.state).toBe("OBSERVING");
     expect(snapshots[0].supervisor.headline).toMatch(/trades needed/);
+  });
+
+  it("reports positions the engines are not currently holding in memory", async () => {
+    const { storage, agents } = runtime();
+    await agents.create({ ...baseInput, symbols: ["BTCUSDT", "ETHUSDT"] }, 10_000);
+
+    // A closed trade persisted for a market whose engine is not warm. Rotation
+    // means most engines are cold at any moment, and an eviction makes them all
+    // cold, so reading only memory hid trades that had genuinely happened.
+    storage.data.set("engine:agent-1:ETHUSDT", {
+      snapshot: {
+        positions: [{
+          id: "POS-COLD", symbol: "ETHUSDT", direction: "LONG", setupId: "s-1",
+          status: "CLOSED", finalPnl: 42.5, realizedPnl: 42.5, openedAt: 1, closedAt: 2,
+          entry: 100, currentPrice: 110, stopLoss: 95, sl: 95, takeProfits: [110],
+          positionSize: 1, notional: 100, entryFee: 0, unrealizedPnl: 0,
+          quantityRemaining: 0, closedQuantity: 1, mae: 0, mfe: 0, events: [],
+          exchange: "t", strategyVersion: "v1", partialPlan: [],
+        }],
+      },
+    });
+
+    const trades = await agents.trades();
+    expect(trades.map((t) => t.id)).toContain("POS-COLD");
+
+    const performance = await agents.performanceOf((await agents.list())[0]);
+    expect(performance.closedTrades).toBe(1);
+    expect(performance.netPnl).toBeCloseTo(42.5, 6);
+  });
+
+  it("shows the same trades on the agent card as on the trades list", async () => {
+    const { storage, agents } = runtime();
+    await agents.create({ ...baseInput, symbols: ["BTCUSDT", "ETHUSDT"] }, 10_000);
+
+    for (const [symbol, pnl] of [["BTCUSDT", 10], ["ETHUSDT", -4]] as const) {
+      storage.data.set(`engine:agent-1:${symbol}`, {
+        snapshot: {
+          positions: [{
+            id: `POS-${symbol}`, symbol, direction: "LONG", setupId: "s", status: "CLOSED",
+            finalPnl: pnl, realizedPnl: pnl, openedAt: 1, closedAt: 2,
+            entry: 100, currentPrice: 100 + pnl, stopLoss: 95, sl: 95, takeProfits: [110],
+            positionSize: 1, notional: 100, entryFee: 0, unrealizedPnl: 0,
+            quantityRemaining: 0, closedQuantity: 1, mae: 0, mfe: 0, events: [],
+            exchange: "t", strategyVersion: "v1", partialPlan: [],
+          }],
+        },
+      });
+    }
+
+    const [snapshot] = await agents.snapshots();
+    const trades = await agents.trades();
+    const closedOnList = trades.filter((t) => t.status === "CLOSED");
+
+    // The card's count and the list's rows are the same positions.
+    expect(snapshot.performance.closedTrades).toBe(closedOnList.length);
+    expect(snapshot.performance.netPnl).toBeCloseTo(
+      closedOnList.reduce((sum, t) => sum + (t.finalPnl ?? t.realizedPnl), 0),
+      6,
+    );
+  });
+
+  it("prefers the warm engine over the stored snapshot for the same market", async () => {
+    const { storage, agents } = runtime();
+    await agents.create(baseInput, 10_000);
+    await agents.tickAll(NOW);
+
+    // A stale snapshot must not add a phantom position alongside the live engine.
+    storage.data.set("engine:agent-1:BTCUSDT", {
+      snapshot: { positions: [{ id: "POS-STALE", symbol: "BTCUSDT", status: "CLOSED" }] },
+    });
+
+    const trades = await agents.trades();
+    expect(trades.map((t) => t.id)).not.toContain("POS-STALE");
   });
 
   it("removes an agent and its commitment", async () => {

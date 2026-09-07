@@ -171,11 +171,34 @@ export class AgentRuntime {
     return runtime;
   }
 
-  /** Every closed and open position the agent's engines are holding. */
-  private positionsOf(agent: AgentConfig): ManagedPosition[] {
+  /**
+   * Every position an agent holds, across all of its markets.
+   *
+   * A warm engine is preferred because it is the freshest, but only symbols
+   * ticked in this Durable Object instance have one, and rotation means most do
+   * not at any given moment. Falling back to the persisted snapshot makes the
+   * answer the same whichever engines happen to be in memory, so the agent card
+   * and the trades page cannot disagree, and neither empties after an eviction.
+   */
+  private async positionsOf(agent: AgentConfig): Promise<ManagedPosition[]> {
     const runtime = this.runtimes.get(agent.id);
-    if (!runtime) return [];
-    return agent.symbols.flatMap((symbol) => runtime.engineFor(symbol)?.getPositions() ?? []);
+    const positions: ManagedPosition[] = [];
+
+    for (const symbol of agent.symbols) {
+      const warm = runtime?.engineFor(symbol);
+      if (warm) {
+        positions.push(...warm.getPositions());
+        continue;
+      }
+      const stored = await this.storage.get<{ snapshot?: { positions?: ManagedPosition[] } }>(
+        `engine:${agent.id}:${symbol}`,
+      );
+      if (stored?.snapshot?.positions) positions.push(...stored.snapshot.positions);
+    }
+
+    // The same position can only come from one source, but a symbol renamed or
+    // removed could leave a stale duplicate; key by id to be certain.
+    return [...new Map(positions.map((p) => [p.id, p])).values()];
   }
 
   private setupsOf(agent: AgentConfig): Setup[] {
@@ -191,8 +214,8 @@ export class AgentRuntime {
    * Realised performance for one agent, measured against its own allocation
    * rather than a global account balance.
    */
-  performanceOf(agent: AgentConfig): AgentPerformance {
-    const positions = this.positionsOf(agent);
+  async performanceOf(agent: AgentConfig): Promise<AgentPerformance> {
+    const positions = await this.positionsOf(agent);
     const closed = positions.filter((p) => p.status === "CLOSED");
     const wins = closed.filter((p) => (p.finalPnl ?? p.realizedPnl) > 0).length;
     const netPnl = closed.reduce((sum, p) => sum + (p.finalPnl ?? p.realizedPnl), 0);
@@ -315,7 +338,7 @@ export class AgentRuntime {
         }
       }
 
-      const performance = this.performanceOf(agent);
+      const performance = await this.performanceOf(agent);
       const verdict = reviewAgent(performance, agent.working);
       const applied: AgentAdjustment[] = [];
 
@@ -377,7 +400,7 @@ export class AgentRuntime {
     const agents = await this.list();
     const out: AgentSnapshot[] = [];
     for (const agent of agents) {
-      const performance = this.performanceOf(agent);
+      const performance = await this.performanceOf(agent);
       out.push({
         config: agent,
         performance,
@@ -392,15 +415,13 @@ export class AgentRuntime {
   /** Closed and open positions across every agent, newest first. */
   async trades(): Promise<(ManagedPosition & { agentId: string; agentName: string })[]> {
     const agents = await this.list();
-    return agents
-      .flatMap((agent) =>
-        this.positionsOf(agent).map((position) => ({
-          ...position,
-          agentId: agent.id,
-          agentName: agent.name,
-        })),
-      )
-      .sort((a, b) => (b.closedAt ?? b.openedAt) - (a.closedAt ?? a.openedAt));
+    const out: (ManagedPosition & { agentId: string; agentName: string })[] = [];
+    for (const agent of agents) {
+      for (const position of await this.positionsOf(agent)) {
+        out.push({ ...position, agentId: agent.id, agentName: agent.name });
+      }
+    }
+    return out.sort((a, b) => (b.closedAt ?? b.openedAt) - (a.closedAt ?? a.openedAt));
   }
 
   engineRuntimeFor(agentId: string): TradingRuntime | undefined {

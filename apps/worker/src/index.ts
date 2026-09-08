@@ -110,6 +110,26 @@ function serializeAnalysis(tick: AnalysisTick): Record<string, unknown> {
   };
 }
 
+/**
+ * Setups kept per market in stored analysis. A stored value has a hard size
+ * limit and a setup carries its full rule evaluation, so keeping every one of
+ * them for every market overflowed it.
+ */
+const STORED_SETUPS_PER_MARKET = 8;
+
+/** A stored analysis without the parts that have no bound. */
+function compactAnalysis(analysis: Record<string, unknown>): Record<string, unknown> {
+  const setups = Array.isArray(analysis.setups) ? analysis.setups : [];
+  return {
+    ...analysis,
+    setups: setups.slice(0, STORED_SETUPS_PER_MARKET).map((setup) => {
+      const { components, timeframeAnalysis, ...rest } = setup as Record<string, unknown>;
+      return rest;
+    }),
+    events: Array.isArray(analysis.events) ? analysis.events.slice(-20) : [],
+  };
+}
+
 function lastCloseOf(tick: AnalysisTick): number | null {
   const timeframes = Object.values(tick.analysis.snapshots);
   for (const snapshot of timeframes.reverse()) {
@@ -568,7 +588,7 @@ export class TradingSession extends DurableObject<Env> {
       // Every distinct key written is a billed storage row, so telemetry that
       // used to occupy five keys is kept in one.
       const writes: Record<string, unknown> = {
-        analysis,
+        analysis: compactAnalysis(analysis),
         feed: {
           lastPrice: lastCloseOf(tick),
           lastPollAt: Date.now(),
@@ -634,13 +654,16 @@ export class TradingSession extends DurableObject<Env> {
 
       let anyWarming = tick.warming;
       if (!symbolOverride && assets.length > 1) {
-        const scans: Record<string, unknown>[] = [analysis];
+        const scans: Record<string, unknown>[] = [compactAnalysis(analysis)];
         for (const asset of assets.slice(1)) {
           const scan = await this.runAnalysis(asset);
           if (scan.warming === true) anyWarming = true;
-          scans.push(scan);
+          scans.push(compactAnalysis(scan));
         }
-        await this.ctx.storage.put({ analysis, marketAnalyses: scans });
+        await this.ctx.storage.put({
+          analysis: compactAnalysis(analysis),
+          marketAnalyses: scans,
+        });
       }
       // Drives the alarm cadence: fast while any market replays history. Only
       // written when it actually flips.

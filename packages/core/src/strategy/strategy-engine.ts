@@ -28,6 +28,30 @@ export const DUPLICATE_BLOCK_MS = 12 * 60 * 60 * 1000;
 /** Upper bound on tracked fingerprints, since they are persisted. */
 export const MAX_TRACKED_FINGERPRINTS = 500;
 
+/**
+ * How much of the journal and activity feed is persisted with a snapshot.
+ *
+ * The in-memory feeds hold thousands of entries, and journal entries carry
+ * whole decisions. Writing all of that into one stored value exceeded the
+ * host's per-value limit, which failed the write and took the analysis for that
+ * market down with it. The durable audit trail lives in the database; a
+ * snapshot only needs enough recent history to be useful on reload.
+ */
+export const PERSISTED_JOURNAL_ENTRIES = 80;
+export const PERSISTED_ACTIVITY_EVENTS = 80;
+
+/** Keys kept from a journal entry's payload; the rest can be arbitrarily large. */
+const PERSISTED_JOURNAL_DATA_KEYS = ["setupId", "positionId", "orderId"] as const;
+
+function trimJournalEntry(entry: JournalEntry): JournalEntry {
+  if (!entry.data) return entry;
+  const data: Record<string, unknown> = {};
+  for (const key of PERSISTED_JOURNAL_DATA_KEYS) {
+    if (entry.data[key] !== undefined) data[key] = entry.data[key];
+  }
+  return { ...entry, data };
+}
+
 export interface StrategyCycleResult {
   symbol: string;
   exchange: string;
@@ -303,8 +327,9 @@ export class StrategyEngine {
     return {
       version: 1,
       positions: this.positionManager.getAll(),
-      journal: this.journal.getAll(),
-      activity: this.activity.getAll(),
+      // Newest first, bounded, and stripped of payloads that have no bound.
+      journal: this.journal.getAll().slice(0, PERSISTED_JOURNAL_ENTRIES).map(trimJournalEntry),
+      activity: this.activity.getAll().slice(0, PERSISTED_ACTIVITY_EVENTS),
       risk: {
         equity: risk.equity,
         equityDayStart: risk.equityDayStart,

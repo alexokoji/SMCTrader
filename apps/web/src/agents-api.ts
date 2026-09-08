@@ -155,6 +155,35 @@ export interface CreateAgentInput {
   minRr?: number;
 }
 
+export interface MarketStatus {
+  symbol: string;
+  status: string;
+  bias: string;
+  setups: number;
+  warming: boolean;
+  executed: number;
+  rejected: number;
+  reason: string | null;
+  blocked: string[];
+  regime: string | null;
+}
+
+export interface LiveStatus {
+  lastTickAt: number | null;
+  nextTickAt: number | null;
+  running: boolean;
+  health: string;
+  serverTime: number;
+  agents: {
+    id: string;
+    name: string;
+    supervisor: string;
+    headline: string;
+    openPositions: number;
+    markets: MarketStatus[];
+  }[];
+}
+
 export interface MarketsResponse {
   symbols: string[];
   fetchedAt: number;
@@ -164,6 +193,7 @@ export interface MarketsResponse {
 export const agentsApi = {
   list: () => request<AgentsResponse>("/api/agents"),
   markets: () => request<MarketsResponse>("/api/markets"),
+  liveStatus: () => request<LiveStatus>("/api/live-status"),
   create: (input: CreateAgentInput) =>
     request<{ agent?: AgentConfig; error?: string }>("/api/agents", {
       method: "POST",

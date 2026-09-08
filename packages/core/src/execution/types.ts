@@ -27,6 +27,11 @@ export interface OrderRequest {
   kind?: "ENTRY" | "TARGET" | "STOP";
   /** Recent volatility as a fraction of price, which widens slippage. */
   volatilityPct?: number;
+  /**
+   * The bar the order is being placed against. A simulated venue needs it to
+   * judge whether a resting limit order would actually have been filled.
+   */
+  bar?: { high: number; low: number };
 }
 
 export interface OrderResult {

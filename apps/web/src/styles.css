@@ -355,3 +355,21 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   .mobile-nav span { font-size: 9px; font-weight: 700; }
   .mobile-nav button.active { background: var(--violet-soft); color: var(--violet); }
 }
+
+/* ---- engine activity ---- */
+.heartbeat { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
+.heartbeat > div { padding: 9px 10px; border-radius: 8px; background: var(--surface-2); }
+.heartbeat span { display: block; color: var(--faint); font-size: 9px; }
+.heartbeat b { display: block; margin-top: 3px; color: var(--ink); font: 11px "DM Mono", monospace; }
+.live-agent { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.live-agent header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.live-agent header b { color: var(--ink-strong); font-size: 12px; }
+.live-agent header span { color: var(--faint); font: 9px "DM Mono", monospace; }
+.live-markets { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; }
+.live-market { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.live-market-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.live-market-head b { color: var(--ink); font: 11px "DM Mono", monospace; }
+.live-market-meta { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 5px; color: var(--faint); font: 9px "DM Mono", monospace; }
+.live-market-meta .good { color: var(--green); }
+.live-market p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+@media (max-width: 760px) { .heartbeat { grid-template-columns: 1fr; } .live-markets { grid-template-columns: 1fr; } }

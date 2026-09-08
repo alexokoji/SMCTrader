@@ -2,6 +2,7 @@ import type { Candle, Side, Timeframe } from "../types/candles.js";
 import { hashString } from "../util.js";
 import {
   DEFAULT_MARKET_MODEL,
+  limitOrderFilled,
   meetsExchangeMinimums,
   simulateFill,
   type MarketModelConfig,
@@ -123,6 +124,24 @@ export class PaperExecutionAdapter implements ExchangeAdapter {
         rejectionReason: "No reference price available",
       };
     }
+    // A resting limit order is not filled merely because price reached it: it
+    // joins a queue. Assuming otherwise is the largest remaining source of
+    // paper optimism, because the entries that would not have filled live are
+    // disproportionately the ones that ran without you.
+    if (order.orderType === "LIMIT" && order.price !== undefined && order.bar) {
+      if (!limitOrderFilled(order.side, order.price, order.bar, this.market)) {
+        return {
+          orderId: `P${this.orderCounter}`,
+          symbol: order.symbol,
+          side: order.side,
+          filledPrice: 0,
+          filledQuantity: 0,
+          status: "REJECTED",
+          rejectionReason: `Limit order at ${order.price} was reached but not filled: price did not trade decisively through it.`,
+        };
+      }
+    }
+
     const minimums = meetsExchangeMinimums(order.quantity, ref, this.market);
     if (!minimums.ok) {
       return {

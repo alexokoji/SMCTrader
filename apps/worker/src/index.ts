@@ -263,6 +263,34 @@ export class TradingSession extends DurableObject<Env> {
     }
   }
 
+  /**
+   * What the engine is doing right now, and whether it is running at all.
+   * Reported from the last completed tick rather than recomputed, so opening
+   * the page never changes what it reports.
+   */
+  async liveStatus(): Promise<Record<string, unknown>> {
+    const status = await this.ctx.storage.get<Record<string, unknown>>("liveStatus");
+    const lastTickAt = (await this.ctx.storage.get<number>("lastTickAt")) ?? null;
+    const alarm = await this.ctx.storage.getAlarm();
+    const now = Date.now();
+    const stale = lastTickAt === null || now - lastTickAt > 3 * STEADY_TICK_MS;
+
+    return {
+      ...(status ?? { agents: [] }),
+      lastTickAt,
+      nextTickAt: alarm,
+      running: !stale,
+      // Said plainly, because "no trades" and "not running" look identical from
+      // the outside and mean very different things.
+      health: stale
+        ? lastTickAt === null
+          ? "No analysis has run yet."
+          : `No analysis for ${Math.round((now - lastTickAt) / 60_000)} minutes. The loop is being restarted.`
+        : "Analysis is running.",
+      serverTime: now,
+    };
+  }
+
   async marketConditions(): Promise<Record<string, unknown>> {
     return (await this.ctx.storage.get<Record<string, unknown>>("marketConditions")) ?? {
       conditions: [],
@@ -346,6 +374,45 @@ export class TradingSession extends DurableObject<Env> {
     if (current === null) await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
   }
 
+  /**
+   * Restart the analysis loop if it has stopped advancing.
+   *
+   * Re-arming only when no alarm exists is not enough: an alarm whose handler
+   * keeps failing is retried and then dropped, and one scheduled far ahead
+   * still counts as present. Either way the agents go quiet until somebody
+   * opens the dashboard, which is what made them look like they only ran while
+   * being watched. The heartbeat records real progress, so a stale one means
+   * the loop is not running whatever the alarm says.
+   */
+  async reviveIfStalled(): Promise<{ revived: boolean; lastTickAt: number | null; reason?: string }> {
+    const lastTickAt = (await this.ctx.storage.get<number>("lastTickAt")) ?? null;
+    const alarm = await this.ctx.storage.getAlarm();
+    const now = Date.now();
+    const stallAfter = 3 * STEADY_TICK_MS;
+
+    const neverRan = lastTickAt === null;
+    const stalled = lastTickAt !== null && now - lastTickAt > stallAfter;
+    const overdue = alarm !== null && alarm < now - stallAfter;
+
+    if (!neverRan && !stalled && !overdue) {
+      if (alarm === null) await this.ctx.storage.setAlarm(now + STEADY_TICK_MS);
+      return { revived: false, lastTickAt };
+    }
+
+    const reason = neverRan
+      ? "no analysis has run yet"
+      : stalled
+        ? `no analysis for ${Math.round((now - (lastTickAt ?? now)) / 60_000)} minutes`
+        : "the scheduled alarm is overdue";
+
+    // Replace rather than trust the existing schedule: a stuck alarm is exactly
+    // the case this is here to recover from.
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.setAlarm(now + 1_000);
+    console.warn(JSON.stringify({ event: "analysis_revived", reason, lastTickAt, timestamp: now }));
+    return { revived: true, lastTickAt, reason };
+  }
+
   async alarm(): Promise<void> {
     let nextDelay = STEADY_TICK_MS;
     try {
@@ -373,6 +440,7 @@ export class TradingSession extends DurableObject<Env> {
    * alarm from rescheduling.
    */
   async tickAgents(): Promise<void> {
+    await this.ctx.storage.put({ lastTickAt: Date.now() });
     let results;
     try {
       results = await this.agents().tickAll();
@@ -404,6 +472,33 @@ export class TradingSession extends DurableObject<Env> {
         timestamp: Date.now(),
       }));
     }
+
+    // A compact record of what each market actually did, so the interface can
+    // show the engine working rather than leaving the operator to infer it from
+    // numbers that only move when a position closes.
+    const liveStatus = {
+      lastTickAt: Date.now(),
+      agents: results.map((result) => ({
+        id: result.agentId,
+        name: result.name,
+        supervisor: result.supervisor.state,
+        headline: result.supervisor.headline,
+        openPositions: result.performance.openPositions,
+        markets: result.ticks.map((tick) => ({
+          symbol: tick.symbol,
+          status: tick.status,
+          bias: tick.analysis.bias,
+          setups: tick.analysis.setups.length,
+          warming: tick.warming,
+          executed: tick.executed,
+          rejected: tick.rejected,
+          reason: tick.analysis.noTradeReason ?? tick.message ?? null,
+          blocked: tick.blockedReasons,
+          regime: result.regimes[tick.symbol]?.regime ?? null,
+        })),
+      })),
+    };
+    await this.ctx.storage.put({ liveStatus });
 
     const pending = results[0]?.pendingMarkets ?? 0;
     if (pending !== ((await this.ctx.storage.get<number>("agentBacklog")) ?? 0)) {
@@ -949,7 +1044,7 @@ export default {
       const users = await registry.listSessions();
       for (const userId of users) {
         try {
-          await env.TRADING_SESSION.getByName(`user:${userId}`).ensureAnalysisAlarm();
+          await env.TRADING_SESSION.getByName(`user:${userId}`).reviveIfStalled();
         } catch (error) {
           console.error(JSON.stringify({
             event: "alarm_rearm_failed",
@@ -1020,6 +1115,11 @@ export default {
       if (request.method === "DELETE") return json(request, env, await session.deleteAgent(id));
     }
     if (url.pathname === "/api/markets" && request.method === "GET") return json(request, env, await session.availableMarkets());
+    if (url.pathname === "/api/live-status" && request.method === "GET") {
+      // Opening the page is also a chance to notice the loop has stopped.
+      await session.reviveIfStalled();
+      return json(request, env, await session.liveStatus());
+    }
     if (url.pathname === "/api/portfolio" && request.method === "GET") return json(request, env, await session.portfolio());
     if (url.pathname === "/api/trades" && request.method === "GET") return json(request, env, await session.agentTrades());
     if (url.pathname === "/api/market-conditions" && request.method === "GET") return json(request, env, await session.marketConditions());

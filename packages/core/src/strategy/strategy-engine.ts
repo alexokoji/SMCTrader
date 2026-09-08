@@ -670,6 +670,10 @@ export class StrategyEngine {
         price: decision.entry,
         stopLoss: decision.stopLoss,
         takeProfits: decision.takeProfits,
+        kind: "ENTRY",
+        // The bar lets a simulated venue judge whether a resting order at this
+        // entry would actually have been filled rather than merely touched.
+        bar: this.lastBar(),
       });
       if (result.status === "FILLED") {
         setup.status = "EXECUTED";
@@ -709,6 +713,9 @@ export class StrategyEngine {
       } else {
         setup.status = "REJECTED";
         setup.rejectionReasons = [`Order failed: ${result.rejectionReason ?? "rejected by exchange"}`];
+        // A missed fill is not an executed setup, so it must not be recorded as
+        // one; otherwise the setup could never be taken when price returns.
+        this.executedFingerprints.delete(this.fingerprintOf(setup));
         this.journal.add({
           timestamp: now,
           symbol: setup.symbol,
@@ -798,6 +805,13 @@ export class StrategyEngine {
       }
     }
     return null;
+  }
+
+  /** The most recent lower-timeframe bar, for fill simulation. */
+  private lastBar(): { high: number; low: number } | undefined {
+    const buf = this.analysis.candlesFor(this.strategyCfg.timeframes.ltf);
+    const last = buf[buf.length - 1];
+    return last ? { high: last.high, low: last.low } : undefined;
   }
 
   private lastPrice(): number | undefined {

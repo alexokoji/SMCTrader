@@ -5,10 +5,12 @@ import {
   type AgentSnapshot,
   type AgentTrade,
   type MarketCondition,
+  type LiveStatus,
   type NewsResult,
   type Portfolio,
 } from "./agents-api";
 import { MarketPicker } from "./components/MarketPicker";
+import { LiveStatusPanel } from "./components/LiveStatus";
 import {
   AgentsView,
   ConditionsView,
@@ -73,6 +75,7 @@ function App() {
     updatedAt: null,
   });
   const [news, setNews] = useState<NewsResult | null>(null);
+  const [live, setLive] = useState<LiveStatus | null>(null);
 
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -93,15 +96,17 @@ function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [agentList, portfolioResult, tradeResult] = await Promise.all([
+      const [agentList, portfolioResult, tradeResult, liveResult] = await Promise.all([
         agentsApi.list(),
         agentsApi.portfolio(),
         agentsApi.trades(),
+        agentsApi.liveStatus(),
       ]);
       setAgents(agentList.agents);
       setCapital(agentList.capital);
       setPortfolio(portfolioResult);
       setTrades(tradeResult.trades);
+      setLive(liveResult);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -326,6 +331,7 @@ function App() {
           }
         />
         {createPanel}
+        <LiveStatusPanel status={live}/>
         <section className="card">
           <div className="card-head"><h2>Paper capital</h2></div>
           <p className="helper">

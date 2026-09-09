@@ -289,6 +289,17 @@ export class TradingRuntime {
     }
 
     const engine = state.engine;
+    // Before anything is decided: nothing else in this deployment advances the
+    // trading day, so without this the daily trade ceiling and the daily loss
+    // limit are reached once and never released.
+    if (engine.rolloverIfNewDay(now)) {
+      console.log(JSON.stringify({
+        event: "daily_rollover",
+        namespace: this.namespace,
+        symbol,
+        timestamp: now,
+      }));
+    }
     if (opts.portfolio) engine.setPortfolioContext(opts.portfolio);
     engine.setMode(opts.mode);
     engine.updateRiskConfig(riskCfg);

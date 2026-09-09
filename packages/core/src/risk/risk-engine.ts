@@ -141,14 +141,22 @@ export class RiskEngine {
 
   /**
    * Roll over to a new trading day: rebase daily equity, reset daily trade
-   * counters and clear the daily-loss flag. Peak equity and drawdown tracking
-   * are preserved across the rollover.
+   * counters and clear both the daily-loss and drawdown lockouts.
+   *
+   * The drawdown reference is rebased to the day's starting equity as well.
+   * Measuring it against an all-time peak made the lockout permanent: an engine
+   * that once dipped past the limit could never trade again, because equity can
+   * only recover through trades it was no longer allowed to take. Capital is
+   * still protected across days by the supervisor, which measures an agent's
+   * drawdown against its original allocation and pauses it outright.
    */
   rolloverDay(): void {
     this.state.equityDayStart = this.state.equity;
+    this.state.peakEquity = this.state.equity;
     this.state.tradesToday = 0;
     this.state.realizedPnlToday = 0;
     this.state.dailyLossReached = false;
+    this.state.drawdownReached = false;
     this.refreshLimits();
   }
 

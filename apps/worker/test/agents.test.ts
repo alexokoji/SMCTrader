@@ -362,3 +362,69 @@ describe("defaultAgentConfig", () => {
     expect(defaultAgentConfig(baseInput).entryModels).toEqual(["CONFIRMATION", "SWEEP"]);
   });
 });
+
+describe("daily reset", () => {
+  const DAY = 24 * 3_600_000;
+
+  it("returns a supervisor-paused agent to service on a new day", async () => {
+    const { storage, agents } = runtime();
+    await agents.create(baseInput, 10_000);
+    await storage.put({ agentsDayKey: new Date(NOW).toISOString().slice(0, 10) });
+
+    // Tightened and paused by the supervisor, exactly as a losing run leaves it.
+    const [paused] = await agents.list();
+    await storage.put({
+      agents: [{
+        ...paused,
+        status: "SUPERVISOR_PAUSED",
+        working: { ...paused.baseline, riskPerTrade: 0.25, minRr: 4 },
+        lastSupervisedAtTrades: 12,
+      }],
+    });
+
+    await agents.tickAll(NOW + DAY);
+
+    const [revived] = await agents.list();
+    expect(revived.status).toBe("ACTIVE");
+    // Resuming on stale, tightened settings would hand the new day a crippled
+    // agent, so the baseline comes back with it.
+    expect(revived.working).toEqual(revived.baseline);
+    expect(revived.lastSupervisedAtTrades).toBeUndefined();
+  });
+
+  it("leaves an agent the operator paused alone", async () => {
+    const { storage, agents } = runtime();
+    await agents.create(baseInput, 10_000);
+    await storage.put({ agentsDayKey: new Date(NOW).toISOString().slice(0, 10) });
+    const [agent] = await agents.list();
+    await storage.put({ agents: [{ ...agent, status: "PAUSED" }] });
+
+    await agents.tickAll(NOW + DAY);
+
+    expect((await agents.list())[0].status).toBe("PAUSED");
+  });
+
+  it("does not revive a paused agent within the same day", async () => {
+    const { storage, agents } = runtime();
+    await agents.create(baseInput, 10_000);
+    await agents.tickAll(NOW);
+    const [agent] = await agents.list();
+    await storage.put({ agents: [{ ...agent, status: "SUPERVISOR_PAUSED" }] });
+
+    await agents.tickAll(NOW + 3_600_000);
+
+    expect((await agents.list())[0].status).toBe("SUPERVISOR_PAUSED");
+  });
+
+  it("releases a pause carried over from before daily resets existed", async () => {
+    // No recorded day: the pause was set when nothing could ever clear it.
+    const { storage, agents } = runtime();
+    await agents.create(baseInput, 10_000);
+    const [agent] = await agents.list();
+    await storage.put({ agents: [{ ...agent, status: "SUPERVISOR_PAUSED" }] });
+
+    await agents.tickAll(NOW);
+
+    expect((await agents.list())[0].status).toBe("ACTIVE");
+  });
+});

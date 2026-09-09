@@ -17,6 +17,7 @@ import {
   checkAllocation,
   classifyRegime,
   computePerformance,
+  dayKeyOf,
   relaxAgent,
   reviewAgent,
   type AgentAdjustment,
@@ -117,6 +118,50 @@ export class AgentRuntime {
 
   private async save(agents: AgentConfig[]): Promise<void> {
     await this.storage.put({ agents });
+  }
+
+  /**
+   * Start a new trading day for the account.
+   *
+   * A supervisor pause is otherwise a one-way door: a paused agent is dropped
+   * from the active set, so it never ticks, so no new evidence ever reaches the
+   * supervisor that could clear the pause. Each day a paused agent is returned
+   * to its baseline settings and given another chance, which is what a limit
+   * that resets daily means. Agents the operator paused or stopped by hand are
+   * left exactly as they are — that decision is not the supervisor's to undo.
+   */
+  private async rolloverAgentsIfNewDay(now: number): Promise<boolean> {
+    const today = dayKeyOf(now);
+    const lastDay = await this.storage.get<string>("agentsDayKey");
+    if (lastDay === today) return false;
+    await this.storage.put({ agentsDayKey: today });
+
+    // No recorded day means the account has never rolled over, so any pause it
+    // is carrying was set when nothing could ever clear it. Those are released
+    // here too; on a genuinely new account there is nothing to release.
+    const agents = await this.list();
+    const reset = agents.map((agent) =>
+      agent.status === "SUPERVISOR_PAUSED"
+        ? {
+            ...agent,
+            status: "ACTIVE" as const,
+            working: { ...agent.baseline },
+            lastSupervisedAtTrades: undefined,
+            updatedAt: now,
+          }
+        : agent,
+    );
+    const resumed = reset.filter((a, i) => a.status !== agents[i].status).map((a) => a.name);
+    if (resumed.length) {
+      await this.save(reset);
+      console.log(JSON.stringify({
+        event: "agents_daily_reset",
+        day: today,
+        resumed,
+        timestamp: now,
+      }));
+    }
+    return resumed.length > 0;
   }
 
   async create(
@@ -272,6 +317,7 @@ export class AgentRuntime {
    * of agents cannot put unbounded work into a single invocation.
    */
   async tickAll(now = Date.now()): Promise<AgentTickResult[]> {
+    await this.rolloverAgentsIfNewDay(now);
     const agents = await this.list();
     const active = agents.filter((a) => a.status === "ACTIVE");
     const results: AgentTickResult[] = [];

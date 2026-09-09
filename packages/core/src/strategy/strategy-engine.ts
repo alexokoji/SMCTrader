@@ -37,6 +37,11 @@ export const MAX_TRACKED_FINGERPRINTS = 500;
  * market down with it. The durable audit trail lives in the database; a
  * snapshot only needs enough recent history to be useful on reload.
  */
+/** The UTC day a timestamp belongs to. Daily limits reset on this boundary. */
+export function dayKeyOf(ts: number): string {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
 export const PERSISTED_JOURNAL_ENTRIES = 80;
 export const PERSISTED_ACTIVITY_EVENTS = 80;
 
@@ -376,7 +381,12 @@ export class StrategyEngine {
     this.executedFingerprints = new Map(snapshot.executedFingerprints ?? []);
     this.lastSeenTs = snapshot.lastSeenTs ?? 0;
     this.pruneFingerprints();
-    this.dailyCounter = { ...snapshot.dailyCounter };
+    // An older snapshot predates the day key. Treating it as unset lets the
+    // next rollover check adopt today rather than roll a day that never ended.
+    this.dailyCounter = {
+      dayKey: snapshot.dailyCounter?.dayKey ?? "",
+      count: snapshot.dailyCounter?.count ?? 0,
+    };
     this.autoTrading = snapshot.autoTrading;
     this.safetyBlocked = snapshot.safetyBlocked;
   }
@@ -914,17 +924,45 @@ export class StrategyEngine {
   }
 
   private bumpDailyCounter(ts: number): void {
-    const day = new Date(ts).toISOString().slice(0, 10);
+    const day = dayKeyOf(ts);
     if (this.dailyCounter.dayKey !== day) {
       this.dailyCounter = { dayKey: day, count: 0 };
     }
     this.dailyCounter.count += 1;
   }
 
+  /**
+   * Roll the trading day over if `now` falls on a later UTC day than the
+   * counters belong to. Returns whether anything was reset.
+   *
+   * Every host must call this on each pass. The daily trade ceiling and the
+   * daily loss limit are only limits if something clears them; left to
+   * accumulate they are a one-way stop, and an engine that reached either would
+   * report `DAILY_LIMIT_REACHED` for the rest of its life.
+   */
+  rolloverIfNewDay(now: number): boolean {
+    const today = dayKeyOf(now);
+    if (this.dailyCounter.dayKey === today) return false;
+    if (!this.dailyCounter.dayKey) {
+      const risk = this.riskEngine.getState();
+      const untouched = risk.tradesToday === 0 && !risk.dailyLossReached && !risk.drawdownReached;
+      if (untouched) {
+        // A fresh engine's counters already belong to today. Recording the day
+        // is not a rollover and must not be journalled as one.
+        this.dailyCounter = { dayKey: today, count: this.dailyCounter.count };
+        return false;
+      }
+      // A snapshot written before day keys existed. Its counters accumulated
+      // without ever resetting, so they belong to no single day and are cleared.
+    }
+    this.rolloverDay(now);
+    return true;
+  }
+
   /** Advance the trading day (called by the scheduler at midnight). */
   rolloverDay(now: number): void {
     this.riskEngine.rolloverDay();
-    this.bumpDailyCounter(now);
+    this.dailyCounter = { dayKey: dayKeyOf(now), count: 0 };
     this.activity.add({
       kind: "risk",
       symbol: this.strategyCfg.symbol,

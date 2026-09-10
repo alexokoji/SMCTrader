@@ -18,6 +18,7 @@ import {
 } from "./runtime.js";
 import { sendIngest } from "./ingest.js";
 import { AgentRuntime, defaultAgentConfig } from "./agents.js";
+import { SpotSignalRuntime, type SpotSignal } from "./spot.js";
 import { cautionSymbols, fetchNews, type NewsResult } from "./news.js";
 
 interface Env {
@@ -145,6 +146,7 @@ export class TradingSession extends DurableObject<Env> {
   private lastEngineSignature = "";
   private lastAnyWarming?: boolean;
   private agentRuntimeInstance?: AgentRuntime;
+  private spotRuntimeInstance?: SpotSignalRuntime;
 
   /** Agents are held on the instance so their engines stay warm between ticks. */
   private agents(): AgentRuntime {
@@ -155,6 +157,50 @@ export class TradingSession extends DurableObject<Env> {
       });
     }
     return this.agentRuntimeInstance;
+  }
+
+  /**
+   * Read-only market analysis for the spot watchlist. Held on the instance for
+   * the same reason as agents: its engines stay warm between ticks. It never
+   * shares state with `agents()` — see the comment on `SpotSignalRuntime`.
+   */
+  private spot(): SpotSignalRuntime {
+    if (!this.spotRuntimeInstance) {
+      this.spotRuntimeInstance = new SpotSignalRuntime({
+        get: <T,>(key: string) => this.ctx.storage.get<T>(key),
+        put: (entries: Record<string, unknown>) => this.ctx.storage.put(entries),
+      });
+    }
+    return this.spotRuntimeInstance;
+  }
+
+  async getWatchlist(): Promise<string[]> {
+    return this.spot().getWatchlist();
+  }
+
+  async setWatchlist(symbols: string[]): Promise<{ symbols: string[]; error?: string }> {
+    return this.spot().setWatchlist(symbols);
+  }
+
+  async getSpotSignals(): Promise<{ signals: SpotSignal[]; updatedAt: number | null }> {
+    return this.spot().getSignals();
+  }
+
+  /**
+   * Advance the spot watchlist. Failures here are contained exactly like
+   * `tickAgents`: a bad market or feed outage must not stop the alarm loop
+   * that trading agents also depend on.
+   */
+  async tickSpot(): Promise<void> {
+    try {
+      await this.spot().tickAll();
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "spot_tick_failed",
+        message: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+      }));
+    }
   }
 
   // ---- agents ------------------------------------------------------------
@@ -444,9 +490,16 @@ export class TradingSession extends DurableObject<Env> {
       // Markets left over only when the per-invocation cap was reached; come
       // back sooner so they are not left behind for a full interval.
       const uncovered = (await this.ctx.storage.get<number>("agentBacklog")) ?? 0;
-      nextDelay = (await this.ctx.storage.get<boolean>("anyWarming")) || uncovered > 0
-        ? WARMING_TICK_MS
-        : STEADY_TICK_MS;
+      const agentsWarming = (await this.ctx.storage.get<boolean>("anyWarming")) || uncovered > 0;
+      // Cold-starting the spot watchlist costs its own run of exchange calls
+      // (fallback across five exchanges per timeframe on a market with no
+      // history yet). Stacked onto an invocation that is also backfilling
+      // every agent's markets, that is what pushed this Worker over its
+      // per-invocation subrequest ceiling in production. Spot analysis waits
+      // for a tick where nothing else is warming, so its own cold start gets
+      // the budget to itself rather than fighting agents for it.
+      if (!agentsWarming) await this.tickSpot();
+      nextDelay = agentsWarming ? WARMING_TICK_MS : STEADY_TICK_MS;
       // Provider probes are only useful at the steady cadence.
       if (nextDelay === STEADY_TICK_MS) await this.probeProviderHealth();
     } finally {
@@ -1147,6 +1200,25 @@ export default {
     if (url.pathname === "/api/trades" && request.method === "GET") return json(request, env, await session.agentTrades());
     if (url.pathname === "/api/market-conditions" && request.method === "GET") return json(request, env, await session.marketConditions());
     if (url.pathname === "/api/news" && request.method === "GET") return json(request, env, await session.news());
+    if (url.pathname === "/api/spot/watchlist" && request.method === "GET") {
+      return json(request, env, { symbols: await session.getWatchlist() });
+    }
+    if (url.pathname === "/api/spot/watchlist" && request.method === "PUT") {
+      const body = (await request.json().catch(() => ({}))) as { symbols?: unknown };
+      const symbols = Array.isArray(body.symbols) ? body.symbols.filter((s): s is string => typeof s === "string") : [];
+      const result = await session.setWatchlist(symbols);
+      return json(request, env, result, result.error ? 400 : 200);
+    }
+    if (url.pathname === "/api/spot/signals" && request.method === "GET") {
+      // A trader opening this page for the first time should not have to wait
+      // for the next alarm to see anything on a fresh watchlist.
+      let { signals, updatedAt } = await session.getSpotSignals();
+      if (updatedAt === null) {
+        await session.tickSpot();
+        ({ signals, updatedAt } = await session.getSpotSignals());
+      }
+      return json(request, env, { signals, updatedAt });
+    }
     if (url.pathname === "/api/capital" && request.method === "POST") {
       const body = (await request.json().catch(() => ({}))) as { amount?: number };
       if (!Number.isFinite(body.amount)) return json(request, env, { error: "A numeric amount is required." }, 400);

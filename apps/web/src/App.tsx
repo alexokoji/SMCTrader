@@ -8,9 +8,11 @@ import {
   type LiveStatus,
   type NewsResult,
   type Portfolio,
+  type SpotSignal,
 } from "./agents-api";
 import { MarketPicker } from "./components/MarketPicker";
 import { LiveStatusPanel } from "./components/LiveStatus";
+import { SpotView } from "./components/SpotView";
 import {
   AgentsView,
   ConditionsView,
@@ -20,7 +22,7 @@ import {
   money,
 } from "./components/AgentViews";
 
-type Page = "agents" | "portfolio" | "trades" | "conditions" | "news";
+type Page = "agents" | "spot" | "portfolio" | "trades" | "conditions" | "news";
 type Theme = "dark" | "light";
 
 /**
@@ -38,6 +40,7 @@ function readStoredTheme(): Theme {
 
 const nav: Array<[Page, string, string]> = [
   ["agents", "◉", "Agents"],
+  ["spot", "◈", "Spot signals"],
   ["portfolio", "◫", "Portfolio"],
   ["trades", "▤", "Trades"],
   ["conditions", "⌁", "Market conditions"],
@@ -76,6 +79,11 @@ function App() {
   });
   const [news, setNews] = useState<NewsResult | null>(null);
   const [live, setLive] = useState<LiveStatus | null>(null);
+  const [spotSignals, setSpotSignals] = useState<{ signals: SpotSignal[]; updatedAt: number | null }>({
+    signals: [],
+    updatedAt: null,
+  });
+  const [spotWatchlist, setSpotWatchlist] = useState<string[]>([]);
 
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -140,7 +148,7 @@ function App() {
   // Conditions and news are polled only while their page is open: both change
   // far more slowly than positions and cost a request each.
   useEffect(() => {
-    if (!user || !showCreate || markets.length > 0) return;
+    if (!user || (!showCreate && page !== "spot") || markets.length > 0) return;
     void agentsApi
       .markets()
       .then((result) => {
@@ -148,7 +156,34 @@ function App() {
         setMarketsError(result.error ?? (result.symbols.length ? null : "No markets returned."));
       })
       .catch((err) => setMarketsError(err instanceof Error ? err.message : String(err)));
-  }, [user, showCreate, markets.length]);
+  }, [user, showCreate, page, markets.length]);
+
+  // Spot signals are polled only while the page is open, on the same cadence
+  // as the engine's own tick, so the analysis on screen is never far behind
+  // what the worker last computed.
+  useEffect(() => {
+    if (!user || page !== "spot") return;
+    const load = () => {
+      void agentsApi.spotSignals().then(setSpotSignals).catch(() => undefined);
+    };
+    load();
+    const timer = setInterval(load, 20_000);
+    return () => clearInterval(timer);
+  }, [user, page]);
+
+  useEffect(() => {
+    if (!user || page !== "spot") return;
+    void agentsApi.spotWatchlist().then((r) => setSpotWatchlist(r.symbols)).catch(() => undefined);
+  }, [user, page]);
+
+  const saveSpotWatchlist = (symbols: string[]) =>
+    void run("spot-watchlist", async () => {
+      const result = await agentsApi.setSpotWatchlist(symbols);
+      if (result.error) throw new Error(result.error);
+      setSpotWatchlist(result.symbols);
+      setNotice("Watchlist updated.");
+      setSpotSignals(await agentsApi.spotSignals());
+    });
 
   useEffect(() => {
     if (!user || page !== "conditions") return;
@@ -349,6 +384,23 @@ function App() {
           </div>
         </section>
         <AgentsView agents={agents} capital={capital} onUpdate={updateAgent} onRemove={removeAgent} busy={busy}/>
+      </>
+    ),
+    spot: (
+      <>
+        <PageTitle
+          title="Spot signals"
+          description="Continuous read-only analysis of markets you choose — no capital, no agent, no order placed for you."
+        />
+        <SpotView
+          signals={spotSignals.signals}
+          updatedAt={spotSignals.updatedAt}
+          watchlist={spotWatchlist}
+          available={markets}
+          marketsError={marketsError}
+          onSave={saveSpotWatchlist}
+          busy={busy === "spot-watchlist"}
+        />
       </>
     ),
     portfolio: (

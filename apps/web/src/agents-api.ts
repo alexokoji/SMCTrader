@@ -190,6 +190,37 @@ export interface MarketsResponse {
   error?: string;
 }
 
+export interface SpotSetupView {
+  direction: string;
+  entryModel: string;
+  timeframe: string;
+  entry: number;
+  stopLoss: number;
+  takeProfits: number[];
+  targetMovesPct: number[];
+  nearestTargetPct: number;
+  rr: number[];
+  score: number;
+  reasons: string[];
+  qualityFactors: { name: string; status: string; detail: string }[];
+  createdAt: number;
+}
+
+export interface SpotSignal {
+  symbol: string;
+  price: number | null;
+  bias: string;
+  status: string;
+  regime: string | null;
+  regimeDetail: string | null;
+  warming: boolean;
+  noTradeReason: string | null;
+  setup: SpotSetupView | null;
+  alternates: SpotSetupView[];
+  news: { title: string; url: string; source: string; sentiment: string; publishedAt: number }[];
+  updatedAt: number;
+}
+
 export const agentsApi = {
   list: () => request<AgentsResponse>("/api/agents"),
   markets: () => request<MarketsResponse>("/api/markets"),
@@ -213,4 +244,11 @@ export const agentsApi = {
   news: () => request<NewsResult>("/api/news"),
   setCapital: (amount: number) =>
     request<{ total: number }>("/api/capital", { method: "POST", body: JSON.stringify({ amount }) }),
+  spotWatchlist: () => request<{ symbols: string[] }>("/api/spot/watchlist"),
+  setSpotWatchlist: (symbols: string[]) =>
+    request<{ symbols: string[]; error?: string }>("/api/spot/watchlist", {
+      method: "PUT",
+      body: JSON.stringify({ symbols }),
+    }),
+  spotSignals: () => request<{ signals: SpotSignal[]; updatedAt: number | null }>("/api/spot/signals"),
 };

@@ -1,15 +1,16 @@
-import { useMemo, useState } from "react";
-import type { SpotSignal, SpotSetupView } from "../agents-api";
-import { MarketPicker } from "./MarketPicker";
+import type { CexMarketStat, SpotSignal, SpotSetupView } from "../agents-api";
 import { num } from "./AgentViews";
 
 /**
  * Spot signals.
  *
- * This is analysis, not an agent: nothing here places an order. Every card
- * states what the engine concluded and why, at what price it would matter,
- * and what move it implies — so a trader can act on their own exchange
- * account, or not, on their own judgement.
+ * This is analysis, not an agent: nothing here places an order. What gets
+ * analysed is discovered, not typed in — the top USDT pairs by 24h volume are
+ * pulled fresh every tick and shown automatically; pinning a market only adds
+ * it to that list regardless of its ranking, it is never required to see
+ * anything. Every card states what the engine concluded and why, at what
+ * price it would matter, and what move it implies — so a trader can act on
+ * their own exchange account, or not, on their own judgement.
  */
 
 function ago(ts?: number | null): string {
@@ -81,7 +82,13 @@ function SetupCard({ setup, muted = false }: { setup: SpotSetupView; muted?: boo
   );
 }
 
-function SignalCard({ signal }: { signal: SpotSignal }) {
+function usd(n: number): string {
+  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `$${(n / 1_000).toFixed(0)}K`;
+  return `$${n.toFixed(0)}`;
+}
+
+function SignalCard({ signal, onPin, onUnpin }: { signal: SpotSignal; onPin: (symbol: string) => void; onUnpin: (symbol: string) => void }) {
   return (
     <article className="spot-card">
       <header>
@@ -93,11 +100,24 @@ function SignalCard({ signal }: { signal: SpotSignal }) {
               {signal.regime.replace(/_/g, " ")}
             </span>
           )}
+          <button className="link-button" onClick={() => (signal.pinned ? onUnpin(signal.symbol) : onPin(signal.symbol))}>
+            {signal.pinned ? "Unpin" : "Pin"}
+          </button>
         </div>
       </header>
       <div className="spot-price-row">
         <span>{signal.price !== null ? priceOf(signal.price) : "—"}</span>
         <span className="helper">updated {ago(signal.updatedAt)}</span>
+      </div>
+      <div className="defi-candidate-meta">
+        {signal.volumeUsd24h !== null && <span>Vol {usd(signal.volumeUsd24h)}</span>}
+        {signal.priceChangePct24h !== null && (
+          <span className={signal.priceChangePct24h >= 0 ? "good" : "bad"}>
+            {signal.priceChangePct24h >= 0 ? "+" : ""}{num(signal.priceChangePct24h, 1)}% 24h
+          </span>
+        )}
+        {signal.discovered && !signal.pinned && <span className="chain-badge">discovered</span>}
+        {signal.pinned && <span className="chain-badge">pinned</span>}
       </div>
 
       {signal.warming ? (
@@ -131,64 +151,35 @@ function SignalCard({ signal }: { signal: SpotSignal }) {
 export function SpotView({
   signals,
   updatedAt,
-  watchlist,
-  available,
-  marketsError,
-  onSave,
+  candidates,
+  candidatesUpdatedAt,
+  pinned,
+  onPin,
+  onUnpin,
+  onRescout,
   busy,
 }: {
   signals: SpotSignal[];
   updatedAt: number | null;
-  watchlist: string[];
-  available: string[];
-  marketsError: string | null;
-  onSave: (symbols: string[]) => void;
+  candidates: CexMarketStat[];
+  candidatesUpdatedAt: number | null;
+  pinned: string[];
+  onPin: (symbol: string) => void;
+  onUnpin: (symbol: string) => void;
+  onRescout: () => void;
   busy?: boolean;
 }) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState<string[]>(watchlist);
-
-  const bySymbol = useMemo(() => new Map(signals.map((s) => [s.symbol, s])), [signals]);
-  // Watched markets in watchlist order, even before their first analysis pass
-  // has landed, so the page never looks emptier than what was asked for.
-  const ordered = watchlist.map((symbol) => bySymbol.get(symbol) ?? placeholder(symbol));
-
-  const startEdit = () => {
-    setDraft(watchlist);
-    setEditing(true);
-  };
-
   return (
     <>
       <section className="card">
         <div className="card-head">
-          <h2>Watchlist</h2>
-          <button onClick={() => (editing ? setEditing(false) : startEdit())}>
-            {editing ? "Close" : "Edit watchlist"}
-          </button>
+          <h2>Discovered markets</h2>
+          <button disabled={busy} onClick={onRescout}>Re-scout now</button>
         </div>
-        {editing ? (
-          <>
-            <MarketPicker available={available} selected={draft} error={marketsError} onChange={setDraft} />
-            <div className="card-actions">
-              <button
-                className="primary"
-                disabled={busy}
-                onClick={() => {
-                  onSave(draft);
-                  setEditing(false);
-                }}
-              >
-                Save watchlist
-              </button>
-              <button onClick={() => setEditing(false)}>Cancel</button>
-            </div>
-          </>
-        ) : (
-          <p className="helper">
-            Watching {watchlist.length} market{watchlist.length === 1 ? "" : "s"} · last analysed {ago(updatedAt)}
-          </p>
-        )}
+        <p className="helper">
+          The top {candidates.length} USDT pairs by 24h volume, pulled fresh {ago(candidatesUpdatedAt)} —
+          nothing here was typed in. Pin a market below to keep it in view regardless of its ranking.
+        </p>
       </section>
 
       <p className="helper spot-disclaimer">
@@ -197,33 +188,19 @@ export function SpotView({
         are what the engine would trade if it were allowed to; the decision stays yours.
       </p>
 
-      {ordered.length === 0 ? (
+      {signals.length === 0 ? (
         <div className="empty">
-          No markets on the watchlist yet.
-          <p>Add markets above to start seeing analysis.</p>
+          No markets cleared the volume floor on the last scout, and nothing is pinned.
+          <p>Try re-scouting, or check back shortly.</p>
         </div>
       ) : (
-        <div className="spot-grid">
-          {ordered.map((signal) => <SignalCard key={signal.symbol} signal={signal} />)}
-        </div>
+        <>
+          <p className="helper">Analysed {signals.length} market{signals.length === 1 ? "" : "s"} · last analysed {ago(updatedAt)} · {pinned.length} pinned</p>
+          <div className="spot-grid">
+            {signals.map((signal) => <SignalCard key={signal.symbol} signal={signal} onPin={onPin} onUnpin={onUnpin} />)}
+          </div>
+        </>
       )}
     </>
   );
-}
-
-function placeholder(symbol: string): SpotSignal {
-  return {
-    symbol,
-    price: null,
-    bias: "UNCLEAR",
-    status: "SCANNING",
-    regime: null,
-    regimeDetail: null,
-    warming: true,
-    noTradeReason: null,
-    setup: null,
-    alternates: [],
-    news: [],
-    updatedAt: 0,
-  };
 }

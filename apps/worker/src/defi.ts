@@ -424,27 +424,25 @@ export class DeFiRuntime {
   // ---- automated trading --------------------------------------------------
 
   /**
-   * One pass of the automated bot: manage open positions against the exit
-   * policy, then look for a new entry among fresh candidates. Bounded to
-   * `AUTO_CANDIDATES_PER_TICK` new candidates per tick — the same reasoning
-   * as the CEX spot page's deferral: running the full engine on every
-   * scouted pool every tick is the cost spike that already broke production
-   * once, and this one moves real funds, so it gets the smaller number.
+   * Exit management only: one `getPool` call per open position, plus a swap
+   * only on the ticks that actually decide to sell. This is deliberately
+   * cheap and called on every alarm tick regardless of what else is running
+   * — a held position is risk exposure, and deferring a sell decision to
+   * save on subrequests is the wrong thing to defer. Discovery and the full
+   * analysis engine (`attemptEntries`) are the expensive half, and get their
+   * own, separately-throttled cadence.
    */
-  async tickAuto(now = Date.now()): Promise<{ skipped?: string; managed: number; opened: number }> {
+  async manageOpenPositions(now = Date.now()): Promise<{ skipped?: string; managed: number }> {
     const config = await this.getAutoConfig();
-    if (!config.enabled) return { skipped: "Automated trading is disabled.", managed: 0, opened: 0 };
+    if (!config.enabled) return { skipped: "Automated trading is disabled.", managed: 0 };
 
     const privateKey = await this.decryptedPrivateKey().catch((error) => {
       console.error(JSON.stringify({ event: "defi_wallet_decrypt_failed", reason: error instanceof Error ? error.message : String(error), timestamp: now }));
       return null;
     });
-    if (!privateKey) return { skipped: "No wallet configured.", managed: 0, opened: 0 };
+    if (!privateKey) return { skipped: "No wallet configured.", managed: 0 };
 
     let managed = 0;
-    let opened = 0;
-
-    // 1. Manage open positions against the exit policy.
     const positions = await this.getPositions();
     const open = positions.filter((p) => p.status === "OPEN");
     for (const position of open) {
@@ -502,13 +500,33 @@ export class DeFiRuntime {
         });
       }
     }
+    return { managed };
+  }
 
-    // 2. Look for new entries, capital and cooldown permitting.
+  /**
+   * New entries only: discovery plus the full analysis engine on up to
+   * `AUTO_CANDIDATES_PER_TICK` fresh candidates. This is the expensive half —
+   * the same reasoning as the CEX spot page's warming deferral applies here,
+   * so the caller (the alarm loop in index.ts) runs this on its own, less
+   * frequent cadence rather than every tick.
+   */
+  async attemptEntries(now = Date.now()): Promise<{ skipped?: string; opened: number }> {
+    const config = await this.getAutoConfig();
+    if (!config.enabled) return { skipped: "Automated trading is disabled.", opened: 0 };
+
+    const privateKey = await this.decryptedPrivateKey().catch((error) => {
+      console.error(JSON.stringify({ event: "defi_wallet_decrypt_failed", reason: error instanceof Error ? error.message : String(error), timestamp: now }));
+      return null;
+    });
+    if (!privateKey) return { skipped: "No wallet configured.", opened: 0 };
+
+    let opened = 0;
+
     const stillOpen = (await this.getPositions()).filter((p) => p.status === "OPEN");
     const committed = stillOpen.reduce((sum, p) => sum + p.amountInUsd, 0);
     const available = config.allocatedCapitalUsd - committed;
     if (available < config.perTradeCapUsd) {
-      return { managed, opened };
+      return { opened };
     }
 
     let { candidates, updatedAt } = await this.getCandidates();
@@ -607,6 +625,19 @@ export class DeFiRuntime {
       }
     }
 
-    return { managed, opened };
+    return { opened };
+  }
+
+  /**
+   * Both halves together — kept for callers (and tests) that want the whole
+   * automated pass in one call. The alarm loop calls the two halves
+   * separately on their own cadences instead of this; see the comments on
+   * `manageOpenPositions` and `attemptEntries` for why.
+   */
+  async tickAuto(now = Date.now()): Promise<{ skipped?: string; managed: number; opened: number }> {
+    const managed = await this.manageOpenPositions(now);
+    if (managed.skipped) return { skipped: managed.skipped, managed: 0, opened: 0 };
+    const entries = await this.attemptEntries(now);
+    return { managed: managed.managed, opened: entries.opened };
   }
 }

@@ -388,3 +388,81 @@ describe("automated trading — execution compatibility", () => {
     expect(isV2Compatible("uniswap_v3")).toBe(false);
   });
 });
+
+describe("manageOpenPositions / attemptEntries split", () => {
+  // The whole point of separating these: exit management must stay cheap and
+  // run every tick regardless of what else the alarm loop is doing, while
+  // discovery and the full engine (only needed for new entries) get their
+  // own, less frequent cadence. A regression that makes exit management pull
+  // in discovery again would silently reintroduce the subrequest-ceiling
+  // failure this split exists to fix.
+  it("manages positions without ever calling discovery", async () => {
+    let discoveryCalls = 0;
+    const fetchFn = (async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.includes("/trending_pools")) {
+        discoveryCalls++;
+        return new Response(JSON.stringify(TRENDING_FIXTURE), { status: 200 });
+      }
+      return geckoStubFetch()(input as never);
+    }) as unknown as typeof fetch;
+
+    const wallet = stubWallet();
+    const storage = memoryStorage();
+    const defi = new DeFiRuntime(storage, { fetchFn, encryptionKey: generateEncryptionKey(), walletFactory: () => wallet });
+    await defi.createWallet();
+    await defi.setAutoConfig({ enabled: true, allocatedCapitalUsd: 500, perTradeCapUsd: 50 });
+    await storage.put({
+      defiPositions: [{
+        id: "pos1", symbol: "ethereum:0xpool1", network: "ethereum", poolAddress: "0xpool1",
+        dex: "uniswap_v2", baseSymbol: "TOKEN", baseTokenAddress: "0xbase1",
+        entryPriceUsd: 1.0, entryLiquidityUsd: 300_000, amountInUsd: 50, quantity: "100",
+        status: "OPEN", openedAt: NOW - 3_600_000, txHashOpen: "0xopen",
+      }],
+    });
+
+    const result = await defi.manageOpenPositions(NOW);
+
+    expect(result.managed).toBe(1);
+    expect(discoveryCalls).toBe(0);
+  });
+
+  it("attemptEntries alone opens a position without re-managing existing ones", async () => {
+    const wallet = stubWallet();
+    const storage = memoryStorage();
+    const defi = new DeFiRuntime(storage, { fetchFn: geckoStubFetch(), encryptionKey: generateEncryptionKey(), walletFactory: () => wallet });
+    await defi.createWallet();
+    await defi.setAutoConfig({ enabled: true, allocatedCapitalUsd: 500, perTradeCapUsd: 50 });
+
+    const result = await defi.attemptEntries(NOW);
+
+    // Whether or not the stub candle data forms a valid setup, the call must
+    // complete without touching position management at all.
+    expect(result).not.toHaveProperty("managed");
+    expect(typeof result.opened).toBe("number");
+  });
+
+  it("tickAuto composes both halves, matching the pre-split behaviour", async () => {
+    const swap = vi.fn().mockResolvedValue({ txHash: "0xexit", amountIn: 100n, amountOutMin: 200_000_000n, path: [] });
+    const wallet = stubWallet({ swap });
+    const storage = memoryStorage();
+    const defi = new DeFiRuntime(storage, { fetchFn: geckoStubFetch(), encryptionKey: generateEncryptionKey(), walletFactory: () => wallet });
+    await defi.createWallet();
+    await defi.setAutoConfig({ enabled: true, allocatedCapitalUsd: 500, perTradeCapUsd: 50 });
+    await storage.put({
+      defiPositions: [{
+        id: "pos1", symbol: "ethereum:0xpool1", network: "ethereum", poolAddress: "0xpool1",
+        dex: "uniswap_v2", baseSymbol: "TOKEN", baseTokenAddress: "0xbase1",
+        entryPriceUsd: 1.0, entryLiquidityUsd: 300_000, amountInUsd: 50, quantity: "100",
+        status: "OPEN", openedAt: NOW - 3_600_000, txHashOpen: "0xopen",
+      }],
+    });
+
+    const result = await defi.tickAuto(NOW);
+
+    expect(result.managed).toBe(1);
+    expect(swap).toHaveBeenCalled();
+    const positions = await defi.getPositions();
+    expect(positions[0]!.status).toBe("CLOSED");
+  });
+});

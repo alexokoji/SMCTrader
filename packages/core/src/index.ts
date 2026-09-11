@@ -49,6 +49,7 @@ export * from "./journal/journal.js";
 // ---- market data ----
 export * from "./marketdata/providers.js";
 export * from "./marketdata/multi-exchange.js";
+export * from "./marketdata/screener.js";
 export * from "./marketdata/demo.js";
 export * from "./marketdata/inmemory.js";
 

@@ -2,28 +2,36 @@
  * Spot signals.
  *
  * A separate, non-executing surface: the same deterministic SMC engine every
- * agent runs, pointed at a user-chosen watchlist and never allowed to trade.
- * Nothing here sizes a position, places an order, or touches capital — it
- * produces a read of the market (direction, entry, stop, targets, the expected
- * move to each, and why) and hands the decision to the person looking at it.
+ * agent runs, never allowed to trade. Nothing here sizes a position, places
+ * an order, or touches capital — it produces a read of the market (direction,
+ * entry, stop, targets, the expected move to each, and why) and hands the
+ * decision to the person looking at it.
+ *
+ * What markets it analyses is discovered, not typed in: every tick, the top
+ * USDT pairs by 24h volume are pulled from a single bulk exchange call (see
+ * `@smc/core`'s `CexScreener`) and analysed automatically — nothing has to be
+ * added by hand for the page to show anything. A trader can still pin a
+ * market they want kept in view regardless of its ranking; a pin is additive
+ * to discovery, never a requirement for it.
  *
  * This exists because an agent commits capital the moment its analysis clears
  * the bar; a trader who wants to place spot orders themselves, by hand, on
  * their own exchange account, needs the analysis without the commitment.
  */
 import {
+  CexScreener,
   DEFAULT_STRATEGY_CONFIG,
   classifyRegime,
+  type CexMarketStat,
   type StrategyConfig,
 } from "@smc/core";
 import { TradingRuntime, type AnalysisTick, type RuntimeStorage } from "./runtime.js";
 import { fetchNews, type NewsItem } from "./news.js";
 
-/** A large watchlist is exactly what a rotation budget elsewhere in this app
- * exists to avoid re-introducing: every symbol here is analysed every tick. */
-export const MAX_WATCHLIST_SYMBOLS = 40;
-
-export const DEFAULT_WATCHLIST = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"];
+/** Bounds total cost per tick: discovered markets plus pins, deduplicated. */
+export const MAX_ANALYSED_MARKETS = 15;
+export const MAX_PINNED_MARKETS = 10;
+const DISCOVERY_COUNT = 10;
 
 export interface SpotSetupView {
   direction: string;
@@ -50,6 +58,12 @@ export interface SpotSetupView {
 
 export interface SpotSignal {
   symbol: string;
+  pinned: boolean;
+  /** Where this market came from this tick: ranked by the screener, kept in
+   * view only because it was pinned, or both. */
+  discovered: boolean;
+  volumeUsd24h: number | null;
+  priceChangePct24h: number | null;
   price: number | null;
   bias: string;
   status: string;
@@ -132,10 +146,12 @@ export class SpotSignalRuntime {
   private readonly runtime: TradingRuntime;
   private readonly storage: RuntimeStorage;
   private readonly fetchFn?: typeof fetch;
+  private readonly screener: CexScreener;
 
   constructor(storage: RuntimeStorage, opts: { fetchFn?: typeof fetch } = {}) {
     this.storage = storage;
     this.fetchFn = opts.fetchFn;
+    this.screener = new CexScreener({ fetchFn: opts.fetchFn });
     // A namespace of its own: this must never share engine state with an
     // agent, even one watching the same symbol, because an agent's engine
     // carries capital and position state that a read-only view must not see
@@ -143,23 +159,43 @@ export class SpotSignalRuntime {
     this.runtime = new TradingRuntime(storage, { fetchFn: opts.fetchFn, namespace: "spot" });
   }
 
-  async getWatchlist(): Promise<string[]> {
-    return (await this.storage.get<string[]>("spotWatchlist")) ?? DEFAULT_WATCHLIST;
+  // ---- discovery -----------------------------------------------------
+
+  async discover(now = Date.now()): Promise<CexMarketStat[]> {
+    const top = await this.screener.topMarkets({ limit: DISCOVERY_COUNT });
+    await this.storage.put({ spotCandidates: { markets: top, updatedAt: now } });
+    return top;
   }
 
-  async setWatchlist(symbols: string[]): Promise<{ symbols: string[]; error?: string }> {
-    const cleaned = [...new Set(symbols.map((s) => s.toUpperCase().trim()).filter(Boolean))];
-    if (cleaned.length === 0) {
-      return { symbols: await this.getWatchlist(), error: "The watchlist needs at least one market." };
+  async getCandidates(): Promise<{ markets: CexMarketStat[]; updatedAt: number | null }> {
+    return (await this.storage.get<{ markets: CexMarketStat[]; updatedAt: number }>("spotCandidates")) ?? {
+      markets: [],
+      updatedAt: null,
+    };
+  }
+
+  // ---- pins ------------------------------------------------------------
+
+  async getPinned(): Promise<string[]> {
+    return (await this.storage.get<string[]>("spotPinned")) ?? [];
+  }
+
+  async pin(symbol: string): Promise<{ pinned: string[]; error?: string }> {
+    const pinned = await this.getPinned();
+    const clean = symbol.toUpperCase().trim();
+    if (pinned.includes(clean)) return { pinned };
+    if (pinned.length >= MAX_PINNED_MARKETS) {
+      return { pinned, error: `You can pin at most ${MAX_PINNED_MARKETS} markets. Unpin one first.` };
     }
-    if (cleaned.length > MAX_WATCHLIST_SYMBOLS) {
-      return {
-        symbols: await this.getWatchlist(),
-        error: `A watchlist is limited to ${MAX_WATCHLIST_SYMBOLS} markets.`,
-      };
-    }
-    await this.storage.put({ spotWatchlist: cleaned });
-    return { symbols: cleaned };
+    const next = [...pinned, clean];
+    await this.storage.put({ spotPinned: next });
+    return { pinned: next };
+  }
+
+  async unpin(symbol: string): Promise<{ pinned: string[] }> {
+    const next = (await this.getPinned()).filter((s) => s !== symbol.toUpperCase().trim());
+    await this.storage.put({ spotPinned: next });
+    return { pinned: next };
   }
 
   async getSignals(): Promise<{ signals: SpotSignal[]; updatedAt: number | null }> {
@@ -170,13 +206,28 @@ export class SpotSignalRuntime {
   }
 
   /**
-   * Analyse every watched market read-only and persist a compact signal per
-   * symbol. `autoTrading: false` is the entire safety property of this class —
-   * the engine still evaluates every setup and hard rule, it is simply never
+   * Analyse the top discovered markets plus any pinned ones, read-only.
+   * `autoTrading: false` is the entire safety property of this class — the
+   * engine still evaluates every setup and hard rule, it is simply never
    * asked to act on the result.
    */
   async tickAll(now = Date.now()): Promise<SpotSignal[]> {
-    const symbols = await this.getWatchlist();
+    const [pinned, cachedCandidates] = await Promise.all([this.getPinned(), this.getCandidates()]);
+    let markets = cachedCandidates.markets;
+    if (!cachedCandidates.updatedAt || now - cachedCandidates.updatedAt > 15 * 60_000) {
+      markets = await this.discover(now).catch((error) => {
+        console.warn(JSON.stringify({
+          event: "spot_discovery_failed",
+          reason: error instanceof Error ? error.message : String(error),
+          timestamp: now,
+        }));
+        return markets;
+      });
+    }
+
+    const byStat = new Map(markets.map((m) => [m.symbol, m]));
+    const discoveredSymbols = markets.map((m) => m.symbol);
+    const symbols = [...new Set([...discoveredSymbols, ...pinned])].slice(0, MAX_ANALYSED_MARKETS);
     if (symbols.length === 0) return [];
 
     const previous = (await this.getSignals()).signals;
@@ -208,10 +259,15 @@ export class SpotSignalRuntime {
         const ltf = tick.analysis.snapshots[DEFAULT_STRATEGY_CONFIG.timeframes.ltf]
           ?? Object.values(tick.analysis.snapshots).find(Boolean);
         const regime = ltf ? classifyRegime(ltf.candles, ltf.structure.trend) : undefined;
+        const stat = byStat.get(symbol);
 
         results.push({
           symbol,
-          price: lastCloseOf(tick),
+          pinned: pinned.includes(symbol),
+          discovered: discoveredSymbols.includes(symbol),
+          volumeUsd24h: stat?.quoteVolume24hUsd ?? null,
+          priceChangePct24h: stat?.priceChangePct24h ?? null,
+          price: stat?.priceUsd ?? lastCloseOf(tick),
           bias: tick.analysis.bias,
           status: tick.status,
           regime: regime?.regime ?? null,

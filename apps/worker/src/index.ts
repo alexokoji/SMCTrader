@@ -19,6 +19,7 @@ import {
 import { sendIngest } from "./ingest.js";
 import { AgentRuntime, defaultAgentConfig } from "./agents.js";
 import { SpotSignalRuntime, type SpotSignal } from "./spot.js";
+import type { CexMarketStat } from "@smc/core";
 import {
   DeFiRuntime,
   type DeFiAutoConfig,
@@ -185,12 +186,24 @@ export class TradingSession extends DurableObject<Env> {
     return this.spotRuntimeInstance;
   }
 
-  async getWatchlist(): Promise<string[]> {
-    return this.spot().getWatchlist();
+  async getSpotCandidates(): Promise<{ markets: CexMarketStat[]; updatedAt: number | null }> {
+    return this.spot().getCandidates();
   }
 
-  async setWatchlist(symbols: string[]): Promise<{ symbols: string[]; error?: string }> {
-    return this.spot().setWatchlist(symbols);
+  async rescoutSpot(): Promise<CexMarketStat[]> {
+    return this.spot().discover();
+  }
+
+  async getSpotPinned(): Promise<string[]> {
+    return this.spot().getPinned();
+  }
+
+  async pinSpotMarket(symbol: string): Promise<{ pinned: string[]; error?: string }> {
+    return this.spot().pin(symbol);
+  }
+
+  async unpinSpotMarket(symbol: string): Promise<{ pinned: string[] }> {
+    return this.spot().unpin(symbol);
   }
 
   async getSpotSignals(): Promise<{ signals: SpotSignal[]; updatedAt: number | null }> {
@@ -307,7 +320,27 @@ export class TradingSession extends DurableObject<Env> {
    * feed outage must not stop the alarm loop the rest of the account
    * depends on.
    */
-  async tickDeFi(): Promise<void> {
+  /**
+   * Exit management only — one cheap call per open position. Held capital is
+   * real risk exposure, so this runs on every tick regardless of what else
+   * is happening, unlike everything below which competes for a shared
+   * subrequest budget.
+   */
+  async tickDeFiExits(): Promise<void> {
+    try {
+      await this.defi().manageOpenPositions();
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "defi_exit_tick_failed",
+        message: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+      }));
+    }
+  }
+
+  /** Discovery plus the full engine, for saved-pool analysis and new
+   * automated entries — the expensive half, run on its own cadence. */
+  async tickDeFiDiscovery(): Promise<void> {
     try {
       await this.defi().tickSaved();
     } catch (error) {
@@ -318,10 +351,10 @@ export class TradingSession extends DurableObject<Env> {
       }));
     }
     try {
-      await this.defi().tickAuto();
+      await this.defi().attemptEntries();
     } catch (error) {
       console.error(JSON.stringify({
-        event: "defi_auto_tick_failed",
+        event: "defi_entry_tick_failed",
         message: error instanceof Error ? error.message : String(error),
         timestamp: Date.now(),
       }));
@@ -616,19 +649,28 @@ export class TradingSession extends DurableObject<Env> {
       // back sooner so they are not left behind for a full interval.
       const uncovered = (await this.ctx.storage.get<number>("agentBacklog")) ?? 0;
       const agentsWarming = (await this.ctx.storage.get<boolean>("anyWarming")) || uncovered > 0;
-      // Cold-starting the spot watchlist costs its own run of exchange calls
-      // (fallback across five exchanges per timeframe on a market with no
-      // history yet). Stacked onto an invocation that is also backfilling
-      // every agent's markets, that is what pushed this Worker over its
-      // per-invocation subrequest ceiling in production. Spot analysis waits
-      // for a tick where nothing else is warming, so its own cold start gets
-      // the budget to itself rather than fighting agents for it.
+      // Cold-starting discovery (CEX spot's bulk scan, DeFi's five-chain
+      // sweep) costs its own round of calls. Stacked onto an invocation
+      // that is also backfilling every agent's markets, that is what pushed
+      // this Worker over its per-invocation subrequest ceiling once already.
+      // Discovery waits for a tick where nothing else is warming.
+      //
+      // Even once warm, CEX spot's discovery+full-engine pass and DeFi's
+      // discovery+full-engine pass are each their own round of calls large
+      // enough to trip the same ceiling if run together — confirmed in
+      // production: "Too many subrequests" from a tick that ran both. They
+      // alternate across ticks instead, so only one runs per invocation.
+      // DeFi position management is the exception: a held position is real
+      // risk exposure, not analysis, so it runs every tick regardless.
+      await this.tickDeFiExits();
       if (!agentsWarming) {
-        await this.tickSpot();
-        // DeFi discovery, saved-pool analysis and automated trading are their
-        // own round of chain calls on top of everything above; the same
-        // reasoning that gates tickSpot gates this.
-        await this.tickDeFi();
+        const cursor = ((await this.ctx.storage.get<number>("secondaryTickCursor")) ?? 0) + 1;
+        await this.ctx.storage.put({ secondaryTickCursor: cursor });
+        if (cursor % 2 === 1) {
+          await this.tickSpot();
+        } else {
+          await this.tickDeFiDiscovery();
+        }
       }
       nextDelay = agentsWarming ? WARMING_TICK_MS : STEADY_TICK_MS;
       // Provider probes are only useful at the steady cadence.
@@ -1331,18 +1373,34 @@ export default {
     if (url.pathname === "/api/trades" && request.method === "GET") return json(request, env, await session.agentTrades());
     if (url.pathname === "/api/market-conditions" && request.method === "GET") return json(request, env, await session.marketConditions());
     if (url.pathname === "/api/news" && request.method === "GET") return json(request, env, await session.news());
-    if (url.pathname === "/api/spot/watchlist" && request.method === "GET") {
-      return json(request, env, { symbols: await session.getWatchlist() });
+    if (url.pathname === "/api/spot/candidates" && request.method === "GET") {
+      let result = await session.getSpotCandidates();
+      if (result.updatedAt === null) {
+        await session.rescoutSpot();
+        result = await session.getSpotCandidates();
+      }
+      return json(request, env, result);
     }
-    if (url.pathname === "/api/spot/watchlist" && request.method === "PUT") {
-      const body = (await request.json().catch(() => ({}))) as { symbols?: unknown };
-      const symbols = Array.isArray(body.symbols) ? body.symbols.filter((s): s is string => typeof s === "string") : [];
-      const result = await session.setWatchlist(symbols);
+    if (url.pathname === "/api/spot/candidates" && request.method === "POST") {
+      // Manual re-scout on demand, rather than waiting for the next alarm.
+      return json(request, env, { markets: await session.rescoutSpot() });
+    }
+    if (url.pathname === "/api/spot/pinned" && request.method === "GET") {
+      return json(request, env, { pinned: await session.getSpotPinned() });
+    }
+    if (url.pathname === "/api/spot/pinned" && request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as { symbol?: unknown };
+      if (typeof body.symbol !== "string") return json(request, env, { error: "A market symbol is required." }, 400);
+      const result = await session.pinSpotMarket(body.symbol);
       return json(request, env, result, result.error ? 400 : 200);
+    }
+    if (url.pathname.startsWith("/api/spot/pinned/") && request.method === "DELETE") {
+      const symbol = decodeURIComponent(url.pathname.slice("/api/spot/pinned/".length));
+      return json(request, env, await session.unpinSpotMarket(symbol));
     }
     if (url.pathname === "/api/spot/signals" && request.method === "GET") {
       // A trader opening this page for the first time should not have to wait
-      // for the next alarm to see anything on a fresh watchlist.
+      // for the next alarm to see anything discovered.
       let { signals, updatedAt } = await session.getSpotSignals();
       if (updatedAt === null) {
         await session.tickSpot();
@@ -1380,7 +1438,7 @@ export default {
     if (url.pathname === "/api/defi/signals" && request.method === "GET") {
       let result = await session.getDeFiSignals();
       if (result.updatedAt === null && (await session.getDeFiSaved()).length > 0) {
-        await session.tickDeFi();
+        await session.tickDeFiDiscovery();
         result = await session.getDeFiSignals();
       }
       return json(request, env, result);

@@ -9,6 +9,7 @@ import {
   type NewsResult,
   type Portfolio,
   type SpotSignal,
+  type CexMarketStat,
 } from "./agents-api";
 import { MarketPicker } from "./components/MarketPicker";
 import { LiveStatusPanel } from "./components/LiveStatus";
@@ -94,7 +95,11 @@ function App() {
     signals: [],
     updatedAt: null,
   });
-  const [spotWatchlist, setSpotWatchlist] = useState<string[]>([]);
+  const [spotCandidates, setSpotCandidates] = useState<{ markets: CexMarketStat[]; updatedAt: number | null }>({
+    markets: [],
+    updatedAt: null,
+  });
+  const [spotPinned, setSpotPinned] = useState<string[]>([]);
 
   const [defiCandidates, setDefiCandidates] = useState<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }>({
     candidates: [],
@@ -168,10 +173,10 @@ function App() {
     return () => clearInterval(timer);
   }, [user, refresh]);
 
-  // Conditions and news are polled only while their page is open: both change
-  // far more slowly than positions and cost a request each.
+  // Markets are only needed to build a new agent; the spot page discovers
+  // its own markets and never uses this list.
   useEffect(() => {
-    if (!user || (!showCreate && page !== "spot") || markets.length > 0) return;
+    if (!user || !showCreate || markets.length > 0) return;
     void agentsApi
       .markets()
       .then((result) => {
@@ -179,32 +184,41 @@ function App() {
         setMarketsError(result.error ?? (result.symbols.length ? null : "No markets returned."));
       })
       .catch((err) => setMarketsError(err instanceof Error ? err.message : String(err)));
-  }, [user, showCreate, page, markets.length]);
+  }, [user, showCreate, markets.length]);
 
-  // Spot signals are polled only while the page is open, on the same cadence
-  // as the engine's own tick, so the analysis on screen is never far behind
-  // what the worker last computed.
+  // Spot signals and the underlying discovery are polled only while the page
+  // is open, on the same cadence as the engine's own tick, so the analysis on
+  // screen is never far behind what the worker last computed.
   useEffect(() => {
     if (!user || page !== "spot") return;
     const load = () => {
       void agentsApi.spotSignals().then(setSpotSignals).catch(() => undefined);
+      void agentsApi.spotCandidates().then(setSpotCandidates).catch(() => undefined);
+      void agentsApi.spotPinned().then((r) => setSpotPinned(r.pinned)).catch(() => undefined);
     };
     load();
     const timer = setInterval(load, 20_000);
     return () => clearInterval(timer);
   }, [user, page]);
 
-  useEffect(() => {
-    if (!user || page !== "spot") return;
-    void agentsApi.spotWatchlist().then((r) => setSpotWatchlist(r.symbols)).catch(() => undefined);
-  }, [user, page]);
-
-  const saveSpotWatchlist = (symbols: string[]) =>
-    void run("spot-watchlist", async () => {
-      const result = await agentsApi.setSpotWatchlist(symbols);
+  const pinSpotMarket = (symbol: string) =>
+    void run("spot-pin", async () => {
+      const result = await agentsApi.pinSpotMarket(symbol);
       if (result.error) throw new Error(result.error);
-      setSpotWatchlist(result.symbols);
-      setNotice("Watchlist updated.");
+      setSpotPinned(result.pinned);
+      setSpotSignals(await agentsApi.spotSignals());
+    });
+
+  const unpinSpotMarket = (symbol: string) =>
+    void run("spot-unpin", async () => {
+      const result = await agentsApi.unpinSpotMarket(symbol);
+      setSpotPinned(result.pinned);
+    });
+
+  const rescoutSpot = () =>
+    void run("spot-rescout", async () => {
+      await agentsApi.rescoutSpot();
+      setSpotCandidates(await agentsApi.spotCandidates());
       setSpotSignals(await agentsApi.spotSignals());
     });
 
@@ -494,11 +508,13 @@ function App() {
         <SpotView
           signals={spotSignals.signals}
           updatedAt={spotSignals.updatedAt}
-          watchlist={spotWatchlist}
-          available={markets}
-          marketsError={marketsError}
-          onSave={saveSpotWatchlist}
-          busy={busy === "spot-watchlist"}
+          candidates={spotCandidates.markets}
+          candidatesUpdatedAt={spotCandidates.updatedAt}
+          pinned={spotPinned}
+          onPin={pinSpotMarket}
+          onUnpin={unpinSpotMarket}
+          onRescout={rescoutSpot}
+          busy={busy?.startsWith("spot-") ?? false}
         />
       </>
     ),

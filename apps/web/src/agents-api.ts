@@ -208,6 +208,10 @@ export interface SpotSetupView {
 
 export interface SpotSignal {
   symbol: string;
+  pinned: boolean;
+  discovered: boolean;
+  volumeUsd24h: number | null;
+  priceChangePct24h: number | null;
   price: number | null;
   bias: string;
   status: string;
@@ -219,6 +223,13 @@ export interface SpotSignal {
   alternates: SpotSetupView[];
   news: { title: string; url: string; source: string; sentiment: string; publishedAt: number }[];
   updatedAt: number;
+}
+
+export interface CexMarketStat {
+  symbol: string;
+  priceUsd: number;
+  quoteVolume24hUsd: number;
+  priceChangePct24h: number;
 }
 
 export const agentsApi = {
@@ -244,11 +255,12 @@ export const agentsApi = {
   news: () => request<NewsResult>("/api/news"),
   setCapital: (amount: number) =>
     request<{ total: number }>("/api/capital", { method: "POST", body: JSON.stringify({ amount }) }),
-  spotWatchlist: () => request<{ symbols: string[] }>("/api/spot/watchlist"),
-  setSpotWatchlist: (symbols: string[]) =>
-    request<{ symbols: string[]; error?: string }>("/api/spot/watchlist", {
-      method: "PUT",
-      body: JSON.stringify({ symbols }),
-    }),
+  spotCandidates: () => request<{ markets: CexMarketStat[]; updatedAt: number | null }>("/api/spot/candidates"),
+  rescoutSpot: () => request<{ markets: CexMarketStat[] }>("/api/spot/candidates", { method: "POST" }),
+  spotPinned: () => request<{ pinned: string[] }>("/api/spot/pinned"),
+  pinSpotMarket: (symbol: string) =>
+    request<{ pinned: string[]; error?: string }>("/api/spot/pinned", { method: "POST", body: JSON.stringify({ symbol }) }),
+  unpinSpotMarket: (symbol: string) =>
+    request<{ pinned: string[] }>(`/api/spot/pinned/${encodeURIComponent(symbol)}`, { method: "DELETE" }),
   spotSignals: () => request<{ signals: SpotSignal[]; updatedAt: number | null }>("/api/spot/signals"),
 };

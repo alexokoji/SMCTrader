@@ -123,6 +123,91 @@ describe("discovery", () => {
     expect(stored.candidates).toHaveLength(1);
     expect(stored.updatedAt).toBe(NOW);
   });
+
+  it("keeps existing candidates when every chain fails, instead of wiping them", async () => {
+    // Exactly what happened in production: GeckoTerminal 429'd every chain
+    // at once. A discover() that just wrote the result through would have
+    // erased a working candidate list with an empty one.
+    const storage = memoryStorage();
+    let failing = false;
+    const defi = new DeFiRuntime(storage, {
+      fetchFn: (async (input: string | URL) => {
+        if (failing) return new Response("", { status: 429 });
+        return geckoStubFetch()(input as never);
+      }) as unknown as typeof fetch,
+      encryptionKey: generateEncryptionKey(),
+    });
+
+    const first = await defi.discover(NOW);
+    expect(first.candidates).toHaveLength(1);
+
+    failing = true;
+    const HOUR = 3_600_000;
+    const second = await defi.discover(NOW + 6 * HOUR);
+
+    expect(second.candidates).toHaveLength(1);
+    expect(second.candidates[0]!.symbol).toBe("ethereum:0xpool1");
+    expect(second.chainErrors.length).toBeGreaterThan(0);
+
+    const stored = await defi.getCandidates();
+    expect(stored.candidates).toHaveLength(1);
+    // The successful timestamp is preserved, not bumped by the failed
+    // attempt — a failure must not be mistaken for fresh data.
+    expect(stored.updatedAt).toBe(NOW);
+  });
+
+  it("leaves updatedAt null on a first-ever discovery that fails completely, so callers keep retrying", async () => {
+    const storage = memoryStorage();
+    const defi = new DeFiRuntime(storage, {
+      fetchFn: (async () => new Response("", { status: 429 })) as unknown as typeof fetch,
+      encryptionKey: generateEncryptionKey(),
+    });
+
+    const result = await defi.discover(NOW);
+    expect(result.candidates).toHaveLength(0);
+
+    const stored = await defi.getCandidates();
+    expect(stored.updatedAt).toBeNull();
+  });
+
+  it("throttles an automatic retry within the cooldown window, returning cached data", async () => {
+    const storage = memoryStorage();
+    let calls = 0;
+    const defi = new DeFiRuntime(storage, {
+      fetchFn: (async (input: string | URL) => {
+        calls++;
+        return geckoStubFetch()(input as never);
+      }) as unknown as typeof fetch,
+      encryptionKey: generateEncryptionKey(),
+    });
+
+    await defi.discover(NOW);
+    const callsAfterFirst = calls;
+
+    const second = await defi.discover(NOW + 60_000); // 1 minute later — inside the cooldown
+    expect(calls).toBe(callsAfterFirst); // no new network calls were made
+    expect(second.throttled).toBe(true);
+    expect(second.candidates).toHaveLength(1); // cached data is still returned
+  });
+
+  it("an explicit forced re-scout bypasses the cooldown", async () => {
+    const storage = memoryStorage();
+    let calls = 0;
+    const defi = new DeFiRuntime(storage, {
+      fetchFn: (async (input: string | URL) => {
+        calls++;
+        return geckoStubFetch()(input as never);
+      }) as unknown as typeof fetch,
+      encryptionKey: generateEncryptionKey(),
+    });
+
+    await defi.discover(NOW);
+    const callsAfterFirst = calls;
+
+    const second = await defi.discover(NOW + 60_000, { force: true });
+    expect(calls).toBeGreaterThan(callsAfterFirst);
+    expect(second.throttled).toBeUndefined();
+  });
 });
 
 describe("saving a scouted pool", () => {

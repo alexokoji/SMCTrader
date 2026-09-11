@@ -43,6 +43,13 @@ import { TradingRuntime, type RuntimeStorage } from "./runtime.js";
 const MAX_SAVED_POOLS = 15;
 const AUTO_CANDIDATES_PER_TICK = 3;
 const ENTRY_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+/** Minimum gap between discovery attempts, success or failure. The 15-minute
+ * staleness check below decides *whether* a retry is due; this decides how
+ * often "due" is allowed to actually try again — without it, a sustained
+ * rate limit (GeckoTerminal has 429'd every chain at once in production)
+ * turns every subsequent tick into another attempt, compounding the very
+ * rate limit it is failing on. */
+const MIN_DISCOVERY_RETRY_MS = 5 * 60_000;
 
 /**
  * The automated bot only executes against Uniswap-V2-style routers (see
@@ -194,15 +201,61 @@ export class DeFiRuntime {
 
   // ---- discovery -----------------------------------------------------
 
-  async discover(now = Date.now()): Promise<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[] }> {
+  /**
+   * `force: true` bypasses the retry cooldown — used only by an explicit,
+   * user-initiated re-scout, where a deliberate click should always attempt
+   * rather than silently doing nothing. Every automatic trigger (a page
+   * loading for the first time, the alarm's own entry-scouting cadence)
+   * leaves it off, so a sustained rate limit does not turn each of those
+   * into another attempt that compounds the limit it is already failing on.
+   */
+  async discover(
+    now = Date.now(),
+    opts: { force?: boolean } = {},
+  ): Promise<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[]; throttled?: boolean }> {
+    if (!opts.force) {
+      const lastAttempt = await this.storage.get<number>("defiLastDiscoveryAttempt");
+      if (lastAttempt && now - lastAttempt < MIN_DISCOVERY_RETRY_MS) {
+        const cached = await this.getCandidates();
+        return { candidates: cached.candidates, chainErrors: cached.chainErrors, throttled: true };
+      }
+    }
+
     const result = await this.scout.discover({ now, limit: 20 });
-    await this.storage.put({ defiCandidates: { ...result, updatedAt: now } });
+
+    // Every chain failing at once — GeckoTerminal rate-limiting all of them
+    // simultaneously has happened in production — is a total outage of this
+    // attempt, not "nothing is trading right now." Writing it through would
+    // wipe a working candidate list with an empty one and reset the staleness
+    // clock, so the next attempt would wait a further 15 minutes despite this
+    // one having found nothing. The previous good candidates are kept; only
+    // the errors (surfaced to the UI) and the attempt time change.
+    if (result.candidates.length === 0 && result.chainErrors.length > 0) {
+      const previous = await this.getCandidates();
+      // `updatedAt` stays exactly what it was — null if this account has
+      // never had a successful discovery, so the "never discovered yet"
+      // callers below keep retrying rather than being told a failure counts
+      // as an up-to-date (empty) result.
+      await this.storage.put({
+        defiCandidates: { candidates: previous.candidates, updatedAt: previous.updatedAt, chainErrors: result.chainErrors },
+        defiLastDiscoveryAttempt: now,
+      });
+      console.warn(JSON.stringify({
+        event: "defi_discovery_all_chains_failed",
+        chainErrors: result.chainErrors,
+        keptCandidates: previous.candidates.length,
+        timestamp: now,
+      }));
+      return { candidates: previous.candidates, chainErrors: result.chainErrors };
+    }
+
+    await this.storage.put({ defiCandidates: { ...result, updatedAt: now }, defiLastDiscoveryAttempt: now });
     return result;
   }
 
   async getCandidates(): Promise<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }> {
     return (
-      (await this.storage.get<{ candidates: ScoutCandidate[]; updatedAt: number; chainErrors: { chain: ChainId; reason: string }[] }>(
+      (await this.storage.get<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }>(
         "defiCandidates",
       )) ?? { candidates: [], updatedAt: null, chainErrors: [] }
     );

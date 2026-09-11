@@ -249,8 +249,8 @@ export class TradingSession extends DurableObject<Env> {
     return this.defiRuntimeInstance;
   }
 
-  async discoverDeFiPools(): Promise<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[] }> {
-    return this.defi().discover();
+  async discoverDeFiPools(opts: { force?: boolean } = {}): Promise<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[]; throttled?: boolean }> {
+    return this.defi().discover(Date.now(), opts);
   }
 
   async getDeFiCandidates(): Promise<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }> {
@@ -1419,8 +1419,11 @@ export default {
       return json(request, env, result);
     }
     if (url.pathname === "/api/defi/candidates" && request.method === "POST") {
-      // Manual re-scout on demand, rather than waiting for the next alarm.
-      return json(request, env, await session.discoverDeFiPools());
+      // Manual re-scout on demand, rather than waiting for the next alarm. A
+      // deliberate click bypasses the retry cooldown that protects automatic
+      // triggers, since it is a one-off, not a loop that could compound a
+      // rate limit.
+      return json(request, env, await session.discoverDeFiPools({ force: true }));
     }
     if (url.pathname === "/api/defi/saved" && request.method === "GET") {
       return json(request, env, { saved: await session.getDeFiSaved() });

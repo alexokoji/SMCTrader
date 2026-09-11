@@ -61,6 +61,10 @@ function CandidateRow({ candidate, saved, onSave }: { candidate: ScoutCandidate;
       <div className="defi-candidate-main">
         <b>{candidate.baseSymbol}</b>
         <ChainBadge chain={candidate.network} dex={candidate.dex} />
+        <span className="chain-badge" title={candidate.source === "dexscreener" ? "Found via a boosted/submitted listing, then verified against the same safety filters" : "Found by organic trading-activity ranking"}>
+          {candidate.source === "dexscreener" ? "dexscreener" : "geckoterminal"}
+        </span>
+        {candidate.fromNews && <span className="chain-badge" title="Named in a recent headline, then verified against the same safety filters">in the news</span>}
       </div>
       <div className="defi-candidate-meta">
         <span>{priceOf(candidate.priceUsd)}</span>
@@ -232,6 +236,7 @@ export function DeFiView({
   candidates,
   candidatesUpdatedAt,
   chainErrors,
+  sourceErrors,
   saved,
   signals,
   signalsUpdatedAt,
@@ -251,6 +256,7 @@ export function DeFiView({
   candidates: ScoutCandidate[];
   candidatesUpdatedAt: number | null;
   chainErrors: { chain: ChainId; reason: string }[];
+  sourceErrors: { source: string; reason: string }[];
   saved: string[];
   signals: DeFiSignal[];
   signalsUpdatedAt: number | null;
@@ -280,12 +286,18 @@ export function DeFiView({
           <button onClick={onRescout}>Re-scout now</button>
         </div>
         <p className="helper">
-          Swept from every registered chain's trending pools {ago(candidatesUpdatedAt)} — nothing
-          here was typed in. Save any pool to keep the full analysis engine watching it below.
+          Swept from GeckoTerminal and DexScreener across every registered chain {ago(candidatesUpdatedAt)}
+          — nothing here was typed in. Save any pool to keep the full analysis engine watching it below.
         </p>
         {chainErrors.length > 0 && (
           <p className="helper bad">
-            Could not scout: {chainErrors.map((e) => `${e.chain} (${e.reason})`).join(", ")}
+            GeckoTerminal unreachable: {chainErrors.map((e) => `${e.chain} (${e.reason})`).join(", ")}
+            {sourceErrors.length === 0 && " — DexScreener candidates below still came through."}
+          </p>
+        )}
+        {sourceErrors.length > 0 && (
+          <p className="helper bad">
+            DexScreener unreachable: {sourceErrors.map((e) => `${e.source} (${e.reason})`).join(", ")}
           </p>
         )}
         {candidates.length === 0 ? (

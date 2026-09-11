@@ -1,6 +1,6 @@
 /**
- * DexScreener client — live pair metadata, used as a second source rather
- * than the price history source.
+ * DexScreener client — live pair metadata, used both as a second source and
+ * as the fallback discovery path when GeckoTerminal is unavailable.
  *
  * The free API returns a current snapshot only (no OHLCV), so it cannot feed
  * the trend engine — that is GeckoTerminal's job (see `geckoterminal.ts`).
@@ -9,6 +9,15 @@
  * indexers agree exists with a real, matching price — a pool this endpoint
  * has never heard of is a reason for caution, not proof of anything on its
  * own, but it is a second data point that costs nothing to check.
+ *
+ * `latestBoosts`/`latestProfiles` are how this client finds candidates
+ * without a search query — but both are self-submitted or paid-promotion
+ * lists, not an organic ranking, so nothing in this file trusts them as a
+ * signal of quality. They are only ever used as a source of addresses to
+ * verify: `Scout` (in `scout.ts`) runs every address they surface through
+ * `getTokens` and the same liquidity/volume/age filters a GeckoTerminal
+ * candidate has to clear. A boosted token that turns out to be a thin,
+ * fresh pool is filtered out exactly like any other.
  */
 
 const BASE_URL = "https://api.dexscreener.com";
@@ -86,5 +95,43 @@ export class DexScreenerClient {
     const data = (await response.json()) as { pairs: DexScreenerPair[] | null };
     const pair = data.pairs?.[0];
     return pair ? toDexPair(pair) : null;
+  }
+
+  /**
+   * Every trading pair DexScreener knows for a set of token addresses on one
+   * chain — up to 30 addresses per call, so a whole batch of candidate leads
+   * is verified in a single request rather than one each.
+   */
+  async getTokens(chainId: string, tokenAddresses: string[]): Promise<DexPair[]> {
+    if (tokenAddresses.length === 0) return [];
+    const url = `${BASE_URL}/tokens/v1/${chainId}/${tokenAddresses.slice(0, 30).join(",")}`;
+    const response = await this.fetchFn(url, { signal: AbortSignal.timeout(this.timeoutMs) });
+    if (!response.ok) throw new Error(`DexScreener token lookup returned HTTP ${response.status}`);
+    const data = (await response.json()) as DexScreenerPair[] | null;
+    return (data ?? []).map(toDexPair);
+  }
+
+  /**
+   * Recently boosted (paid-promotion) and self-submitted token profiles,
+   * across every chain DexScreener covers — not ranked by trading activity,
+   * only by recency/spend. Used purely as a list of addresses to check, per
+   * the class comment above; never trust `totalAmount` or list order as a
+   * quality signal.
+   */
+  async latestBoosts(): Promise<{ chainId: string; tokenAddress: string }[]> {
+    return this.addressList("/token-boosts/latest/v1");
+  }
+
+  async latestProfiles(): Promise<{ chainId: string; tokenAddress: string }[]> {
+    return this.addressList("/token-profiles/latest/v1");
+  }
+
+  private async addressList(path: string): Promise<{ chainId: string; tokenAddress: string }[]> {
+    const response = await this.fetchFn(`${BASE_URL}${path}`, { signal: AbortSignal.timeout(this.timeoutMs) });
+    if (!response.ok) throw new Error(`DexScreener ${path} returned HTTP ${response.status}`);
+    const data = (await response.json()) as { chainId?: string; tokenAddress?: string }[] | null;
+    return (data ?? [])
+      .filter((item) => Boolean(item.chainId && item.tokenAddress))
+      .map((item) => ({ chainId: item.chainId!, tokenAddress: item.tokenAddress! }));
   }
 }

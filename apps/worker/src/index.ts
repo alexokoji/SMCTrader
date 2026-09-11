@@ -249,11 +249,21 @@ export class TradingSession extends DurableObject<Env> {
     return this.defiRuntimeInstance;
   }
 
-  async discoverDeFiPools(opts: { force?: boolean } = {}): Promise<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[]; throttled?: boolean }> {
+  async discoverDeFiPools(opts: { force?: boolean } = {}): Promise<{
+    candidates: ScoutCandidate[];
+    chainErrors: { chain: ChainId; reason: string }[];
+    sourceErrors: { source: string; reason: string }[];
+    throttled?: boolean;
+  }> {
     return this.defi().discover(Date.now(), opts);
   }
 
-  async getDeFiCandidates(): Promise<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }> {
+  async getDeFiCandidates(): Promise<{
+    candidates: ScoutCandidate[];
+    updatedAt: number | null;
+    chainErrors: { chain: ChainId; reason: string }[];
+    sourceErrors: { source: string; reason: string }[];
+  }> {
     return this.defi().getCandidates();
   }
 

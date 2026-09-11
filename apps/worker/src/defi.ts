@@ -39,6 +39,8 @@ import {
   type ScoutCandidate,
 } from "@smc/core";
 import { TradingRuntime, type RuntimeStorage } from "./runtime.js";
+import { fetchNews } from "./news.js";
+import { extractCashtags } from "./spot.js";
 
 const MAX_SAVED_POOLS = 15;
 const AUTO_CANDIDATES_PER_TICK = 3;
@@ -212,16 +214,46 @@ export class DeFiRuntime {
   async discover(
     now = Date.now(),
     opts: { force?: boolean } = {},
-  ): Promise<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[]; throttled?: boolean }> {
+  ): Promise<{
+    candidates: ScoutCandidate[];
+    chainErrors: { chain: ChainId; reason: string }[];
+    sourceErrors: { source: string; reason: string }[];
+    throttled?: boolean;
+  }> {
     if (!opts.force) {
       const lastAttempt = await this.storage.get<number>("defiLastDiscoveryAttempt");
       if (lastAttempt && now - lastAttempt < MIN_DISCOVERY_RETRY_MS) {
         const cached = await this.getCandidates();
-        return { candidates: cached.candidates, chainErrors: cached.chainErrors, throttled: true };
+        return { candidates: cached.candidates, chainErrors: cached.chainErrors, sourceErrors: cached.sourceErrors, throttled: true };
       }
     }
 
     const result = await this.scout.discover({ now, limit: 20 });
+
+    // A cashtag in a recent headline, resolved to a real pool and safety-
+    // filtered exactly like any other candidate — see `discoverFromSymbols`
+    // in the core Scout. Best-effort: a news lookup failing costs only the
+    // extra candidates it might have added, not the discovery pass itself.
+    try {
+      const news = await fetchNews([], { fetchFn: this.fetchFn });
+      const cashtags = extractCashtags(news.items).slice(0, 8);
+      if (cashtags.length > 0) {
+        const newsCandidates = await this.scout.discoverFromSymbols(cashtags, { now });
+        const seen = new Set(result.candidates.map((c) => c.symbol));
+        for (const candidate of newsCandidates) {
+          if (!seen.has(candidate.symbol)) {
+            result.candidates.push(candidate);
+            seen.add(candidate.symbol);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: "defi_news_lookup_failed",
+        reason: error instanceof Error ? error.message : String(error),
+        timestamp: now,
+      }));
+    }
 
     // Every chain failing at once — GeckoTerminal rate-limiting all of them
     // simultaneously has happened in production — is a total outage of this
@@ -237,27 +269,36 @@ export class DeFiRuntime {
       // callers below keep retrying rather than being told a failure counts
       // as an up-to-date (empty) result.
       await this.storage.put({
-        defiCandidates: { candidates: previous.candidates, updatedAt: previous.updatedAt, chainErrors: result.chainErrors },
+        defiCandidates: { candidates: previous.candidates, updatedAt: previous.updatedAt, chainErrors: result.chainErrors, sourceErrors: result.sourceErrors },
         defiLastDiscoveryAttempt: now,
       });
       console.warn(JSON.stringify({
         event: "defi_discovery_all_chains_failed",
         chainErrors: result.chainErrors,
+        sourceErrors: result.sourceErrors,
         keptCandidates: previous.candidates.length,
         timestamp: now,
       }));
-      return { candidates: previous.candidates, chainErrors: result.chainErrors };
+      return { candidates: previous.candidates, chainErrors: result.chainErrors, sourceErrors: result.sourceErrors };
     }
 
     await this.storage.put({ defiCandidates: { ...result, updatedAt: now }, defiLastDiscoveryAttempt: now });
     return result;
   }
 
-  async getCandidates(): Promise<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }> {
+  async getCandidates(): Promise<{
+    candidates: ScoutCandidate[];
+    updatedAt: number | null;
+    chainErrors: { chain: ChainId; reason: string }[];
+    sourceErrors: { source: string; reason: string }[];
+  }> {
     return (
-      (await this.storage.get<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }>(
-        "defiCandidates",
-      )) ?? { candidates: [], updatedAt: null, chainErrors: [] }
+      (await this.storage.get<{
+        candidates: ScoutCandidate[];
+        updatedAt: number | null;
+        chainErrors: { chain: ChainId; reason: string }[];
+        sourceErrors: { source: string; reason: string }[];
+      }>("defiCandidates")) ?? { candidates: [], updatedAt: null, chainErrors: [], sourceErrors: [] }
     );
   }
 

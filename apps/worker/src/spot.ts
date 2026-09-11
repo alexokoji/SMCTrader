@@ -14,6 +14,13 @@
  * market they want kept in view regardless of its ranking; a pin is additive
  * to discovery, never a requirement for it.
  *
+ * A market can also arrive via the news: a cashtag ($TICKER) in a recent
+ * headline is checked against the same bulk exchange stats, with a much
+ * lower volume floor than the ranked list — a genuinely newsworthy pair is
+ * not always one of the most liquid ones yet. It still has to be a real,
+ * tradeable, non-stablecoin pair that has not moved too far in 24h; being in
+ * the news earns a lower bar, not an exemption from having one.
+ *
  * This exists because an agent commits capital the moment its analysis clears
  * the bar; a trader who wants to place spot orders themselves, by hand, on
  * their own exchange account, needs the analysis without the commitment.
@@ -62,6 +69,9 @@ export interface SpotSignal {
   /** Where this market came from this tick: ranked by the screener, kept in
    * view only because it was pinned, or both. */
   discovered: boolean;
+  /** True when this market would not have ranked on volume alone and was
+   * added because a recent headline named it. */
+  newsSource: boolean;
   volumeUsd24h: number | null;
   priceChangePct24h: number | null;
   price: number | null;
@@ -129,6 +139,19 @@ function lastCloseOf(tick: AnalysisTick): number | null {
   return null;
 }
 
+/** Cashtag mentions ($TICKER) in recent headlines — a common convention for
+ * naming a specific token in crypto journalism, and the one pattern that can
+ * be pulled from free text without a predefined universe to check against. */
+const CASHTAG_RE = /\$([A-Za-z]{2,10})\b/g;
+
+export function extractCashtags(items: { title: string }[]): string[] {
+  const found = new Set<string>();
+  for (const item of items) {
+    for (const match of item.title.matchAll(CASHTAG_RE)) found.add(match[1]!.toUpperCase());
+  }
+  return [...found];
+}
+
 function newsFor(symbol: string, items: NewsItem[]): SpotSignal["news"] {
   return items
     .filter((item) => item.symbols.includes(symbol))
@@ -162,9 +185,25 @@ export class SpotSignalRuntime {
   // ---- discovery -----------------------------------------------------
 
   async discover(now = Date.now()): Promise<CexMarketStat[]> {
-    const top = await this.screener.topMarkets({ limit: DISCOVERY_COUNT });
-    await this.storage.put({ spotCandidates: { markets: top, updatedAt: now } });
+    const { top } = await this.discoverWithStats(now);
     return top;
+  }
+
+  /**
+   * Fetches the bulk exchange stats exactly once and returns both the ranked
+   * top markets and the full unfiltered set — so a caller that also needs to
+   * verify a couple of news-mentioned symbols this same tick (see `tickAll`)
+   * does not pay for a second three-exchange round trip to get it. Calling
+   * `allStats()` again after this already burned that budget once is what
+   * pushed a production tick over Cloudflare's per-invocation subrequest
+   * ceiling — confirmed in a tail immediately after this was first shipped
+   * without the reuse.
+   */
+  private async discoverWithStats(now: number): Promise<{ top: CexMarketStat[]; all: CexMarketStat[] }> {
+    const all = await this.screener.allStats();
+    const top = await this.screener.topMarkets({ stats: all, limit: DISCOVERY_COUNT });
+    await this.storage.put({ spotCandidates: { markets: top, updatedAt: now } });
+    return { top, all };
   }
 
   async getCandidates(): Promise<{ markets: CexMarketStat[]; updatedAt: number | null }> {
@@ -214,21 +253,28 @@ export class SpotSignalRuntime {
   async tickAll(now = Date.now()): Promise<SpotSignal[]> {
     const [pinned, cachedCandidates] = await Promise.all([this.getPinned(), this.getCandidates()]);
     let markets = cachedCandidates.markets;
+    // Freshly-fetched full stats, kept only for this tick, so the
+    // news-verification step below can reuse them instead of fetching the
+    // bulk exchange data a second time — see `discoverWithStats`.
+    let freshStats: CexMarketStat[] | undefined;
     if (!cachedCandidates.updatedAt || now - cachedCandidates.updatedAt > 15 * 60_000) {
-      markets = await this.discover(now).catch((error) => {
-        console.warn(JSON.stringify({
-          event: "spot_discovery_failed",
-          reason: error instanceof Error ? error.message : String(error),
-          timestamp: now,
-        }));
-        return markets;
-      });
+      await this.discoverWithStats(now)
+        .then((result) => {
+          markets = result.top;
+          freshStats = result.all;
+        })
+        .catch((error) => {
+          console.warn(JSON.stringify({
+            event: "spot_discovery_failed",
+            reason: error instanceof Error ? error.message : String(error),
+            timestamp: now,
+          }));
+        });
     }
 
     const byStat = new Map(markets.map((m) => [m.symbol, m]));
     const discoveredSymbols = markets.map((m) => m.symbol);
-    const symbols = [...new Set([...discoveredSymbols, ...pinned])].slice(0, MAX_ANALYSED_MARKETS);
-    if (symbols.length === 0) return [];
+    let symbols = [...new Set([...discoveredSymbols, ...pinned])];
 
     const previous = (await this.getSignals()).signals;
     const byPrevious = new Map(previous.map((s) => [s.symbol, s]));
@@ -236,6 +282,36 @@ export class SpotSignalRuntime {
     const news = await fetchNews(symbols, { fetchFn: this.fetchFn }).catch(
       () => ({ items: [] as NewsItem[], unavailable: true, fetchedAt: now, sources: [] }),
     );
+
+    // News-driven extra candidates: a cashtag not already covered, verified
+    // as a real tradeable pair before it is trusted. Reuses this tick's
+    // discovery stats when they were just fetched; a bulk-stats call is only
+    // made from scratch when discovery was a cache hit and a headline still
+    // names something new — never both a discovery fetch and a verification
+    // fetch in the same tick, which is what pushed a tick over Cloudflare's
+    // subrequest ceiling in production before this reuse existed.
+    const newsSymbols = new Set<string>();
+    const newCashtags = extractCashtags(news.items)
+      .map((t) => `${t}USDT`)
+      .filter((s) => !symbols.includes(s));
+    if (newCashtags.length > 0) {
+      try {
+        const all = freshStats ?? (await this.screener.allStats());
+        for (const stat of this.screener.bySymbol(all, newCashtags).slice(0, 5)) {
+          byStat.set(stat.symbol, stat);
+          newsSymbols.add(stat.symbol);
+          symbols.push(stat.symbol);
+        }
+      } catch (error) {
+        console.warn(JSON.stringify({
+          event: "spot_news_lookup_failed",
+          reason: error instanceof Error ? error.message : String(error),
+          timestamp: now,
+        }));
+      }
+    }
+    symbols = symbols.slice(0, MAX_ANALYSED_MARKETS);
+    if (symbols.length === 0) return [];
 
     const results: SpotSignal[] = [];
     for (const symbol of symbols) {
@@ -265,6 +341,7 @@ export class SpotSignalRuntime {
           symbol,
           pinned: pinned.includes(symbol),
           discovered: discoveredSymbols.includes(symbol),
+          newsSource: newsSymbols.has(symbol),
           volumeUsd24h: stat?.quoteVolume24hUsd ?? null,
           priceChangePct24h: stat?.priceChangePct24h ?? null,
           price: stat?.priceUsd ?? lastCloseOf(tick),

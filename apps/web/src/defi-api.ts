@@ -24,6 +24,13 @@ export interface ScoutCandidate {
   priceChangePct24h: number;
   fdvUsd: number | null;
   turnoverRatio: number;
+  /** "geckoterminal" (organic, activity-ranked) or "dexscreener" (a boosted
+   * or self-submitted listing, re-verified against the same safety filters
+   * before it ever reaches here — see the core Scout module for why). */
+  source: "geckoterminal" | "dexscreener";
+  /** True when this candidate would not have been found by ordinary
+   * discovery and was added because a recent headline named it. */
+  fromNews?: boolean;
 }
 
 export interface DeFiSetupView {
@@ -101,8 +108,19 @@ export interface DeFiActivityEvent {
 }
 
 export const defiApi = {
-  candidates: () => request<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }>("/api/defi/candidates"),
-  rescout: () => request<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[] }>("/api/defi/candidates", { method: "POST" }),
+  candidates: () =>
+    request<{
+      candidates: ScoutCandidate[];
+      updatedAt: number | null;
+      chainErrors: { chain: ChainId; reason: string }[];
+      sourceErrors: { source: string; reason: string }[];
+    }>("/api/defi/candidates"),
+  rescout: () =>
+    request<{
+      candidates: ScoutCandidate[];
+      chainErrors: { chain: ChainId; reason: string }[];
+      sourceErrors: { source: string; reason: string }[];
+    }>("/api/defi/candidates", { method: "POST" }),
   saved: () => request<{ saved: string[] }>("/api/defi/saved"),
   save: (symbol: string) => request<{ saved: string[]; error?: string }>("/api/defi/saved", { method: "POST", body: JSON.stringify({ symbol }) }),
   unsave: (symbol: string) => request<{ saved: string[] }>(`/api/defi/saved/${encodeURIComponent(symbol)}`, { method: "DELETE" }),

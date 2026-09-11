@@ -210,6 +210,7 @@ export interface SpotSignal {
   symbol: string;
   pinned: boolean;
   discovered: boolean;
+  newsSource: boolean;
   volumeUsd24h: number | null;
   priceChangePct24h: number | null;
   price: number | null;

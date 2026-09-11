@@ -82,4 +82,62 @@ describe("DexScreenerClient", () => {
     const client = new DexScreenerClient({ fetchFn: stubFetch({}) });
     expect(await client.getPair("ethereum", "0xdeadbeef")).toBeNull();
   });
+
+  it("batch-verifies token addresses via the tokens/v1 endpoint", async () => {
+    const fixture = [SINGLE_PAIR_FIXTURE.pairs[0]];
+    const client = new DexScreenerClient({
+      fetchFn: stubFetch({ "/tokens/v1/ethereum": fixture }),
+    });
+    const pairs = await client.getTokens("ethereum", ["0x6982508145454ce325ddbe47a25d4ec3d2311933"]);
+    expect(pairs).toHaveLength(1);
+    expect(pairs[0]!.baseToken.symbol).toBe("PEPE");
+  });
+
+  it("caps a token batch at 30 addresses", async () => {
+    let requestedUrl = "";
+    const fetchFn = (async (input: string | URL) => {
+      requestedUrl = String(input);
+      return new Response("[]", { status: 200 });
+    }) as unknown as typeof fetch;
+    const client = new DexScreenerClient({ fetchFn });
+    const addresses = Array.from({ length: 40 }, (_, i) => `0xtoken${i}`);
+    await client.getTokens("ethereum", addresses);
+    const requestedAddresses = requestedUrl.split("/").pop()!.split(",");
+    expect(requestedAddresses).toHaveLength(30);
+  });
+
+  it("returns an empty array without a request when given no addresses", async () => {
+    let called = false;
+    const client = new DexScreenerClient({
+      fetchFn: (async () => { called = true; return new Response("[]"); }) as unknown as typeof fetch,
+    });
+    expect(await client.getTokens("ethereum", [])).toEqual([]);
+    expect(called).toBe(false);
+  });
+
+  it("parses the latest boosted-token address list", async () => {
+    const client = new DexScreenerClient({
+      fetchFn: stubFetch({
+        "/token-boosts/latest/v1": [
+          { chainId: "ethereum", tokenAddress: "0xabc", totalAmount: 500 },
+          { chainId: "solana", tokenAddress: "sol123" },
+          { chainId: "robinhood" }, // no tokenAddress — dropped
+        ],
+      }),
+    });
+    const boosts = await client.latestBoosts();
+    expect(boosts).toEqual([
+      { chainId: "ethereum", tokenAddress: "0xabc" },
+      { chainId: "solana", tokenAddress: "sol123" },
+    ]);
+  });
+
+  it("parses the latest submitted token-profile address list", async () => {
+    const client = new DexScreenerClient({
+      fetchFn: stubFetch({
+        "/token-profiles/latest/v1": [{ chainId: "base", tokenAddress: "0xdef" }],
+      }),
+    });
+    expect(await client.latestProfiles()).toEqual([{ chainId: "base", tokenAddress: "0xdef" }]);
+  });
 });

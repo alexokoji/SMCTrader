@@ -118,6 +118,7 @@ function SignalCard({ signal, onPin, onUnpin }: { signal: SpotSignal; onPin: (sy
         )}
         {signal.discovered && !signal.pinned && <span className="chain-badge">discovered</span>}
         {signal.pinned && <span className="chain-badge">pinned</span>}
+        {signal.newsSource && <span className="chain-badge" title="Named in a recent headline, then verified as a real, liquid pair">in the news</span>}
       </div>
 
       {signal.warming ? (

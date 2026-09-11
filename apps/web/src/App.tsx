@@ -101,10 +101,16 @@ function App() {
   });
   const [spotPinned, setSpotPinned] = useState<string[]>([]);
 
-  const [defiCandidates, setDefiCandidates] = useState<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }>({
+  const [defiCandidates, setDefiCandidates] = useState<{
+    candidates: ScoutCandidate[];
+    updatedAt: number | null;
+    chainErrors: { chain: ChainId; reason: string }[];
+    sourceErrors: { source: string; reason: string }[];
+  }>({
     candidates: [],
     updatedAt: null,
     chainErrors: [],
+    sourceErrors: [],
   });
   const [defiSaved, setDefiSaved] = useState<string[]>([]);
   const [defiSignals, setDefiSignals] = useState<{ signals: DeFiSignal[]; updatedAt: number | null }>({ signals: [], updatedAt: null });
@@ -529,6 +535,7 @@ function App() {
             candidates={defiCandidates.candidates}
             candidatesUpdatedAt={defiCandidates.updatedAt}
             chainErrors={defiCandidates.chainErrors}
+            sourceErrors={defiCandidates.sourceErrors}
             saved={defiSaved}
             signals={defiSignals.signals}
             signalsUpdatedAt={defiSignals.updatedAt}

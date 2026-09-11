@@ -551,3 +551,69 @@ describe("manageOpenPositions / attemptEntries split", () => {
     expect(positions[0]!.status).toBe("CLOSED");
   });
 });
+
+describe("news-driven candidates", () => {
+  it("resolves a cashtag from a headline into a discovered candidate", async () => {
+    const searchFixture = {
+      data: [{
+        id: "eth_0xnewspool",
+        type: "pool",
+        attributes: {
+          address: "0xnewspool",
+          name: "NEWSCOIN / WETH",
+          base_token_price_usd: "2",
+          fdv_usd: "8000000",
+          market_cap_usd: "8000000",
+          price_change_percentage: { h1: "3", h24: "6" },
+          volume_usd: { h24: "300000" },
+          reserve_in_usd: "200000",
+          pool_created_at: new Date(NOW - 30 * 24 * 3_600_000).toISOString(),
+        },
+        relationships: {
+          base_token: { data: { id: "eth_newsbase", type: "token" } },
+          quote_token: { data: { id: "eth_newsquote", type: "token" } },
+          dex: { data: { id: "uniswap_v2", type: "dex" } },
+        },
+      }],
+      included: [
+        { id: "eth_newsbase", type: "token", attributes: { address: "0xnewsbase", symbol: "NEWSCOIN", name: "NewsCoin", decimals: 18 } },
+        { id: "eth_newsquote", type: "token", attributes: { address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", symbol: "WETH", name: "Wrapped Ether", decimals: 18 } },
+      ],
+    };
+
+    const fetchFn = (async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === "www.coindesk.com") {
+        return new Response(
+          "<rss><channel><item><title>$NEWSCOIN surges on listing news</title><link>https://x/1</link></item></channel></rss>",
+          { status: 200 },
+        );
+      }
+      if (url.pathname === "/api/v2/search/pools") {
+        return new Response(JSON.stringify(searchFixture), { status: 200 });
+      }
+      return geckoStubFetch()(input as never);
+    }) as unknown as typeof fetch;
+
+    const defi = new DeFiRuntime(memoryStorage(), { fetchFn, encryptionKey: generateEncryptionKey() });
+    const result = await defi.discover(NOW);
+
+    const newsCandidate = result.candidates.find((c) => c.baseSymbol === "NEWSCOIN");
+    expect(newsCandidate).toBeDefined();
+    expect(newsCandidate!.fromNews).toBe(true);
+  });
+
+  it("a news-lookup failure costs nothing beyond the extra candidates it might have found", async () => {
+    const fetchFn = (async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname === "www.coindesk.com") throw new Error("feed down");
+      return geckoStubFetch()(input as never);
+    }) as unknown as typeof fetch;
+
+    const defi = new DeFiRuntime(memoryStorage(), { fetchFn, encryptionKey: generateEncryptionKey() });
+    const result = await defi.discover(NOW);
+
+    // The ordinary GeckoTerminal/DexScreener discovery still succeeds.
+    expect(result.candidates.length).toBeGreaterThan(0);
+  });
+});

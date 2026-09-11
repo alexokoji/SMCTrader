@@ -77,6 +77,32 @@ function runtime(discoveredSymbols?: string[]) {
   return { storage, spot: new SpotSignalRuntime(storage, { fetchFn: stubFetch(NOW, discoveredSymbols) }) };
 }
 
+/** Extends `stubFetch` with an RSS response carrying a cashtag, and a bulk
+ * stats response that includes every symbol in `allSymbols` — the news path
+ * needs both: something to extract a ticker from, and something to verify
+ * it against. */
+function stubFetchWithNews(now: number, allSymbols: { symbol: string; volume?: number }[], headline: string): typeof fetch {
+  return (async (input: string | URL) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v3/ticker/24hr") {
+      return new Response(
+        JSON.stringify(allSymbols.map((s) => binanceRow(s.symbol, { volume: s.volume }))),
+        { status: 200 },
+      );
+    }
+    if (url.hostname === "www.coindesk.com") {
+      return new Response(
+        `<rss><channel><item><title>${headline}</title><link>https://x/1</link><pubDate>Wed, 20 Aug 2026 08:00:00 GMT</pubDate></item></channel></rss>`,
+        { status: 200 },
+      );
+    }
+    if (!url.pathname.includes("klines") && !url.hostname.includes("binance")) {
+      return new Response("", { status: 503 }); // other news feeds: unavailable
+    }
+    return stubFetch(now, allSymbols.map((s) => s.symbol))(input as never);
+  }) as unknown as typeof fetch;
+}
+
 describe("discovery", () => {
   it("discovers markets by 24h volume without anything typed in", async () => {
     const { spot } = runtime(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
@@ -198,5 +224,92 @@ describe("spot signals", () => {
     const keys = [...storage.data.keys()];
     expect(keys.some((k) => k.startsWith("engine:spot:"))).toBe(true);
     expect(keys).not.toContain("engine:BTCUSDT");
+  });
+});
+
+describe("news-driven discovery", () => {
+  it("fetches bulk exchange stats only once per tick, even when discovery is stale and a headline names something new", async () => {
+    // Two 3-exchange bulk fetches (discovery, then news verification) in the
+    // same tick was exactly what pushed a production tick over Cloudflare's
+    // per-invocation subrequest ceiling. This asserts the fix: one bulk
+    // fetch per exchange per tick, reused for both purposes.
+    let statsCalls = 0;
+    const storage = memoryStorage();
+    const spot = new SpotSignalRuntime(storage, {
+      fetchFn: (async (input: string | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/api/v3/ticker/24hr") statsCalls++;
+        return stubFetchWithNews(
+          NOW,
+          [{ symbol: "BTCUSDT", volume: 900_000_000 }, { symbol: "SOLUSDT", volume: 5_000_000 }],
+          "$SOL rallies",
+        )(input as never);
+      }) as unknown as typeof fetch,
+    });
+
+    await spot.tickAll(NOW);
+
+    expect(statsCalls).toBe(1);
+  });
+
+  it("adds a market a headline named, even though it would not have ranked by volume alone", async () => {
+    const storage = memoryStorage();
+    const spot = new SpotSignalRuntime(storage, {
+      fetchFn: stubFetchWithNews(
+        NOW,
+        [
+          { symbol: "BTCUSDT", volume: 900_000_000 }, // discovered by volume
+          { symbol: "SOLUSDT", volume: 5_000_000 }, // too small to rank, but news-eligible
+        ],
+        "$SOL rallies on new partnership news",
+      ),
+    });
+
+    const signals = await spot.tickAll(NOW);
+    const sol = signals.find((s) => s.symbol === "SOLUSDT");
+
+    expect(sol).toBeDefined();
+    expect(sol!.newsSource).toBe(true);
+    expect(sol!.discovered).toBe(false);
+    const btc = signals.find((s) => s.symbol === "BTCUSDT");
+    expect(btc!.newsSource).toBe(false);
+  });
+
+  it("does not add a cashtag mention that fails the reduced news volume floor", async () => {
+    const storage = memoryStorage();
+    const spot = new SpotSignalRuntime(storage, {
+      fetchFn: stubFetchWithNews(
+        NOW,
+        [
+          { symbol: "BTCUSDT", volume: 900_000_000 },
+          { symbol: "TINYUSDT", volume: 1_000 }, // far below even the news floor
+        ],
+        "$TINY surges 40%",
+      ),
+    });
+
+    const signals = await spot.tickAll(NOW);
+    expect(signals.find((s) => s.symbol === "TINYUSDT")).toBeUndefined();
+  });
+
+  it("does not add a cashtag for a symbol that is not a real tradeable pair", async () => {
+    const storage = memoryStorage();
+    const spot = new SpotSignalRuntime(storage, {
+      fetchFn: stubFetchWithNews(NOW, [{ symbol: "BTCUSDT", volume: 900_000_000 }], "$NOTREAL is trending"),
+    });
+
+    const signals = await spot.tickAll(NOW);
+    expect(signals.map((s) => s.symbol)).not.toContain("NOTREALUSDT");
+  });
+
+  it("does not re-add a cashtag for a market already discovered or pinned", async () => {
+    const storage = memoryStorage();
+    const spot = new SpotSignalRuntime(storage, {
+      fetchFn: stubFetchWithNews(NOW, [{ symbol: "BTCUSDT", volume: 900_000_000 }], "$BTC breaks new highs"),
+    });
+
+    const signals = await spot.tickAll(NOW);
+    // Exactly one BTCUSDT entry — not duplicated via the news path.
+    expect(signals.filter((s) => s.symbol === "BTCUSDT")).toHaveLength(1);
   });
 });

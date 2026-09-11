@@ -13,6 +13,16 @@ import {
 import { MarketPicker } from "./components/MarketPicker";
 import { LiveStatusPanel } from "./components/LiveStatus";
 import { SpotView } from "./components/SpotView";
+import { DeFiView } from "./components/DeFiView";
+import {
+  defiApi,
+  type ChainId,
+  type DeFiActivityEvent,
+  type DeFiAutoConfig,
+  type DeFiPosition,
+  type DeFiSignal,
+  type ScoutCandidate,
+} from "./defi-api";
 import {
   AgentsView,
   ConditionsView,
@@ -22,7 +32,7 @@ import {
   money,
 } from "./components/AgentViews";
 
-type Page = "agents" | "spot" | "portfolio" | "trades" | "conditions" | "news";
+type Page = "agents" | "spot" | "defi" | "portfolio" | "trades" | "conditions" | "news";
 type Theme = "dark" | "light";
 
 /**
@@ -41,6 +51,7 @@ function readStoredTheme(): Theme {
 const nav: Array<[Page, string, string]> = [
   ["agents", "◉", "Agents"],
   ["spot", "◈", "Spot signals"],
+  ["defi", "⬡", "DeFi spot"],
   ["portfolio", "◫", "Portfolio"],
   ["trades", "▤", "Trades"],
   ["conditions", "⌁", "Market conditions"],
@@ -84,6 +95,18 @@ function App() {
     updatedAt: null,
   });
   const [spotWatchlist, setSpotWatchlist] = useState<string[]>([]);
+
+  const [defiCandidates, setDefiCandidates] = useState<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }>({
+    candidates: [],
+    updatedAt: null,
+    chainErrors: [],
+  });
+  const [defiSaved, setDefiSaved] = useState<string[]>([]);
+  const [defiSignals, setDefiSignals] = useState<{ signals: DeFiSignal[]; updatedAt: number | null }>({ signals: [], updatedAt: null });
+  const [defiWallet, setDefiWallet] = useState<string | null>(null);
+  const [defiAutoConfig, setDefiAutoConfigState] = useState<DeFiAutoConfig | null>(null);
+  const [defiPositions, setDefiPositions] = useState<DeFiPosition[]>([]);
+  const [defiActivity, setDefiActivity] = useState<DeFiActivityEvent[]>([]);
 
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -183,6 +206,82 @@ function App() {
       setSpotWatchlist(result.symbols);
       setNotice("Watchlist updated.");
       setSpotSignals(await agentsApi.spotSignals());
+    });
+
+  // DeFi: discovery and saved-pool analysis are polled only while the page is
+  // open. Wallet, config, positions and activity are cheap and loaded once
+  // the page opens, then refreshed on the same interval.
+  useEffect(() => {
+    if (!user || page !== "defi") return;
+    const load = () => {
+      void defiApi.candidates().then(setDefiCandidates).catch(() => undefined);
+      void defiApi.saved().then((r) => setDefiSaved(r.saved)).catch(() => undefined);
+      void defiApi.signals().then(setDefiSignals).catch(() => undefined);
+      void defiApi.walletAddress().then((r) => setDefiWallet(r.address)).catch(() => undefined);
+      void defiApi.autoConfig().then(setDefiAutoConfigState).catch(() => undefined);
+      void defiApi.positions().then((r) => setDefiPositions(r.positions)).catch(() => undefined);
+      void defiApi.activity().then((r) => setDefiActivity(r.activity)).catch(() => undefined);
+    };
+    load();
+    const timer = setInterval(load, 30_000);
+    return () => clearInterval(timer);
+  }, [user, page]);
+
+  const saveDefiPool = (symbol: string) =>
+    void run("defi-save", async () => {
+      const result = await defiApi.save(symbol);
+      if (result.error) throw new Error(result.error);
+      setDefiSaved(result.saved);
+      setDefiSignals(await defiApi.signals());
+    });
+
+  const unsaveDefiPool = (symbol: string) =>
+    void run("defi-unsave", async () => {
+      const result = await defiApi.unsave(symbol);
+      setDefiSaved(result.saved);
+    });
+
+  const rescoutDefi = () =>
+    void run("defi-rescout", async () => {
+      await defiApi.rescout();
+      setDefiCandidates(await defiApi.candidates());
+    });
+
+  const createDefiWallet = async () => {
+    const result = await defiApi.createWallet();
+    if (!("error" in result)) {
+      setDefiWallet(result.address);
+      setDefiAutoConfigState(await defiApi.autoConfig());
+      setNotice("Wallet created. Save the private key shown — it will not be shown again.");
+    } else {
+      setError(result.error);
+    }
+    return result;
+  };
+
+  const importDefiWallet = (privateKey: string) =>
+    void run("defi-import-wallet", async () => {
+      const result = await defiApi.importWallet(privateKey);
+      if (result.error) throw new Error(result.error);
+      setDefiWallet(result.address);
+      setDefiAutoConfigState(await defiApi.autoConfig());
+      setNotice("Wallet imported.");
+    });
+
+  const removeDefiWallet = () =>
+    void run("defi-remove-wallet", async () => {
+      await defiApi.removeWallet();
+      setDefiWallet(null);
+      setDefiAutoConfigState(await defiApi.autoConfig());
+      setNotice("Wallet removed. Automated trading is disabled.");
+    });
+
+  const saveDefiAutoConfig = (patch: Partial<DeFiAutoConfig>) =>
+    void run("defi-auto-config", async () => {
+      const result = await defiApi.setAutoConfig(patch);
+      if (result.error) throw new Error(result.error);
+      setDefiAutoConfigState(result.config);
+      setNotice("Automated trading settings saved.");
     });
 
   useEffect(() => {
@@ -401,6 +500,36 @@ function App() {
           onSave={saveSpotWatchlist}
           busy={busy === "spot-watchlist"}
         />
+      </>
+    ),
+    defi: (
+      <>
+        <PageTitle
+          title="DeFi spot"
+          description="On-chain pools, discovered across every registered chain — save what you want to follow, or let the automated bot trade within its own limits."
+        />
+        {defiAutoConfig && (
+          <DeFiView
+            candidates={defiCandidates.candidates}
+            candidatesUpdatedAt={defiCandidates.updatedAt}
+            chainErrors={defiCandidates.chainErrors}
+            saved={defiSaved}
+            signals={defiSignals.signals}
+            signalsUpdatedAt={defiSignals.updatedAt}
+            onSave={saveDefiPool}
+            onUnsave={unsaveDefiPool}
+            onRescout={rescoutDefi}
+            walletAddress={defiWallet}
+            onCreateWallet={createDefiWallet}
+            onImportWallet={importDefiWallet}
+            onRemoveWallet={removeDefiWallet}
+            autoConfig={defiAutoConfig}
+            onSaveAutoConfig={saveDefiAutoConfig}
+            positions={defiPositions}
+            activity={defiActivity}
+            busy={busy?.startsWith("defi") ?? false}
+          />
+        )}
       </>
     ),
     portfolio: (

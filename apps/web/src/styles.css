@@ -318,6 +318,23 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .spot-news a.negative { color: var(--red); }
 .spot-news a.positive { color: var(--green); }
 
+/* ---- defi spot ---- */
+.chain-badge { padding: 3px 7px; border-radius: 5px; background: var(--surface-2); color: var(--muted); font: 8px "DM Mono", monospace; letter-spacing: .03em; white-space: nowrap; }
+.defi-candidate-list { display: flex; flex-direction: column; gap: 8px; }
+.defi-candidate { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.defi-candidate-main { display: flex; align-items: center; gap: 8px; }
+.defi-candidate-main b { color: var(--ink-strong); font: 12px "DM Mono", monospace; }
+.defi-candidate-meta { display: flex; flex-wrap: wrap; gap: 10px; color: var(--faint); font: 9px "DM Mono", monospace; margin-left: auto; }
+.defi-candidate button { margin-left: 8px; }
+.defi-wallet, .defi-wallet-setup { display: flex; flex-direction: column; gap: 10px; padding: 12px; margin: 10px 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.defi-wallet { flex-direction: row; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.defi-wallet code { display: block; margin-top: 2px; color: var(--ink); font: 10px "DM Mono", monospace; word-break: break-all; }
+.defi-key-reveal { display: block; margin: 10px 0; padding: 10px; border-radius: 6px; background: var(--surface-2); color: var(--ink); font: 11px "DM Mono", monospace; word-break: break-all; user-select: all; }
+.defi-position-list, .defi-activity-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.defi-position { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.defi-position.closed { opacity: .8; }
+.defi-activity-time { color: var(--faint); margin-right: 6px; }
+
 /* ---- responsive ---- */
 @media (max-width: 1180px) {
   main { padding: 26px; }

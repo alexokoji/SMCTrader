@@ -19,6 +19,14 @@ import {
 import { sendIngest } from "./ingest.js";
 import { AgentRuntime, defaultAgentConfig } from "./agents.js";
 import { SpotSignalRuntime, type SpotSignal } from "./spot.js";
+import {
+  DeFiRuntime,
+  type DeFiAutoConfig,
+  type DeFiActivityEvent,
+  type DeFiPosition,
+  type DeFiSignal,
+} from "./defi.js";
+import type { ChainId, ScoutCandidate } from "@smc/core";
 import { cautionSymbols, fetchNews, type NewsResult } from "./news.js";
 
 interface Env {
@@ -27,6 +35,9 @@ interface Env {
   WORKER_AUTH_SECRET?: string;
   /** Origin of the platform API that owns the MongoDB connection. */
   PLATFORM_API_URL?: string;
+  /** Encrypts every DeFi wallet private key at rest. Deliberately separate
+   * from WORKER_AUTH_SECRET — a leak of one must not compromise the other. */
+  DEFI_WALLET_ENCRYPTION_KEY?: string;
 }
 
 type RuntimeMode = "ANALYSIS_ONLY" | "PAPER" | "LIVE";
@@ -197,6 +208,120 @@ export class TradingSession extends DurableObject<Env> {
     } catch (error) {
       console.error(JSON.stringify({
         event: "spot_tick_failed",
+        message: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+      }));
+    }
+  }
+
+  // ---- defi ----------------------------------------------------------------
+
+  private defiRuntimeInstance?: DeFiRuntime;
+
+  /**
+   * On-chain DeFi trading, both the read-only scouted signals and the
+   * automated bot. Held on the instance so its engines stay warm, exactly
+   * like `agents()` and `spot()`. Never shares engine state with either.
+   */
+  private defi(): DeFiRuntime {
+    if (!this.defiRuntimeInstance) {
+      this.defiRuntimeInstance = new DeFiRuntime(
+        {
+          get: <T,>(key: string) => this.ctx.storage.get<T>(key),
+          put: (entries: Record<string, unknown>) => this.ctx.storage.put(entries),
+        },
+        { encryptionKey: this.env.DEFI_WALLET_ENCRYPTION_KEY },
+      );
+    }
+    return this.defiRuntimeInstance;
+  }
+
+  async discoverDeFiPools(): Promise<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[] }> {
+    return this.defi().discover();
+  }
+
+  async getDeFiCandidates(): Promise<{ candidates: ScoutCandidate[]; updatedAt: number | null; chainErrors: { chain: ChainId; reason: string }[] }> {
+    return this.defi().getCandidates();
+  }
+
+  async getDeFiSaved(): Promise<string[]> {
+    return this.defi().getSaved();
+  }
+
+  async saveDeFiPool(symbol: string): Promise<{ saved: string[]; error?: string }> {
+    return this.defi().save(symbol);
+  }
+
+  async unsaveDeFiPool(symbol: string): Promise<{ saved: string[] }> {
+    return this.defi().unsave(symbol);
+  }
+
+  async getDeFiSignals(): Promise<{ signals: DeFiSignal[]; updatedAt: number | null }> {
+    return this.defi().getManualSignals();
+  }
+
+  async createDeFiWallet(): Promise<{ address: string; privateKey: string } | { error: string }> {
+    try {
+      return await this.defi().createWallet();
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Wallet creation failed." };
+    }
+  }
+
+  async importDeFiWallet(privateKey: string): Promise<{ address: string; error?: string }> {
+    try {
+      return await this.defi().importWallet(privateKey);
+    } catch (error) {
+      return { address: "", error: error instanceof Error ? error.message : "Wallet import failed." };
+    }
+  }
+
+  async removeDeFiWallet(): Promise<{ removed: boolean }> {
+    await this.defi().removeWallet();
+    return { removed: true };
+  }
+
+  async getDeFiWalletAddress(): Promise<{ address: string | null }> {
+    return { address: await this.defi().getWalletAddress() };
+  }
+
+  async getDeFiAutoConfig(): Promise<DeFiAutoConfig> {
+    return this.defi().getAutoConfig();
+  }
+
+  async setDeFiAutoConfig(patch: Partial<DeFiAutoConfig>): Promise<{ config: DeFiAutoConfig; error?: string }> {
+    return this.defi().setAutoConfig(patch);
+  }
+
+  async getDeFiPositions(): Promise<DeFiPosition[]> {
+    return this.defi().getPositions();
+  }
+
+  async getDeFiActivity(): Promise<DeFiActivityEvent[]> {
+    return this.defi().getActivity();
+  }
+
+  /**
+   * Advance the manual saved-pool analysis and the automated bot. Failures
+   * are contained exactly like `tickAgents`/`tickSpot`: a bad chain, RPC, or
+   * feed outage must not stop the alarm loop the rest of the account
+   * depends on.
+   */
+  async tickDeFi(): Promise<void> {
+    try {
+      await this.defi().tickSaved();
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "defi_saved_tick_failed",
+        message: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+      }));
+    }
+    try {
+      await this.defi().tickAuto();
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "defi_auto_tick_failed",
         message: error instanceof Error ? error.message : String(error),
         timestamp: Date.now(),
       }));
@@ -498,7 +623,13 @@ export class TradingSession extends DurableObject<Env> {
       // per-invocation subrequest ceiling in production. Spot analysis waits
       // for a tick where nothing else is warming, so its own cold start gets
       // the budget to itself rather than fighting agents for it.
-      if (!agentsWarming) await this.tickSpot();
+      if (!agentsWarming) {
+        await this.tickSpot();
+        // DeFi discovery, saved-pool analysis and automated trading are their
+        // own round of chain calls on top of everything above; the same
+        // reasoning that gates tickSpot gates this.
+        await this.tickDeFi();
+      }
       nextDelay = agentsWarming ? WARMING_TICK_MS : STEADY_TICK_MS;
       // Provider probes are only useful at the steady cadence.
       if (nextDelay === STEADY_TICK_MS) await this.probeProviderHealth();
@@ -1218,6 +1349,73 @@ export default {
         ({ signals, updatedAt } = await session.getSpotSignals());
       }
       return json(request, env, { signals, updatedAt });
+    }
+
+    // ---- defi ----------------------------------------------------------
+    if (url.pathname === "/api/defi/candidates" && request.method === "GET") {
+      let result = await session.getDeFiCandidates();
+      if (result.updatedAt === null) {
+        await session.discoverDeFiPools();
+        result = await session.getDeFiCandidates();
+      }
+      return json(request, env, result);
+    }
+    if (url.pathname === "/api/defi/candidates" && request.method === "POST") {
+      // Manual re-scout on demand, rather than waiting for the next alarm.
+      return json(request, env, await session.discoverDeFiPools());
+    }
+    if (url.pathname === "/api/defi/saved" && request.method === "GET") {
+      return json(request, env, { saved: await session.getDeFiSaved() });
+    }
+    if (url.pathname === "/api/defi/saved" && request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as { symbol?: unknown };
+      if (typeof body.symbol !== "string") return json(request, env, { error: "A pool symbol is required." }, 400);
+      const result = await session.saveDeFiPool(body.symbol);
+      return json(request, env, result, result.error ? 400 : 200);
+    }
+    if (url.pathname.startsWith("/api/defi/saved/") && request.method === "DELETE") {
+      const symbol = decodeURIComponent(url.pathname.slice("/api/defi/saved/".length));
+      return json(request, env, await session.unsaveDeFiPool(symbol));
+    }
+    if (url.pathname === "/api/defi/signals" && request.method === "GET") {
+      let result = await session.getDeFiSignals();
+      if (result.updatedAt === null && (await session.getDeFiSaved()).length > 0) {
+        await session.tickDeFi();
+        result = await session.getDeFiSignals();
+      }
+      return json(request, env, result);
+    }
+    if (url.pathname === "/api/defi/wallet" && request.method === "GET") {
+      return json(request, env, await session.getDeFiWalletAddress());
+    }
+    if (url.pathname === "/api/defi/wallet" && request.method === "POST") {
+      // The private key in this response is shown to the trader exactly once
+      // — it is never retrievable again after this call returns.
+      const result = await session.createDeFiWallet();
+      return json(request, env, result, "error" in result ? 400 : 200);
+    }
+    if (url.pathname === "/api/defi/wallet/import" && request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as { privateKey?: unknown };
+      if (typeof body.privateKey !== "string") return json(request, env, { error: "A private key is required." }, 400);
+      const result = await session.importDeFiWallet(body.privateKey);
+      return json(request, env, result, result.error ? 400 : 200);
+    }
+    if (url.pathname === "/api/defi/wallet" && request.method === "DELETE") {
+      return json(request, env, await session.removeDeFiWallet());
+    }
+    if (url.pathname === "/api/defi/auto-config" && request.method === "GET") {
+      return json(request, env, await session.getDeFiAutoConfig());
+    }
+    if (url.pathname === "/api/defi/auto-config" && request.method === "PATCH") {
+      const body = (await request.json().catch(() => ({}))) as Partial<DeFiAutoConfig>;
+      const result = await session.setDeFiAutoConfig(body);
+      return json(request, env, result, result.error ? 400 : 200);
+    }
+    if (url.pathname === "/api/defi/positions" && request.method === "GET") {
+      return json(request, env, { positions: await session.getDeFiPositions() });
+    }
+    if (url.pathname === "/api/defi/activity" && request.method === "GET") {
+      return json(request, env, { activity: await session.getDeFiActivity() });
     }
     if (url.pathname === "/api/capital" && request.method === "POST") {
       const body = (await request.json().catch(() => ({}))) as { amount?: number };

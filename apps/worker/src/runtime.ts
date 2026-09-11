@@ -29,6 +29,7 @@ import {
   type SymbolAnalysis,
   type Timeframe,
   type TradingMode,
+  type MarketDataProvider,
 } from "@smc/core";
 
 /** Candles retained per timeframe. Bounds both storage and replay cost. */
@@ -134,7 +135,7 @@ const TF_MS = TIMEFRAME_DURATION_MS;
 
 export class TradingRuntime {
   private readonly storage: RuntimeStorage;
-  private readonly marketData: MultiExchangeMarketData;
+  private readonly marketData: MarketDataProvider;
   private readonly symbols = new Map<string, SymbolState>();
   private lastProvider = "unknown";
 
@@ -148,15 +149,24 @@ export class TradingRuntime {
 
   constructor(
     storage: RuntimeStorage,
-    opts: { fetchFn?: typeof fetch; hydrationBudget?: number; namespace?: string } = {},
+    opts: {
+      fetchFn?: typeof fetch;
+      hydrationBudget?: number;
+      namespace?: string;
+      /** Overrides the default exchange-backed provider — used by DeFi spot
+       * to point this same engine at on-chain pool data instead. */
+      marketData?: MarketDataProvider;
+    } = {},
   ) {
     this.storage = storage;
     this.hydrationBudget = opts.hydrationBudget ?? HYDRATION_BUDGET;
     this.namespace = opts.namespace ?? "";
-    this.marketData = new MultiExchangeMarketData({
-      fetchFn: opts.fetchFn,
-      timeoutMs: 8_000,
-    });
+    this.marketData =
+      opts.marketData ??
+      new MultiExchangeMarketData({
+        fetchFn: opts.fetchFn,
+        timeoutMs: 8_000,
+      });
   }
 
   get provider(): string {

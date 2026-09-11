@@ -63,3 +63,13 @@ export * from "./analytics/performance.js";
 export * from "./agents/types.js";
 export * from "./agents/regime.js";
 export * from "./agents/supervisor.js";
+
+// ---- defi ----
+export * from "./defi/chains.js";
+export * from "./defi/geckoterminal.js";
+export * from "./defi/dexscreener.js";
+export * from "./defi/market-data-adapter.js";
+export * from "./defi/scout.js";
+export * from "./defi/exit-policy.js";
+export * from "./defi/wallet-crypto.js";
+export * from "./defi/evm-wallet.js";

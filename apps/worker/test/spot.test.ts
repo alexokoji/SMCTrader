@@ -32,8 +32,30 @@ function binanceRow(symbol: string, overrides: Partial<{ price: number; volume: 
     symbol,
     lastPrice: String(overrides.price ?? 60_000),
     quoteVolume: String(overrides.volume ?? 500_000_000),
-    priceChangePercent: String(overrides.changePct ?? 2),
+    priceChangePercent: String(overrides.changePct ?? 10), // clears the default movement floor
   };
+}
+
+/** CoinGecko's market-cap join is required for a symbol to survive
+ * `topMarkets`'s legitimacy floor — every symbol these stubs discover needs
+ * a matching row here, or it is (correctly) filtered out as having no
+ * verifiable market cap. */
+function geckoRow(symbol: string, marketCapUsd = 500_000_000) {
+  return {
+    symbol: symbol.replace(/USDT$/, "").toLowerCase(),
+    market_cap: marketCapUsd,
+    total_volume: 500_000_000,
+    price_change_percentage_24h: 10,
+    current_price: 60_000,
+    market_cap_rank: 10,
+  };
+}
+
+function coingeckoResponse(input: string | URL, symbols: string[]): Response | null {
+  const url = new URL(String(input));
+  if (url.hostname !== "api.coingecko.com") return null;
+  const page = url.searchParams.get("page");
+  return new Response(JSON.stringify(page === "1" ? symbols.map((s) => geckoRow(s)) : []), { status: 200 });
 }
 
 /** A steady uptrend so at least one market reliably produces a valid setup,
@@ -44,6 +66,8 @@ function stubFetch(now: number, discoveredSymbols: string[] = ["BTCUSDT", "ETHUS
     if (url.pathname === "/api/v3/ticker/24hr") {
       return new Response(JSON.stringify(discoveredSymbols.map((s) => binanceRow(s))), { status: 200 });
     }
+    const gecko = coingeckoResponse(input, discoveredSymbols);
+    if (gecko) return gecko;
     if (!url.pathname.includes("klines") && !url.hostname.includes("binance")) {
       // News feeds and anything else: empty, unavailable response.
       return new Response("", { status: 503 });
@@ -78,10 +102,17 @@ function runtime(discoveredSymbols?: string[]) {
 }
 
 /** Extends `stubFetch` with an RSS response carrying a cashtag, and a bulk
- * stats response that includes every symbol in `allSymbols` — the news path
- * needs both: something to extract a ticker from, and something to verify
- * it against. */
-function stubFetchWithNews(now: number, allSymbols: { symbol: string; volume?: number }[], headline: string): typeof fetch {
+ * stats response that includes every symbol in `allSymbols`. Only symbols in
+ * `withMarketCap` get a CoinGecko row — a symbol left out of it cannot pass
+ * ordinary discovery (no verifiable market cap) but can still be found via
+ * the news path, which does not require one. Defaults to every symbol
+ * having a cap, for tests that are not exercising that distinction. */
+function stubFetchWithNews(
+  now: number,
+  allSymbols: { symbol: string; volume?: number }[],
+  headline: string,
+  withMarketCap: string[] = allSymbols.map((s) => s.symbol),
+): typeof fetch {
   return (async (input: string | URL) => {
     const url = new URL(String(input));
     if (url.pathname === "/api/v3/ticker/24hr") {
@@ -90,6 +121,8 @@ function stubFetchWithNews(now: number, allSymbols: { symbol: string; volume?: n
         { status: 200 },
       );
     }
+    const gecko = coingeckoResponse(input, withMarketCap);
+    if (gecko) return gecko;
     if (url.hostname === "www.coindesk.com") {
       return new Response(
         `<rss><channel><item><title>${headline}</title><link>https://x/1</link><pubDate>Wed, 20 Aug 2026 08:00:00 GMT</pubDate></item></channel></rss>`,
@@ -112,6 +145,20 @@ describe("discovery", () => {
     const stored = await spot.getCandidates();
     expect(stored.markets).toHaveLength(3);
     expect(stored.updatedAt).toBe(NOW);
+  });
+
+  it("does not cap discovery itself, even when it finds far more than get fully analysed", async () => {
+    // The whole point: showing only ~5 majors was the reported problem, and
+    // it traced back to discovery itself being capped. This asserts the
+    // fix at the layer where it actually lives — discovery — separately
+    // from the (still bounded, for cost reasons) full-analysis cap.
+    const many = Array.from({ length: 40 }, (_, i) => `TOK${i}USDT`);
+    const { spot } = runtime(many);
+    const markets = await spot.discover(NOW);
+    expect(markets).toHaveLength(40);
+
+    const stored = await spot.getCandidates();
+    expect(stored.markets).toHaveLength(40);
   });
 });
 
@@ -252,16 +299,17 @@ describe("news-driven discovery", () => {
     expect(statsCalls).toBe(1);
   });
 
-  it("adds a market a headline named, even though it would not have ranked by volume alone", async () => {
+  it("adds a market a headline named, even though it would not have qualified for ordinary discovery", async () => {
     const storage = memoryStorage();
     const spot = new SpotSignalRuntime(storage, {
       fetchFn: stubFetchWithNews(
         NOW,
         [
-          { symbol: "BTCUSDT", volume: 900_000_000 }, // discovered by volume
-          { symbol: "SOLUSDT", volume: 5_000_000 }, // too small to rank, but news-eligible
+          { symbol: "BTCUSDT", volume: 900_000_000 }, // discovered normally
+          { symbol: "SOLUSDT", volume: 5_000_000 }, // no market cap row below — news-eligible only
         ],
         "$SOL rallies on new partnership news",
+        ["BTCUSDT"], // only BTC gets a CoinGecko market-cap row
       ),
     });
 

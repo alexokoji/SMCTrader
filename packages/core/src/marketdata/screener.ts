@@ -7,15 +7,24 @@
  * instead pulls every USDT pair's 24h volume and price change in a single
  * request per exchange — Binance, Bybit and OKX each expose a bulk endpoint
  * that returns every symbol at once, so ranking the whole market costs one
- * call per exchange, not one per candidate — and ranks by liquidity, so what
- * a trader sees is whatever is actually most active right now.
+ * call per exchange, not one per candidate.
  *
  * All configured exchanges are queried, not "try one, fall back to the next
  * on failure": one exchange being rate-limited or down degrades coverage
  * instead of silently narrowing discovery to whichever exchange happened to
  * answer first, and a symbol only one exchange lists still gets found.
+ *
+ * Ranking is deliberately not "highest volume first": that ordering puts
+ * BTC and ETH at the top of every single scan, because they are always the
+ * most-traded pairs in absolute terms — and they are also, day to day, among
+ * the least volatile, which makes them a poor match for someone sizing a
+ * small position who needs the pair to actually move. Market cap is used as
+ * a legitimacy floor instead (a real, established coin, not a thinly-traded
+ * micro-cap), and the coins that clear it are ranked by how much they are
+ * moving relative to their own size — see `movementScore`.
  */
 import type { PublicExchange } from "./multi-exchange.js";
+import { CoinGeckoClient, type CoinGeckoMarket } from "./coingecko.js";
 
 export interface CexMarketStat {
   symbol: string;
@@ -26,6 +35,15 @@ export interface CexMarketStat {
    * several sources agreeing, which is itself a mark of a real, liquid pair
    * rather than one thin listing. */
   sources: PublicExchange[];
+  /** From CoinGecko; null when the coin was outside the fetched market-cap
+   * ranking (e.g. beyond the top 500) — `topMarkets` excludes these, since
+   * market cap is exactly the legitimacy signal it uses. */
+  marketCapUsd: number | null;
+  /** |24h % change| × (24h volume ÷ market cap) — rewards a coin that is
+   * both moving and seeing real activity relative to its size; a flat
+   * mega-cap and an illiquid pump both score low. Null wherever
+   * `marketCapUsd` is null, for the same reason. */
+  movementScore: number | null;
 }
 
 export interface ScreenerFilters {
@@ -34,11 +52,22 @@ export interface ScreenerFilters {
   /** A pair moving more than this in 24h is trading on momentum a spot
    * screen is not the read for; it is filtered rather than ranked highest. */
   maxPriceChangePct24h: number;
+  /** Below this in 24h movement, a coin is not worth showing regardless of
+   * size or liquidity — the entire point of ranking by movement is to leave
+   * out the pairs sitting still. */
+  minPriceChangePct24h: number;
+  /** The legitimacy floor: below this market cap, a coin is excluded from
+   * the ranked list regardless of how much it moved — a cheap way to keep a
+   * thinly-capitalized, easily-manipulated token off a list meant to surface
+   * real trading opportunities. */
+  minMarketCapUsd: number;
 }
 
 export const DEFAULT_SCREENER_FILTERS: ScreenerFilters = {
-  minQuoteVolume24hUsd: 20_000_000,
-  maxPriceChangePct24h: 40,
+  minQuoteVolume24hUsd: 2_000_000,
+  maxPriceChangePct24h: 60,
+  minPriceChangePct24h: 3,
+  minMarketCapUsd: 150_000_000,
 };
 
 /** Exchanges with a documented bulk "every symbol's 24h stats in one call"
@@ -60,6 +89,11 @@ function baseAssetOf(symbol: string): string {
 
 export function isTradeableBase(symbol: string): boolean {
   return !NON_TRADEABLE_BASES.has(baseAssetOf(symbol));
+}
+
+function movementScoreOf(stat: { quoteVolume24hUsd: number; priceChangePct24h: number }, marketCapUsd: number | null): number | null {
+  if (marketCapUsd === null || marketCapUsd <= 0) return null;
+  return Math.abs(stat.priceChangePct24h) * (stat.quoteVolume24hUsd / marketCapUsd);
 }
 
 interface BinanceTicker24h {
@@ -93,19 +127,23 @@ export class CexScreener {
   private readonly exchanges: PublicExchange[];
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly coingecko: CoinGeckoClient;
 
-  constructor(opts: { exchanges?: PublicExchange[]; fetchFn?: typeof fetch; timeoutMs?: number } = {}) {
+  constructor(opts: { exchanges?: PublicExchange[]; fetchFn?: typeof fetch; timeoutMs?: number; coingecko?: CoinGeckoClient } = {}) {
     this.exchanges = opts.exchanges?.length ? opts.exchanges.filter((e) => BULK_STATS_EXCHANGES.includes(e)) : BULK_STATS_EXCHANGES;
     this.fetchFn = opts.fetchFn ?? ((input, init) => globalThis.fetch(input, init));
     this.timeoutMs = Math.max(1_000, opts.timeoutMs ?? 10_000);
+    this.coingecko = opts.coingecko ?? new CoinGeckoClient({ fetchFn: opts.fetchFn, timeoutMs: this.timeoutMs });
   }
 
   /** Queries every configured exchange concurrently and merges the results
-   * by symbol; only throws if every one of them failed. */
-  private async fetchStats(): Promise<CexMarketStat[]> {
+   * by symbol; only throws if every one of them failed. Market cap is not
+   * joined in here — this is the raw exchange data `topMarkets` and
+   * `bySymbol` both build on. */
+  private async fetchStats(): Promise<Omit<CexMarketStat, "marketCapUsd" | "movementScore">[]> {
     const results = await Promise.allSettled(this.exchanges.map((ex) => this.statsFor(ex)));
 
-    const byExchange: { exchange: PublicExchange; rows: Omit<CexMarketStat, "sources">[] }[] = [];
+    const byExchange: { exchange: PublicExchange; rows: { symbol: string; priceUsd: number; quoteVolume24hUsd: number; priceChangePct24h: number }[] }[] = [];
     const failures: string[] = [];
     results.forEach((result, i) => {
       const exchange = this.exchanges[i]!;
@@ -120,7 +158,7 @@ export class CexScreener {
     // Merge by symbol: the reading with the highest reported volume wins
     // (exchanges report slightly different figures for the same pair), and
     // every exchange that listed the symbol is recorded.
-    const merged = new Map<string, CexMarketStat>();
+    const merged = new Map<string, Omit<CexMarketStat, "marketCapUsd" | "movementScore">>();
     for (const { exchange, rows } of byExchange) {
       for (const row of rows) {
         const existing = merged.get(row.symbol);
@@ -139,7 +177,7 @@ export class CexScreener {
     return [...merged.values()];
   }
 
-  private async statsFor(exchange: PublicExchange): Promise<Omit<CexMarketStat, "sources">[]> {
+  private async statsFor(exchange: PublicExchange): Promise<{ symbol: string; priceUsd: number; quoteVolume24hUsd: number; priceChangePct24h: number }[]> {
     const url =
       exchange === "binance"
         ? "https://api.binance.com/api/v3/ticker/24hr"
@@ -162,7 +200,7 @@ export class CexScreener {
           : (data as { data?: OkxTicker24h[] }).data ?? [];
     if (!Array.isArray(rows) || rows.length === 0) throw new Error("returned no tickers");
 
-    const stats: Omit<CexMarketStat, "sources">[] = [];
+    const stats: { symbol: string; priceUsd: number; quoteVolume24hUsd: number; priceChangePct24h: number }[] = [];
     for (const row of rows) {
       if (exchange === "binance") {
         const r = row as BinanceTicker24h;
@@ -197,41 +235,60 @@ export class CexScreener {
   }
 
   /**
-   * Every USDT pair currently active, unfiltered and unranked — the raw
-   * material `topMarkets` and `bySymbol` both work from. Exposed so a caller
-   * that needs both (rank by volume, and separately look a few specific
-   * symbols up) pays for the bulk fetch once instead of twice.
+   * Every USDT pair currently active, joined with CoinGecko market caps and
+   * unfiltered/unranked — the raw material `topMarkets` and `bySymbol` both
+   * work from. Exposed so a caller that needs both (rank the market, and
+   * separately look a few specific symbols up) pays for the bulk fetch once
+   * instead of twice. A CoinGecko outage does not fail this — every reading
+   * just carries a null market cap, which `topMarkets` then excludes.
    */
   async allStats(): Promise<CexMarketStat[]> {
-    return this.fetchStats();
+    const [stats, marketCaps] = await Promise.all([
+      this.fetchStats(),
+      this.coingecko.markets().catch((): CoinGeckoMarket[] => []),
+    ]);
+    const byBase = new Map(marketCaps.map((m) => [m.symbol, m]));
+    return stats.map((s) => {
+      const cap = byBase.get(baseAssetOf(s.symbol))?.marketCapUsd ?? null;
+      return { ...s, marketCapUsd: cap, movementScore: movementScoreOf(s, cap) };
+    });
   }
 
-  /** Every USDT pair currently active, ranked by 24h quote volume — the
-   * closest single number to "what is actually tradeable right now." */
+  /**
+   * Coins that clear the market-cap legitimacy floor, ranked by how much
+   * they are moving relative to their own size — not by raw volume, which
+   * only ever surfaces the same handful of megacaps (see the module
+   * comment). No result-count cap by default: everything that passes the
+   * filters is returned, since filtering out the wrong candidates is what
+   * keeps this list meaningful, not truncating a correctly-filtered one.
+   */
   async topMarkets(
     opts: { limit?: number; filters?: ScreenerFilters; stats?: CexMarketStat[] } = {},
   ): Promise<CexMarketStat[]> {
     const filters = opts.filters ?? DEFAULT_SCREENER_FILTERS;
-    const limit = opts.limit ?? 20;
-    const stats = opts.stats ?? (await this.fetchStats());
-    return stats
+    const stats = opts.stats ?? (await this.allStats());
+    const ranked = stats
       .filter(
         (s) =>
           isTradeableBase(s.symbol) &&
+          s.marketCapUsd !== null &&
+          s.marketCapUsd >= filters.minMarketCapUsd &&
           s.quoteVolume24hUsd >= filters.minQuoteVolume24hUsd &&
+          Math.abs(s.priceChangePct24h) >= filters.minPriceChangePct24h &&
           Math.abs(s.priceChangePct24h) <= filters.maxPriceChangePct24h,
       )
-      .sort((a, b) => b.quoteVolume24hUsd - a.quoteVolume24hUsd)
-      .slice(0, limit);
+      .sort((a, b) => (b.movementScore ?? 0) - (a.movementScore ?? 0));
+    return opts.limit !== undefined ? ranked.slice(0, opts.limit) : ranked;
   }
 
   /**
    * Look up specific symbols (e.g. ones a news headline just named) against
    * already-fetched stats, with a much lower volume floor than `topMarkets`
-   * — a pair worth surfacing because it is in the news right now is not
-   * always one of the most liquid pairs on the exchange, but it still has to
-   * be a real, tradeable, non-stablecoin USDT pair that has not moved so far
-   * in 24h that a spot read on it is unreliable.
+   * and no minimum-movement requirement — a pair worth surfacing because it
+   * is in the news right now is not always one of the most liquid or most
+   * volatile pairs on the exchange, but it still has to be a real,
+   * tradeable, non-stablecoin USDT pair that has not moved so far in 24h
+   * that a spot read on it is unreliable.
    */
   bySymbol(
     stats: CexMarketStat[],

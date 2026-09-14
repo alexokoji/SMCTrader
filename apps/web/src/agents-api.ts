@@ -231,6 +231,9 @@ export interface CexMarketStat {
   priceUsd: number;
   quoteVolume24hUsd: number;
   priceChangePct24h: number;
+  sources: string[];
+  marketCapUsd: number | null;
+  movementScore: number | null;
 }
 
 export const agentsApi = {

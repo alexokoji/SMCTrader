@@ -83,9 +83,44 @@ function SetupCard({ setup, muted = false }: { setup: SpotSetupView; muted?: boo
 }
 
 function usd(n: number): string {
+  if (n >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(2)}B`;
   if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `$${(n / 1_000).toFixed(0)}K`;
   return `$${n.toFixed(0)}`;
+}
+
+function CandidateRow({
+  candidate,
+  pinned,
+  analysed,
+  onPin,
+  onUnpin,
+}: {
+  candidate: CexMarketStat;
+  pinned: boolean;
+  analysed: boolean;
+  onPin: (symbol: string) => void;
+  onUnpin: (symbol: string) => void;
+}) {
+  return (
+    <div className="defi-candidate">
+      <div className="defi-candidate-main">
+        <b>{candidate.symbol}</b>
+        {candidate.marketCapUsd !== null && <span className="chain-badge">cap {usd(candidate.marketCapUsd)}</span>}
+        {analysed && <span className="chain-badge" title="Fully analysed below — entry, stop, targets and score">analysed</span>}
+      </div>
+      <div className="defi-candidate-meta">
+        <span>{priceOf(candidate.priceUsd)}</span>
+        <span>Vol {usd(candidate.quoteVolume24hUsd)}</span>
+        <span className={candidate.priceChangePct24h >= 0 ? "good" : "bad"}>
+          {candidate.priceChangePct24h >= 0 ? "+" : ""}{num(candidate.priceChangePct24h, 1)}% 24h
+        </span>
+      </div>
+      <button onClick={() => (pinned ? onUnpin(candidate.symbol) : onPin(candidate.symbol))}>
+        {pinned ? "Unpin" : "Pin"}
+      </button>
+    </div>
+  );
 }
 
 function SignalCard({ signal, onPin, onUnpin }: { signal: SpotSignal; onPin: (symbol: string) => void; onUnpin: (symbol: string) => void }) {
@@ -170,6 +205,8 @@ export function SpotView({
   onRescout: () => void;
   busy?: boolean;
 }) {
+  const analysedSymbols = new Set(signals.map((s) => s.symbol));
+
   return (
     <>
       <section className="card">
@@ -178,25 +215,49 @@ export function SpotView({
           <button disabled={busy} onClick={onRescout}>Re-scout now</button>
         </div>
         <p className="helper">
-          The top {candidates.length} USDT pairs by 24h volume, pulled fresh {ago(candidatesUpdatedAt)} —
-          nothing here was typed in. Pin a market below to keep it in view regardless of its ranking.
+          {candidates.length} high-market-cap pair{candidates.length === 1 ? "" : "s"} actually moving today,
+          pulled fresh {ago(candidatesUpdatedAt)} — ranked by movement relative to size, not raw volume, so this
+          is not just BTC and ETH every time. Nothing here was typed in; every one cleared a market-cap floor, a
+          minimum and maximum 24h move, and a volume floor. Pin any of them to keep it in view regardless of
+          ranking, and to guarantee it gets full analysis below.
         </p>
+        {candidates.length === 0 ? (
+          <div className="empty">
+            Nothing cleared the discovery filters on the last scout.
+            <p>Try re-scouting, or check back shortly — the market may simply be quiet right now.</p>
+          </div>
+        ) : (
+          <div className="defi-candidate-list">
+            {candidates.map((c) => (
+              <CandidateRow
+                key={c.symbol}
+                candidate={c}
+                pinned={pinned.includes(c.symbol)}
+                analysed={analysedSymbols.has(c.symbol)}
+                onPin={onPin}
+                onUnpin={onUnpin}
+              />
+            ))}
+          </div>
+        )}
       </section>
 
       <p className="helper spot-disclaimer">
-        This page never places an order. Every card is the same deterministic SMC analysis an
+        This page never places an order. Every card below is the same deterministic SMC analysis an
         agent uses, run continuously and read-only — the entry, stop, targets and expected move
-        are what the engine would trade if it were allowed to; the decision stays yours.
+        are what the engine would trade if it were allowed to; the decision stays yours. Only a bounded
+        number of discovered markets get this full analysis each tick — real per-symbol cost, not an
+        arbitrary limit — prioritised by movement, with pinned markets always included.
       </p>
 
       {signals.length === 0 ? (
         <div className="empty">
-          No markets cleared the volume floor on the last scout, and nothing is pinned.
-          <p>Try re-scouting, or check back shortly.</p>
+          Nothing has been fully analysed yet.
+          <p>Pin a market above, or wait for the next tick.</p>
         </div>
       ) : (
         <>
-          <p className="helper">Analysed {signals.length} market{signals.length === 1 ? "" : "s"} · last analysed {ago(updatedAt)} · {pinned.length} pinned</p>
+          <p className="helper">Fully analysed {signals.length} market{signals.length === 1 ? "" : "s"} · last analysed {ago(updatedAt)} · {pinned.length} pinned</p>
           <div className="spot-grid">
             {signals.map((signal) => <SignalCard key={signal.symbol} signal={signal} onPin={onPin} onUnpin={onUnpin} />)}
           </div>

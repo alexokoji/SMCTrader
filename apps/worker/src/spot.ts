@@ -35,10 +35,27 @@ import {
 import { TradingRuntime, type AnalysisTick, type RuntimeStorage } from "./runtime.js";
 import { fetchNews, type NewsItem } from "./news.js";
 
-/** Bounds total cost per tick: discovered markets plus pins, deduplicated. */
+/**
+ * Discovery itself has no cap — every market that clears the screener's
+ * filters is returned, since it costs nothing beyond the one bulk-stats
+ * fetch (now including a CoinGecko market-cap join) already being paid for
+ * regardless of how many symbols come back.
+ *
+ * The full SMC engine per symbol is a different cost entirely: each one
+ * needs its own candle history across three timeframes, which is real
+ * network work metered per tick. `MAX_ANALYSED_MARKETS` bounds that
+ * expensive half. It was tried at 25 alongside the CoinGecko join and
+ * brought back down after one production tail: subrequest failures went
+ * from 1 to 3 in a comparable window, confirmed each time as "Too many
+ * subrequests by single Worker invocation." The discovery list above is
+ * unaffected either way — that is what the actual complaint was about, and
+ * it stays fully uncapped regardless of where this number sits. Pinned
+ * markets are prioritised into this budget ahead of newly-discovered ones,
+ * since a pin is a promise this market stays fully analysed regardless of
+ * ranking.
+ */
 export const MAX_ANALYSED_MARKETS = 15;
 export const MAX_PINNED_MARKETS = 10;
-const DISCOVERY_COUNT = 10;
 
 export interface SpotSetupView {
   direction: string;
@@ -201,7 +218,10 @@ export class SpotSignalRuntime {
    */
   private async discoverWithStats(now: number): Promise<{ top: CexMarketStat[]; all: CexMarketStat[] }> {
     const all = await this.screener.allStats();
-    const top = await this.screener.topMarkets({ stats: all, limit: DISCOVERY_COUNT });
+    // No limit: every market clearing the filters is kept. This list is the
+    // full discovery surface shown in the UI; only a bounded slice of it (see
+    // MAX_ANALYSED_MARKETS in tickAll) gets the expensive full engine.
+    const top = await this.screener.topMarkets({ stats: all });
     await this.storage.put({ spotCandidates: { markets: top, updatedAt: now } });
     return { top, all };
   }
@@ -274,7 +294,10 @@ export class SpotSignalRuntime {
 
     const byStat = new Map(markets.map((m) => [m.symbol, m]));
     const discoveredSymbols = markets.map((m) => m.symbol);
-    let symbols = [...new Set([...discoveredSymbols, ...pinned])];
+    // Pinned markets are guaranteed a full-analysis slot ahead of newly
+    // discovered ones — a pin is a promise this market stays analysed
+    // regardless of where it ranks, and `markets` can now be a long list.
+    let symbols = [...new Set([...pinned, ...discoveredSymbols])];
 
     const previous = (await this.getSignals()).signals;
     const byPrevious = new Map(previous.map((s) => [s.symbol, s]));
@@ -300,7 +323,6 @@ export class SpotSignalRuntime {
         for (const stat of this.screener.bySymbol(all, newCashtags).slice(0, 5)) {
           byStat.set(stat.symbol, stat);
           newsSymbols.add(stat.symbol);
-          symbols.push(stat.symbol);
         }
       } catch (error) {
         console.warn(JSON.stringify({
@@ -310,7 +332,10 @@ export class SpotSignalRuntime {
         }));
       }
     }
-    symbols = symbols.slice(0, MAX_ANALYSED_MARKETS);
+    // Pinned first (guaranteed), then news-sourced (the entire point of
+    // surfacing one is defeated if a long discovered list pushes it out of
+    // the analysed slice), then discovered fills whatever is left.
+    symbols = [...new Set([...pinned, ...newsSymbols, ...symbols])].slice(0, MAX_ANALYSED_MARKETS);
     if (symbols.length === 0) return [];
 
     const results: SpotSignal[] = [];

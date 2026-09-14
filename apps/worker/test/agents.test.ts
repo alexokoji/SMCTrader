@@ -428,3 +428,39 @@ describe("daily reset", () => {
     expect((await agents.list())[0].status).toBe("ACTIVE");
   });
 });
+
+describe("subrequest ceiling", () => {
+  it("stops ticking further markets and agents once the ceiling is hit", async () => {
+    // Two agents, several markets each. The second market hit trips the
+    // ceiling; everything after it — the rest of that agent's markets, and
+    // the whole second agent — must never be attempted, since all of it
+    // would fail the identical way.
+    const symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT"];
+    const good = stubFetch(NOW);
+    let calls = 0;
+    const fetchFn = (async (input: string | URL) => {
+      const url = new URL(String(input));
+      calls++;
+      if (url.pathname.includes("klines") && url.searchParams.get("symbol") === "BBBUSDT") {
+        throw new Error("Too many subrequests by single Worker invocation.");
+      }
+      return good(input as never);
+    }) as unknown as typeof fetch;
+
+    const storage = memoryStorage();
+    const agents = new AgentRuntime(storage, { fetchFn });
+    await agents.create({ ...baseInput, id: "agent-1", name: "First", symbols }, 20_000);
+    await agents.create({ ...baseInput, id: "agent-2", name: "Second", symbols: ["ZZZUSDT"] }, 20_000);
+
+    const results = await agents.tickAll(NOW);
+
+    const first = results.find((r) => r.agentId === "agent-1")!;
+    const second = results.find((r) => r.agentId === "agent-2");
+    expect(first.ticks.map((t) => t.symbol)).toContain("AAAUSDT");
+    expect(first.ticks.map((t) => t.symbol)).not.toContain("CCCUSDT");
+    // The second agent's market shares the same doomed invocation — it was
+    // never reached at all.
+    expect(second?.ticks.map((t) => t.symbol) ?? []).not.toContain("ZZZUSDT");
+    expect(calls).toBeLessThan(15); // far less than a full 4-market, 3-timeframe pass
+  });
+});

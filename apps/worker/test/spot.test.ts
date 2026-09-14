@@ -361,3 +361,66 @@ describe("news-driven discovery", () => {
     expect(signals.filter((s) => s.symbol === "BTCUSDT")).toHaveLength(1);
   });
 });
+
+describe("subrequest ceiling", () => {
+  it("stops analysing further markets once the ceiling is hit, rather than trying every remaining one", async () => {
+    // Five discovered markets; the candle fetch for the second one hits the
+    // ceiling. Continuing to the third, fourth and fifth would each burn a
+    // call already known to be doomed — exactly what turned one ceiling hit
+    // into a cascade of failures in production.
+    const symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"];
+    let klineAttempts = 0;
+    const base = stubFetch(NOW, symbols);
+    const storage = memoryStorage();
+    const spot = new SpotSignalRuntime(storage, {
+      fetchFn: (async (input: string | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname.includes("klines")) {
+          klineAttempts++;
+          if (url.searchParams.get("symbol") === "BBBUSDT") {
+            throw new Error("Too many subrequests by single Worker invocation.");
+          }
+        }
+        return base(input as never);
+      }) as unknown as typeof fetch,
+    });
+
+    const signals = await spot.tickAll(NOW);
+
+    // AAA analysed, BBB failed on the ceiling, and the loop stopped —
+    // CCC/DDD/EEE were never attempted at all this tick, so total klines
+    // calls stay far below the ~15 a full 5-symbol/3-timeframe pass would
+    // otherwise cost.
+    expect(signals.map((s) => s.symbol)).toContain("AAAUSDT");
+    expect(signals.map((s) => s.symbol)).not.toContain("CCCUSDT");
+    expect(signals.map((s) => s.symbol)).not.toContain("DDDUSDT");
+    expect(signals.map((s) => s.symbol)).not.toContain("EEEUSDT");
+    expect(klineAttempts).toBeLessThan(10);
+  });
+
+  it("keeps a skipped market's last known signal rather than dropping it when the ceiling stops the loop early", async () => {
+    const symbols = ["AAAUSDT", "BBBUSDT"];
+    const storage = memoryStorage();
+    // First tick: both succeed normally, establishing a prior signal for BBB.
+    const good = new SpotSignalRuntime(storage, { fetchFn: stubFetch(NOW, symbols) });
+    const first = await good.tickAll(NOW);
+    expect(first.map((s) => s.symbol).sort()).toEqual(["AAAUSDT", "BBBUSDT"]);
+
+    // Second tick, same storage: AAA hits the ceiling immediately.
+    const base = stubFetch(NOW + HOUR, symbols);
+    const flaky = new SpotSignalRuntime(storage, {
+      fetchFn: (async (input: string | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname.includes("klines") && url.searchParams.get("symbol") === "AAAUSDT") {
+          throw new Error("Too many subrequests by single Worker invocation.");
+        }
+        return base(input as never);
+      }) as unknown as typeof fetch,
+    });
+    const second = await flaky.tickAll(NOW + HOUR);
+
+    // BBB was never attempted this tick (loop stopped at AAA), but its prior
+    // signal is still present rather than silently disappearing.
+    expect(second.map((s) => s.symbol)).toContain("BBBUSDT");
+  });
+});

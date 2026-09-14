@@ -29,6 +29,7 @@ import {
   CexScreener,
   DEFAULT_STRATEGY_CONFIG,
   classifyRegime,
+  isSubrequestCeilingError,
   type CexMarketStat,
   type StrategyConfig,
 } from "@smc/core";
@@ -392,6 +393,27 @@ export class SpotSignalRuntime {
           reason: error instanceof Error ? error.message : String(error),
           timestamp: now,
         }));
+        // Cloudflare's per-invocation subrequest ceiling was hit — every
+        // remaining symbol in this loop would fail the identical way, each
+        // spending what budget is left on a call already known to be
+        // doomed. Stop here; the rest keep whatever signal they already had
+        // (via byPrevious, above) rather than being wiped by a failure that
+        // was never actually about them.
+        if (isSubrequestCeilingError(error)) {
+          const remaining = symbols.slice(symbols.indexOf(symbol) + 1);
+          for (const skipped of remaining) {
+            const skippedPrior = byPrevious.get(skipped);
+            if (skippedPrior) results.push(skippedPrior);
+          }
+          console.warn(JSON.stringify({
+            event: "spot_tick_stopped_early",
+            reason: "subrequest ceiling reached",
+            analysed: results.length - remaining.filter((s) => byPrevious.has(s)).length,
+            skipped: remaining.length,
+            timestamp: now,
+          }));
+          break;
+        }
       }
     }
 

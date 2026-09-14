@@ -18,6 +18,7 @@ import {
   classifyRegime,
   computePerformance,
   dayKeyOf,
+  isSubrequestCeilingError,
   relaxAgent,
   reviewAgent,
   type AgentAdjustment,
@@ -346,8 +347,16 @@ export class AgentRuntime {
 
     let mutated = false;
     const next = [...agents];
+    // Once Cloudflare's per-invocation subrequest ceiling is hit, every
+    // remaining market — this agent's and every later agent's — would fail
+    // the identical way. Continuing to iterate only spends what budget is
+    // left on calls already known to be doomed, which is exactly what
+    // turned one ceiling hit into a cascade of failures in production
+    // before this flag existed.
+    let ceilingHit = false;
 
     for (const agent of active) {
+      if (ceilingHit) break;
       const symbols = byAgent.get(agent.id);
       if (!symbols?.length) continue;
 
@@ -415,6 +424,16 @@ export class AgentRuntime {
             reason: error instanceof Error ? error.message : String(error),
             timestamp: now,
           }));
+          if (isSubrequestCeilingError(error)) {
+            ceilingHit = true;
+            console.warn(JSON.stringify({
+              event: "agent_tick_stopped_early",
+              reason: "subrequest ceiling reached",
+              agent: agent.name,
+              timestamp: now,
+            }));
+            break;
+          }
         }
       }
 

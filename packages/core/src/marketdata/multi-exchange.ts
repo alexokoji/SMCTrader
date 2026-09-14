@@ -42,6 +42,11 @@ export class MultiExchangeMarketData implements MarketDataProvider {
         return await action(exchange);
       } catch (err) {
         failures.push(`${exchange}: ${describeError(err)}`);
+        // The ceiling is invocation-wide, not exchange-specific: if one
+        // exchange just hit it, every remaining one in this loop is about to
+        // fail the same way. Stop here rather than spending what is left of
+        // this invocation's budget on calls already known to be doomed.
+        if (isSubrequestCeilingError(err)) break;
       }
     }
     throw new Error(`Public market-data ${operation} unavailable across ${this.exchanges.join(", ")}. ${failures.join("; ")}`);
@@ -143,4 +148,22 @@ function describeError(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
   const cause = err instanceof Error && "cause" in err ? (err as Error & { cause?: { code?: string } }).cause : undefined;
   return cause?.code === "ENOTFOUND" || /ENOTFOUND|name could not be resolved/i.test(message) ? "DNS lookup failed" : message;
+}
+
+/**
+ * True when an error is Cloudflare's per-invocation subrequest ceiling, not
+ * an ordinary network failure. This distinction exists because the two call
+ * for opposite responses: an ordinary failure on one exchange is exactly
+ * what the fallback chain below exists to route around by trying the next
+ * one; a ceiling hit means every remaining exchange is doomed too — it is a
+ * property of the invocation, not of any one exchange — so trying them
+ * anyway only spends what budget is left on calls guaranteed to fail. That
+ * distinction was the actual cause behind repeated production incidents in
+ * this project: once the ceiling was hit partway through a tick, every
+ * subsequent symbol burned its full five-exchange fallback chain for
+ * nothing, turning one ceiling hit into hundreds of wasted, doomed calls.
+ */
+export function isSubrequestCeilingError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /too many subrequests/i.test(message);
 }

@@ -206,13 +206,22 @@ export interface SpotSetupView {
   createdAt: number;
 }
 
+export type ChainId = "ethereum" | "bsc" | "polygon" | "arbitrum" | "base";
+
 export interface SpotSignal {
   symbol: string;
+  network: ChainId;
+  poolAddress: string;
+  dex: string;
+  baseSymbol: string;
+  quoteSymbol: string;
   pinned: boolean;
   discovered: boolean;
   newsSource: boolean;
   volumeUsd24h: number | null;
+  liquidityUsd: number | null;
   priceChangePct24h: number | null;
+  fdvUsd: number | null;
   price: number | null;
   bias: string;
   status: string;
@@ -226,14 +235,24 @@ export interface SpotSignal {
   updatedAt: number;
 }
 
-export interface CexMarketStat {
+/** A pool the scout found — never typed in. Same shape DeFi spot's
+ * candidates use, since both pages read from the same scout. */
+export interface SpotCandidate {
   symbol: string;
+  network: ChainId;
+  poolAddress: string;
+  dex: string;
+  baseSymbol: string;
+  baseTokenAddress: string;
+  quoteSymbol: string;
   priceUsd: number;
-  quoteVolume24hUsd: number;
+  liquidityUsd: number;
+  volumeUsd24h: number;
   priceChangePct24h: number;
-  sources: string[];
-  marketCapUsd: number | null;
-  movementScore: number | null;
+  fdvUsd: number | null;
+  turnoverRatio: number;
+  source: "geckoterminal" | "dexscreener";
+  fromNews?: boolean;
 }
 
 export const agentsApi = {
@@ -259,8 +278,8 @@ export const agentsApi = {
   news: () => request<NewsResult>("/api/news"),
   setCapital: (amount: number) =>
     request<{ total: number }>("/api/capital", { method: "POST", body: JSON.stringify({ amount }) }),
-  spotCandidates: () => request<{ markets: CexMarketStat[]; updatedAt: number | null }>("/api/spot/candidates"),
-  rescoutSpot: () => request<{ markets: CexMarketStat[] }>("/api/spot/candidates", { method: "POST" }),
+  spotCandidates: () => request<{ markets: SpotCandidate[]; updatedAt: number | null }>("/api/spot/candidates"),
+  rescoutSpot: () => request<{ markets: SpotCandidate[] }>("/api/spot/candidates", { method: "POST" }),
   spotPinned: () => request<{ pinned: string[] }>("/api/spot/pinned"),
   pinSpotMarket: (symbol: string) =>
     request<{ pinned: string[]; error?: string }>("/api/spot/pinned", { method: "POST", body: JSON.stringify({ symbol }) }),

@@ -7,64 +7,79 @@
  * entry, stop, targets, the expected move to each, and why) and hands the
  * decision to the person looking at it.
  *
- * What markets it analyses is discovered, not typed in: every tick, the top
- * USDT pairs by 24h volume are pulled from a single bulk exchange call (see
- * `@smc/core`'s `CexScreener`) and analysed automatically — nothing has to be
- * added by hand for the page to show anything. A trader can still pin a
- * market they want kept in view regardless of its ranking; a pin is additive
- * to discovery, never a requirement for it.
+ * The market this page reads is on-chain (DEX pools), not exchange pairs —
+ * the same discovery engine and the same GeckoTerminal-backed analysis as the
+ * DeFi spot page (`defi.ts`), reused rather than duplicated. The two pages
+ * stay separate on purpose: this one auto-analyses the top discovered pools
+ * every tick with no save step, for a trader who wants a live read of
+ * whatever the scout is finding right now; DeFi spot requires a pool to be
+ * saved before it gets the full engine, and is also where automated
+ * execution against a wallet lives. Same underlying market, two different
+ * ways of watching it.
+ *
+ * What gets analysed is discovered, not typed in — every tick, every chain
+ * in the registry is scouted for pools trading inside the configured
+ * FDV/liquidity/volume range, and the top ones by turnover are analysed
+ * automatically. A trader can still pin a pool they want kept in view
+ * regardless of its ranking; a pin is additive to discovery, never a
+ * requirement for it. Pins are always chosen from the discovered list (see
+ * the frontend), never typed in freehand — a DEX pool has no memorable
+ * ticker, only a chain and an address.
  *
  * A market can also arrive via the news: a cashtag ($TICKER) in a recent
- * headline is checked against the same bulk exchange stats, with a much
- * lower volume floor than the ranked list — a genuinely newsworthy pair is
- * not always one of the most liquid ones yet. It still has to be a real,
- * tradeable, non-stablecoin pair that has not moved too far in 24h; being in
- * the news earns a lower bar, not an exemption from having one.
+ * headline is resolved to a real, currently-trading pool through the same
+ * scout search used by DeFi spot, and passed through the exact same safety
+ * filters as any other candidate.
  *
  * This exists because an agent commits capital the moment its analysis clears
- * the bar; a trader who wants to place spot orders themselves, by hand, on
- * their own exchange account, needs the analysis without the commitment.
+ * the bar; a trader who wants to trade on-chain themselves, by hand, needs
+ * the analysis without the commitment.
  */
 import {
-  CexScreener,
   DEFAULT_STRATEGY_CONFIG,
+  GeckoTerminalMarketDataProvider,
+  Scout,
   classifyRegime,
   isSubrequestCeilingError,
-  type CexMarketStat,
+  parsePoolSymbol,
+  type ChainId,
+  type ScoutCandidate,
   type StrategyConfig,
 } from "@smc/core";
 import { TradingRuntime, type AnalysisTick, type RuntimeStorage } from "./runtime.js";
 import { fetchNews, type NewsItem } from "./news.js";
 
 /**
- * Discovery itself has no cap — every market that clears the screener's
- * filters is returned, since it costs nothing beyond the one bulk-stats
- * fetch (now including a CoinGecko market-cap join) already being paid for
- * regardless of how many symbols come back.
+ * Discovery itself has no cap — every pool that clears the scout's filters
+ * across every registered chain is returned, since the network cost is the
+ * scout sweep itself, already being paid for regardless of how many pools
+ * come back.
  *
- * The full SMC engine per symbol is a different cost entirely: each one
- * needs its own candle history across three timeframes, which is real
- * network work metered per tick. `MAX_ANALYSED_MARKETS` bounds that
- * expensive half. It was tried at 25 alongside the CoinGecko join and
- * brought back down after one production tail: subrequest failures went
- * from 1 to 3 in a comparable window, confirmed each time as "Too many
- * subrequests by single Worker invocation." The discovery list above is
- * unaffected either way — that is what the actual complaint was about, and
- * it stays fully uncapped regardless of where this number sits. Pinned
- * markets are prioritised into this budget ahead of newly-discovered ones,
- * since a pin is a promise this market stays fully analysed regardless of
- * ranking.
+ * The full SMC engine per pool is a different cost entirely: each one needs
+ * its own candle history across three timeframes, which is real network work
+ * metered per tick. `MAX_ANALYSED_MARKETS` bounds that expensive half — the
+ * same number the exchange-backed version of this page settled on after a
+ * production tail showed raising it tripped Cloudflare's per-invocation
+ * subrequest ceiling more often. The discovery list above is unaffected
+ * either way. Pinned pools are prioritised into this budget ahead of newly
+ * discovered ones, since a pin is a promise this pool stays fully analysed
+ * regardless of ranking.
  */
 export const MAX_ANALYSED_MARKETS = 15;
 export const MAX_PINNED_MARKETS = 10;
+
+/** How many pools the scout sweep keeps, pre-ranking — effectively uncapped,
+ * matching the CEX-era fix that stopped this page from showing only a
+ * handful of majors: the entire complaint that started this rework. */
+const DISCOVERY_LIMIT = 500;
 
 export interface SpotSetupView {
   direction: string;
   entryModel: string;
   timeframe: string;
-  /** Suggested entry price. On spot this is a level to place a limit order at,
-   * or the level price should be near before a market buy — never an
-   * instruction, only what the engine's setup is built around. */
+  /** Suggested entry price — a level to place a limit order at, or the level
+   * price should be near before a market buy — never an instruction, only
+   * what the engine's setup is built around. */
   entry: number;
   stopLoss: number;
   takeProfits: number[];
@@ -83,15 +98,22 @@ export interface SpotSetupView {
 
 export interface SpotSignal {
   symbol: string;
+  network: ChainId;
+  poolAddress: string;
+  dex: string;
+  baseSymbol: string;
+  quoteSymbol: string;
   pinned: boolean;
-  /** Where this market came from this tick: ranked by the screener, kept in
-   * view only because it was pinned, or both. */
+  /** Where this pool came from this tick: ranked by the scout, kept in view
+   * only because it was pinned, or both. */
   discovered: boolean;
-  /** True when this market would not have ranked on volume alone and was
+  /** True when this pool would not have ranked on turnover alone and was
    * added because a recent headline named it. */
   newsSource: boolean;
   volumeUsd24h: number | null;
+  liquidityUsd: number | null;
   priceChangePct24h: number | null;
+  fdvUsd: number | null;
   price: number | null;
   bias: string;
   status: string;
@@ -103,7 +125,7 @@ export interface SpotSignal {
    * position limit to enforce, so unlike an agent every valid setup is worth
    * showing, not only the ones capital was available for. */
   setup: SpotSetupView | null;
-  /** Other valid setups on the same market, most recent first, for context. */
+  /** Other valid setups on the same pool, most recent first, for context. */
   alternates: SpotSetupView[];
   news: { title: string; url: string; source: string; sentiment: string; publishedAt: number }[];
   updatedAt: number;
@@ -187,48 +209,55 @@ export class SpotSignalRuntime {
   private readonly runtime: TradingRuntime;
   private readonly storage: RuntimeStorage;
   private readonly fetchFn?: typeof fetch;
-  private readonly screener: CexScreener;
+  private readonly scout: Scout;
 
   constructor(storage: RuntimeStorage, opts: { fetchFn?: typeof fetch } = {}) {
     this.storage = storage;
     this.fetchFn = opts.fetchFn;
-    this.screener = new CexScreener({ fetchFn: opts.fetchFn });
+    this.scout = new Scout({ fetchFn: opts.fetchFn });
     // A namespace of its own: this must never share engine state with an
     // agent, even one watching the same symbol, because an agent's engine
     // carries capital and position state that a read-only view must not see
     // or influence.
-    this.runtime = new TradingRuntime(storage, { fetchFn: opts.fetchFn, namespace: "spot" });
+    this.runtime = new TradingRuntime(storage, {
+      fetchFn: opts.fetchFn,
+      namespace: "spot",
+      marketData: new GeckoTerminalMarketDataProvider({ fetchFn: opts.fetchFn }),
+    });
   }
 
   // ---- discovery -----------------------------------------------------
 
-  async discover(now = Date.now()): Promise<CexMarketStat[]> {
-    const { top } = await this.discoverWithStats(now);
-    return top;
+  async discover(now = Date.now()): Promise<ScoutCandidate[]> {
+    return this.discoverCandidates(now);
   }
 
   /**
-   * Fetches the bulk exchange stats exactly once and returns both the ranked
-   * top markets and the full unfiltered set — so a caller that also needs to
-   * verify a couple of news-mentioned symbols this same tick (see `tickAll`)
-   * does not pay for a second three-exchange round trip to get it. Calling
-   * `allStats()` again after this already burned that budget once is what
-   * pushed a production tick over Cloudflare's per-invocation subrequest
-   * ceiling — confirmed in a tail immediately after this was first shipped
-   * without the reuse.
+   * A total outage — GeckoTerminal rate-limiting every chain at once, which
+   * has happened in production — is not "nothing is trading right now."
+   * Writing that through would wipe a working candidate list with an empty
+   * one; the previous good candidates are kept instead, and only a warning
+   * is logged. Mirrors the same guard in `defi.ts`'s `discover()`.
    */
-  private async discoverWithStats(now: number): Promise<{ top: CexMarketStat[]; all: CexMarketStat[] }> {
-    const all = await this.screener.allStats();
-    // No limit: every market clearing the filters is kept. This list is the
-    // full discovery surface shown in the UI; only a bounded slice of it (see
-    // MAX_ANALYSED_MARKETS in tickAll) gets the expensive full engine.
-    const top = await this.screener.topMarkets({ stats: all });
-    await this.storage.put({ spotCandidates: { markets: top, updatedAt: now } });
-    return { top, all };
+  private async discoverCandidates(now: number): Promise<ScoutCandidate[]> {
+    const result = await this.scout.discover({ now, limit: DISCOVERY_LIMIT });
+    if (result.candidates.length === 0 && result.chainErrors.length > 0) {
+      const previous = await this.getCandidates();
+      console.warn(JSON.stringify({
+        event: "spot_discovery_all_chains_failed",
+        chainErrors: result.chainErrors,
+        sourceErrors: result.sourceErrors,
+        keptCandidates: previous.markets.length,
+        timestamp: now,
+      }));
+      return previous.markets;
+    }
+    await this.storage.put({ spotCandidates: { markets: result.candidates, updatedAt: now } });
+    return result.candidates;
   }
 
-  async getCandidates(): Promise<{ markets: CexMarketStat[]; updatedAt: number | null }> {
-    return (await this.storage.get<{ markets: CexMarketStat[]; updatedAt: number }>("spotCandidates")) ?? {
+  async getCandidates(): Promise<{ markets: ScoutCandidate[]; updatedAt: number | null }> {
+    return (await this.storage.get<{ markets: ScoutCandidate[]; updatedAt: number }>("spotCandidates")) ?? {
       markets: [],
       updatedAt: null,
     };
@@ -240,9 +269,12 @@ export class SpotSignalRuntime {
     return (await this.storage.get<string[]>("spotPinned")) ?? [];
   }
 
+  /** Pins are always chosen from the discovered list (see the frontend), so
+   * unlike a typed-in exchange ticker a pool symbol is never normalised —
+   * it is a chain id plus a case-sensitive on-chain address. */
   async pin(symbol: string): Promise<{ pinned: string[]; error?: string }> {
     const pinned = await this.getPinned();
-    const clean = symbol.toUpperCase().trim();
+    const clean = symbol.trim();
     if (pinned.includes(clean)) return { pinned };
     if (pinned.length >= MAX_PINNED_MARKETS) {
       return { pinned, error: `You can pin at most ${MAX_PINNED_MARKETS} markets. Unpin one first.` };
@@ -253,7 +285,7 @@ export class SpotSignalRuntime {
   }
 
   async unpin(symbol: string): Promise<{ pinned: string[] }> {
-    const next = (await this.getPinned()).filter((s) => s !== symbol.toUpperCase().trim());
+    const next = (await this.getPinned()).filter((s) => s !== symbol.trim());
     await this.storage.put({ spotPinned: next });
     return { pinned: next };
   }
@@ -266,7 +298,7 @@ export class SpotSignalRuntime {
   }
 
   /**
-   * Analyse the top discovered markets plus any pinned ones, read-only.
+   * Analyse the top discovered pools plus any pinned ones, read-only.
    * `autoTrading: false` is the entire safety property of this class — the
    * engine still evaluates every setup and hard rule, it is simply never
    * asked to act on the result.
@@ -274,15 +306,10 @@ export class SpotSignalRuntime {
   async tickAll(now = Date.now()): Promise<SpotSignal[]> {
     const [pinned, cachedCandidates] = await Promise.all([this.getPinned(), this.getCandidates()]);
     let markets = cachedCandidates.markets;
-    // Freshly-fetched full stats, kept only for this tick, so the
-    // news-verification step below can reuse them instead of fetching the
-    // bulk exchange data a second time — see `discoverWithStats`.
-    let freshStats: CexMarketStat[] | undefined;
     if (!cachedCandidates.updatedAt || now - cachedCandidates.updatedAt > 15 * 60_000) {
-      await this.discoverWithStats(now)
+      await this.discoverCandidates(now)
         .then((result) => {
-          markets = result.top;
-          freshStats = result.all;
+          markets = result;
         })
         .catch((error) => {
           console.warn(JSON.stringify({
@@ -293,10 +320,10 @@ export class SpotSignalRuntime {
         });
     }
 
-    const byStat = new Map(markets.map((m) => [m.symbol, m]));
+    const byCandidate = new Map(markets.map((m) => [m.symbol, m]));
     const discoveredSymbols = markets.map((m) => m.symbol);
-    // Pinned markets are guaranteed a full-analysis slot ahead of newly
-    // discovered ones — a pin is a promise this market stays analysed
+    // Pinned pools are guaranteed a full-analysis slot ahead of newly
+    // discovered ones — a pin is a promise this pool stays analysed
     // regardless of where it ranks, and `markets` can now be a long list.
     let symbols = [...new Set([...pinned, ...discoveredSymbols])];
 
@@ -307,23 +334,17 @@ export class SpotSignalRuntime {
       () => ({ items: [] as NewsItem[], unavailable: true, fetchedAt: now, sources: [] }),
     );
 
-    // News-driven extra candidates: a cashtag not already covered, verified
-    // as a real tradeable pair before it is trusted. Reuses this tick's
-    // discovery stats when they were just fetched; a bulk-stats call is only
-    // made from scratch when discovery was a cache hit and a headline still
-    // names something new — never both a discovery fetch and a verification
-    // fetch in the same tick, which is what pushed a tick over Cloudflare's
-    // subrequest ceiling in production before this reuse existed.
+    // News-driven extra candidates: a cashtag not already covered, resolved
+    // to a real pool and safety-filtered exactly like any other candidate —
+    // see `discoverFromSymbols` in the core Scout.
     const newsSymbols = new Set<string>();
-    const newCashtags = extractCashtags(news.items)
-      .map((t) => `${t}USDT`)
-      .filter((s) => !symbols.includes(s));
+    const newCashtags = extractCashtags(news.items);
     if (newCashtags.length > 0) {
       try {
-        const all = freshStats ?? (await this.screener.allStats());
-        for (const stat of this.screener.bySymbol(all, newCashtags).slice(0, 5)) {
-          byStat.set(stat.symbol, stat);
-          newsSymbols.add(stat.symbol);
+        for (const candidate of await this.scout.discoverFromSymbols(newCashtags, { now })) {
+          if (symbols.includes(candidate.symbol)) continue;
+          byCandidate.set(candidate.symbol, candidate);
+          newsSymbols.add(candidate.symbol);
         }
       } catch (error) {
         console.warn(JSON.stringify({
@@ -337,10 +358,19 @@ export class SpotSignalRuntime {
     // surfacing one is defeated if a long discovered list pushes it out of
     // the analysed slice), then discovered fills whatever is left.
     symbols = [...new Set([...pinned, ...newsSymbols, ...symbols])].slice(0, MAX_ANALYSED_MARKETS);
-    if (symbols.length === 0) return [];
+    if (symbols.length === 0) {
+      // Nothing to show is a real, current answer — a stricter range filter
+      // can legitimately clear zero pools some ticks. Write it through
+      // rather than silently keeping whatever was analysed last time, or the
+      // page is stuck showing pools that no longer qualify, forever.
+      await this.storage.put({ spotSignals: { signals: [], updatedAt: now } });
+      return [];
+    }
 
     const results: SpotSignal[] = [];
     for (const symbol of symbols) {
+      const parsed = parsePoolSymbol(symbol);
+      if (!parsed) continue;
       try {
         const strategy: Partial<StrategyConfig> = {
           entryModels: { aggressive: true, confirmation: true, sweep: true, counterTrend: true },
@@ -361,16 +391,23 @@ export class SpotSignalRuntime {
         const ltf = tick.analysis.snapshots[DEFAULT_STRATEGY_CONFIG.timeframes.ltf]
           ?? Object.values(tick.analysis.snapshots).find(Boolean);
         const regime = ltf ? classifyRegime(ltf.candles, ltf.structure.trend) : undefined;
-        const stat = byStat.get(symbol);
+        const candidate = byCandidate.get(symbol);
 
         results.push({
           symbol,
+          network: parsed.network as ChainId,
+          poolAddress: parsed.poolAddress,
+          dex: candidate?.dex ?? "unknown",
+          baseSymbol: candidate?.baseSymbol ?? "?",
+          quoteSymbol: candidate?.quoteSymbol ?? "?",
           pinned: pinned.includes(symbol),
           discovered: discoveredSymbols.includes(symbol),
           newsSource: newsSymbols.has(symbol),
-          volumeUsd24h: stat?.quoteVolume24hUsd ?? null,
-          priceChangePct24h: stat?.priceChangePct24h ?? null,
-          price: stat?.priceUsd ?? lastCloseOf(tick),
+          volumeUsd24h: candidate?.volumeUsd24h ?? null,
+          liquidityUsd: candidate?.liquidityUsd ?? null,
+          priceChangePct24h: candidate?.priceChangePct24h ?? null,
+          fdvUsd: candidate?.fdvUsd ?? null,
+          price: candidate?.priceUsd ?? lastCloseOf(tick),
           bias: tick.analysis.bias,
           status: tick.status,
           regime: regime?.regime ?? null,
@@ -383,7 +420,7 @@ export class SpotSignalRuntime {
           updatedAt: now,
         });
       } catch (error) {
-        // One failing market keeps its last known signal rather than dropping
+        // One failing pool keeps its last known signal rather than dropping
         // silently out of the list the trader is watching.
         const prior = byPrevious.get(symbol);
         if (prior) results.push(prior);
@@ -394,7 +431,7 @@ export class SpotSignalRuntime {
           timestamp: now,
         }));
         // Cloudflare's per-invocation subrequest ceiling was hit — every
-        // remaining symbol in this loop would fail the identical way, each
+        // remaining pool in this loop would fail the identical way, each
         // spending what budget is left on a call already known to be
         // doomed. Stop here; the rest keep whatever signal they already had
         // (via byPrevious, above) rather than being wiped by a failure that

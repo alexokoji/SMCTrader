@@ -1,16 +1,17 @@
-import type { CexMarketStat, SpotSignal, SpotSetupView } from "../agents-api";
+import type { SpotCandidate, SpotSignal, SpotSetupView } from "../agents-api";
 import { num } from "./AgentViews";
 
 /**
  * Spot signals.
  *
  * This is analysis, not an agent: nothing here places an order. What gets
- * analysed is discovered, not typed in — the top USDT pairs by 24h volume are
- * pulled fresh every tick and shown automatically; pinning a market only adds
- * it to that list regardless of its ranking, it is never required to see
- * anything. Every card states what the engine concluded and why, at what
- * price it would matter, and what move it implies — so a trader can act on
- * their own exchange account, or not, on their own judgement.
+ * analysed is discovered, not typed in — every chain in the registry is
+ * scouted for on-chain pools trading inside the configured FDV/liquidity/
+ * volume range, and the top ones by turnover are shown automatically; pinning
+ * a pool only adds it to that list regardless of its ranking, it is never
+ * required to see anything. Every card states what the engine concluded and
+ * why, at what price it would matter, and what move it implies — so a trader
+ * can act on their own wallet, or not, on their own judgement.
  */
 
 function ago(ts?: number | null): string {
@@ -96,7 +97,7 @@ function CandidateRow({
   onPin,
   onUnpin,
 }: {
-  candidate: CexMarketStat;
+  candidate: SpotCandidate;
   pinned: boolean;
   analysed: boolean;
   onPin: (symbol: string) => void;
@@ -105,13 +106,17 @@ function CandidateRow({
   return (
     <div className="defi-candidate">
       <div className="defi-candidate-main">
-        <b>{candidate.symbol}</b>
-        {candidate.marketCapUsd !== null && <span className="chain-badge">cap {usd(candidate.marketCapUsd)}</span>}
+        <b>{candidate.baseSymbol}</b>
+        <span className="chain-badge">{candidate.network}</span>
+        <span className="chain-badge">{candidate.dex}</span>
+        {candidate.fdvUsd !== null && <span className="chain-badge">FDV {usd(candidate.fdvUsd)}</span>}
+        {candidate.fromNews && <span className="chain-badge" title="Named in a recent headline, then verified as a real, liquid pool">in the news</span>}
         {analysed && <span className="chain-badge" title="Fully analysed below — entry, stop, targets and score">analysed</span>}
       </div>
       <div className="defi-candidate-meta">
         <span>{priceOf(candidate.priceUsd)}</span>
-        <span>Vol {usd(candidate.quoteVolume24hUsd)}</span>
+        <span>Vol {usd(candidate.volumeUsd24h)}</span>
+        <span>Liq {usd(candidate.liquidityUsd)}</span>
         <span className={candidate.priceChangePct24h >= 0 ? "good" : "bad"}>
           {candidate.priceChangePct24h >= 0 ? "+" : ""}{num(candidate.priceChangePct24h, 1)}% 24h
         </span>
@@ -127,7 +132,7 @@ function SignalCard({ signal, onPin, onUnpin }: { signal: SpotSignal; onPin: (sy
   return (
     <article className="spot-card">
       <header>
-        <b>{signal.symbol}</b>
+        <b>{signal.baseSymbol}</b>
         <div className="spot-card-pills">
           <span className={`status-pill ${BIAS_TONE[signal.bias] ?? "wait"}`}>{signal.bias}</span>
           {signal.regime && (
@@ -145,7 +150,11 @@ function SignalCard({ signal, onPin, onUnpin }: { signal: SpotSignal; onPin: (sy
         <span className="helper">updated {ago(signal.updatedAt)}</span>
       </div>
       <div className="defi-candidate-meta">
+        <span className="chain-badge">{signal.network}</span>
+        <span className="chain-badge">{signal.dex}</span>
         {signal.volumeUsd24h !== null && <span>Vol {usd(signal.volumeUsd24h)}</span>}
+        {signal.liquidityUsd !== null && <span>Liq {usd(signal.liquidityUsd)}</span>}
+        {signal.fdvUsd !== null && <span>FDV {usd(signal.fdvUsd)}</span>}
         {signal.priceChangePct24h !== null && (
           <span className={signal.priceChangePct24h >= 0 ? "good" : "bad"}>
             {signal.priceChangePct24h >= 0 ? "+" : ""}{num(signal.priceChangePct24h, 1)}% 24h
@@ -153,7 +162,7 @@ function SignalCard({ signal, onPin, onUnpin }: { signal: SpotSignal; onPin: (sy
         )}
         {signal.discovered && !signal.pinned && <span className="chain-badge">discovered</span>}
         {signal.pinned && <span className="chain-badge">pinned</span>}
-        {signal.newsSource && <span className="chain-badge" title="Named in a recent headline, then verified as a real, liquid pair">in the news</span>}
+        {signal.newsSource && <span className="chain-badge" title="Named in a recent headline, then verified as a real, liquid pool">in the news</span>}
       </div>
 
       {signal.warming ? (
@@ -197,7 +206,7 @@ export function SpotView({
 }: {
   signals: SpotSignal[];
   updatedAt: number | null;
-  candidates: CexMarketStat[];
+  candidates: SpotCandidate[];
   candidatesUpdatedAt: number | null;
   pinned: string[];
   onPin: (symbol: string) => void;
@@ -215,11 +224,11 @@ export function SpotView({
           <button disabled={busy} onClick={onRescout}>Re-scout now</button>
         </div>
         <p className="helper">
-          {candidates.length} high-market-cap pair{candidates.length === 1 ? "" : "s"} actually moving today,
-          pulled fresh {ago(candidatesUpdatedAt)} — ranked by movement relative to size, not raw volume, so this
-          is not just BTC and ETH every time. Nothing here was typed in; every one cleared a market-cap floor, a
-          minimum and maximum 24h move, and a volume floor. Pin any of them to keep it in view regardless of
-          ranking, and to guarantee it gets full analysis below.
+          {candidates.length} on-chain pool{candidates.length === 1 ? "" : "s"} trading right now, pulled fresh{" "}
+          {ago(candidatesUpdatedAt)} — ranked by turnover, scouted across every supported chain. Nothing here was
+          typed in; every one cleared a liquidity floor, a volume floor, an FDV range meant to catch real but
+          still-small projects, and an age check meant to filter out brand-new rugs. Pin any of them to keep it
+          in view regardless of ranking, and to guarantee it gets full analysis below.
         </p>
         {candidates.length === 0 ? (
           <div className="empty">

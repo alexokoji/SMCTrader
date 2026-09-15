@@ -9,7 +9,7 @@ import {
   type NewsResult,
   type Portfolio,
   type SpotSignal,
-  type CexMarketStat,
+  type SpotCandidate,
 } from "./agents-api";
 import { MarketPicker } from "./components/MarketPicker";
 import { LiveStatusPanel } from "./components/LiveStatus";
@@ -95,7 +95,7 @@ function App() {
     signals: [],
     updatedAt: null,
   });
-  const [spotCandidates, setSpotCandidates] = useState<{ markets: CexMarketStat[]; updatedAt: number | null }>({
+  const [spotCandidates, setSpotCandidates] = useState<{ markets: SpotCandidate[]; updatedAt: number | null }>({
     markets: [],
     updatedAt: null,
   });

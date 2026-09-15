@@ -19,7 +19,6 @@ import {
 import { sendIngest } from "./ingest.js";
 import { AgentRuntime, defaultAgentConfig } from "./agents.js";
 import { SpotSignalRuntime, type SpotSignal } from "./spot.js";
-import type { CexMarketStat } from "@smc/core";
 import {
   DeFiRuntime,
   type DeFiAutoConfig,
@@ -186,11 +185,11 @@ export class TradingSession extends DurableObject<Env> {
     return this.spotRuntimeInstance;
   }
 
-  async getSpotCandidates(): Promise<{ markets: CexMarketStat[]; updatedAt: number | null }> {
+  async getSpotCandidates(): Promise<{ markets: ScoutCandidate[]; updatedAt: number | null }> {
     return this.spot().getCandidates();
   }
 
-  async rescoutSpot(): Promise<CexMarketStat[]> {
+  async rescoutSpot(): Promise<ScoutCandidate[]> {
     return this.spot().discover();
   }
 

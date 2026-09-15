@@ -22,6 +22,7 @@ function pool(overrides: Partial<{
   h1Change: number;
   quoteAddress: string;
   baseSymbol: string;
+  fdv: number;
 }> = {}) {
   const age = overrides.ageMs ?? 30 * 24 * 60 * 60 * 1000;
   return {
@@ -31,8 +32,8 @@ function pool(overrides: Partial<{
       address: overrides.address ?? "0xpool1",
       name: `${overrides.baseSymbol ?? "TOKEN"} / WETH`,
       base_token_price_usd: "1.23",
-      fdv_usd: "5000000",
-      market_cap_usd: "5000000",
+      fdv_usd: String(overrides.fdv ?? 5_000_000),
+      market_cap_usd: String(overrides.fdv ?? 5_000_000),
       price_change_percentage: { h1: String(overrides.h1Change ?? 2), h24: String(overrides.h1Change ?? 2) },
       volume_usd: { h24: String(overrides.volume ?? 200_000) },
       reserve_in_usd: String(overrides.liquidity ?? 200_000),
@@ -124,6 +125,32 @@ describe("Scout discovery", () => {
     expect(candidates).toHaveLength(1);
     expect(candidates[0]!.network).toBe("ethereum");
     expect(candidates[0]!.symbol).toBe("ethereum:0xpool1");
+  });
+
+  it("rejects a pool below the FDV floor — a real quality signal, not a raw price/size filter", async () => {
+    const scout = new Scout({
+      fetchFn: stubFetch({
+        eth: {
+          data: [pool({ fdv: DEFAULT_SCOUT_FILTERS.minFdvUsd - 1, quoteAddress: eth.wrappedNativeAddress.toLowerCase() })],
+          included: included(eth.wrappedNativeAddress.toLowerCase()),
+        },
+      }),
+    });
+    const { candidates } = await scout.discover({ chains: ["ethereum"], now: NOW });
+    expect(candidates).toHaveLength(0);
+  });
+
+  it("rejects a pool above the FDV ceiling — this is a target range, not a floor with no top", async () => {
+    const scout = new Scout({
+      fetchFn: stubFetch({
+        eth: {
+          data: [pool({ fdv: DEFAULT_SCOUT_FILTERS.maxFdvUsd + 1, quoteAddress: eth.wrappedNativeAddress.toLowerCase() })],
+          included: included(eth.wrappedNativeAddress.toLowerCase()),
+        },
+      }),
+    });
+    const { candidates } = await scout.discover({ chains: ["ethereum"], now: NOW });
+    expect(candidates).toHaveLength(0);
   });
 
   it("rejects a pool below the liquidity floor", async () => {
@@ -247,7 +274,9 @@ describe("Scout discovery", () => {
       }) as unknown as typeof fetch,
     });
     const { candidates, chainErrors } = await scout.discover({ chains: ["ethereum", "bsc"], now: NOW });
-    expect(chainErrors).toEqual([{ chain: "ethereum", reason: "network down" }]);
+    expect(chainErrors).toHaveLength(1);
+    expect(chainErrors[0]!.chain).toBe("ethereum");
+    expect(chainErrors[0]!.reason).toMatch(/network down/);
     expect(candidates).toHaveLength(1);
     expect(candidates[0]!.network).toBe("bsc");
   });

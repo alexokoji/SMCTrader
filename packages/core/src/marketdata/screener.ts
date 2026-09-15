@@ -56,18 +56,28 @@ export interface ScreenerFilters {
    * size or liquidity — the entire point of ranking by movement is to leave
    * out the pairs sitting still. */
   minPriceChangePct24h: number;
-  /** The legitimacy floor: below this market cap, a coin is excluded from
-   * the ranked list regardless of how much it moved — a cheap way to keep a
-   * thinly-capitalized, easily-manipulated token off a list meant to surface
-   * real trading opportunities. */
+  /**
+   * The legitimacy *range*: a coin outside [minMarketCapUsd,
+   * maxMarketCapUsd] is excluded regardless of how much it moved. Below the
+   * floor is the classic thinly-capitalized, easily-manipulated token; above
+   * the ceiling is the opposite problem this whole ranking exists to route
+   * around — a mega-cap that clears every other filter on a big-news day but
+   * moves nothing like enough, relative to its size, to be worth a small
+   * position. Set for micro-cap trading specifically: this is a narrow band,
+   * not a floor with no top.
+   */
   minMarketCapUsd: number;
+  maxMarketCapUsd: number;
 }
 
 export const DEFAULT_SCREENER_FILTERS: ScreenerFilters = {
-  minQuoteVolume24hUsd: 2_000_000,
+  // A $2-10M cap coin realistically trading might see $50k-500k of daily
+  // volume; requiring millions would exclude the entire target range.
+  minQuoteVolume24hUsd: 50_000,
   maxPriceChangePct24h: 60,
   minPriceChangePct24h: 3,
-  minMarketCapUsd: 150_000_000,
+  minMarketCapUsd: 2_000_000,
+  maxMarketCapUsd: 10_000_000,
 };
 
 /** Exchanges with a documented bulk "every symbol's 24h stats in one call"
@@ -241,11 +251,21 @@ export class CexScreener {
    * separately look a few specific symbols up) pays for the bulk fetch once
    * instead of twice. A CoinGecko outage does not fail this — every reading
    * just carries a null market cap, which `topMarkets` then excludes.
+   *
+   * The CoinGecko pagination is calibrated to `filters.minMarketCapUsd`, not
+   * fetched from page 1: this app's targeted range (a live check found $10M
+   * market cap starts around CoinGecko rank ~1,150, i.e. page 5 of 250) sits
+   * far below the top of the list, so starting at page 1 would spend most of
+   * the pagination budget fetching majors this screener no longer wants at
+   * all. `stopBelowMarketCapUsd` still bounds the worst case if the market's
+   * rank distribution drifts.
    */
-  async allStats(): Promise<CexMarketStat[]> {
+  async allStats(filters: ScreenerFilters = DEFAULT_SCREENER_FILTERS): Promise<CexMarketStat[]> {
     const [stats, marketCaps] = await Promise.all([
       this.fetchStats(),
-      this.coingecko.markets().catch((): CoinGeckoMarket[] => []),
+      this.coingecko
+        .markets({ startPage: 4, pages: 10, stopBelowMarketCapUsd: filters.minMarketCapUsd })
+        .catch((): CoinGeckoMarket[] => []),
     ]);
     const byBase = new Map(marketCaps.map((m) => [m.symbol, m]));
     return stats.map((s) => {
@@ -266,13 +286,14 @@ export class CexScreener {
     opts: { limit?: number; filters?: ScreenerFilters; stats?: CexMarketStat[] } = {},
   ): Promise<CexMarketStat[]> {
     const filters = opts.filters ?? DEFAULT_SCREENER_FILTERS;
-    const stats = opts.stats ?? (await this.allStats());
+    const stats = opts.stats ?? (await this.allStats(filters));
     const ranked = stats
       .filter(
         (s) =>
           isTradeableBase(s.symbol) &&
           s.marketCapUsd !== null &&
           s.marketCapUsd >= filters.minMarketCapUsd &&
+          s.marketCapUsd <= filters.maxMarketCapUsd &&
           s.quoteVolume24hUsd >= filters.minQuoteVolume24hUsd &&
           Math.abs(s.priceChangePct24h) >= filters.minPriceChangePct24h &&
           Math.abs(s.priceChangePct24h) <= filters.maxPriceChangePct24h,

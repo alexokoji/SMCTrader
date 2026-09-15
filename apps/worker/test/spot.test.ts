@@ -40,14 +40,14 @@ function binanceRow(symbol: string, overrides: Partial<{ price: number; volume: 
  * `topMarkets`'s legitimacy floor — every symbol these stubs discover needs
  * a matching row here, or it is (correctly) filtered out as having no
  * verifiable market cap. */
-function geckoRow(symbol: string, marketCapUsd = 500_000_000) {
+function geckoRow(symbol: string, marketCapUsd = 5_000_000) {
   return {
     symbol: symbol.replace(/USDT$/, "").toLowerCase(),
     market_cap: marketCapUsd,
     total_volume: 500_000_000,
     price_change_percentage_24h: 10,
     current_price: 60_000,
-    market_cap_rank: 10,
+    market_cap_rank: 1_500,
   };
 }
 
@@ -55,7 +55,7 @@ function coingeckoResponse(input: string | URL, symbols: string[]): Response | n
   const url = new URL(String(input));
   if (url.hostname !== "api.coingecko.com") return null;
   const page = url.searchParams.get("page");
-  return new Response(JSON.stringify(page === "1" ? symbols.map((s) => geckoRow(s)) : []), { status: 200 });
+  return new Response(JSON.stringify(page === "4" ? symbols.map((s) => geckoRow(s)) : []), { status: 200 });
 }
 
 /** A steady uptrend so at least one market reliably produces a valid setup,

@@ -51,20 +51,72 @@ export class CoinGeckoClient {
   }
 
   /**
-   * The top `pages * perPage` coins by market cap. Pages are fetched in
-   * sequence, not parallel — CoinGecko's free tier rate-limits per second,
-   * and this call sits behind a multi-minute discovery cooldown already, so
-   * there is no reason to burst it.
+   * One retry after a short wait on a 429 specifically — CoinGecko's free
+   * tier rate limit is tight enough that a run of several sequential page
+   * fetches trips it directly (confirmed live: back-to-back multi-page
+   * fetches 429'd on the second attempt within the same minute), and it
+   * typically clears within a second or two rather than needing a longer
+   * backoff. Any other failure, or a second consecutive 429, is left to the
+   * caller.
    */
-  async markets(opts: { pages?: number; perPage?: number } = {}): Promise<CoinGeckoMarket[]> {
+  private async pageWithRetry(pageNumber: number, perPage: number): Promise<CoinGeckoMarketRow[]> {
+    try {
+      return await this.page(pageNumber, perPage);
+    } catch (error) {
+      if (!/HTTP 429/.test(error instanceof Error ? error.message : String(error))) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      return this.page(pageNumber, perPage);
+    }
+  }
+
+  /**
+   * Coins by market cap, starting from `startPage` and reading up to `pages`
+   * pages — or fewer, if `stopBelowMarketCapUsd` is given and a page's
+   * lowest cap drops beneath it, since the list is already sorted
+   * descending and every later page would only be smaller still. Pages are
+   * fetched in sequence, not parallel — CoinGecko's free tier rate-limits
+   * per second, and this call sits behind a multi-minute discovery cooldown
+   * already, so there is no reason to burst it.
+   *
+   * `startPage` matters here in a way it would not for a "top N" list: the
+   * coins this app now targets sit around rank 1,000-2,500 (confirmed
+   * against a live fetch — page 5 is where $10M market cap starts, page 10
+   * is roughly where $2M ends), so starting at page 1 would spend most of
+   * the pagination budget on majors that are then thrown away.
+   */
+  async markets(
+    opts: { pages?: number; perPage?: number; startPage?: number; stopBelowMarketCapUsd?: number } = {},
+  ): Promise<CoinGeckoMarket[]> {
     const pages = opts.pages ?? 2;
     const perPage = Math.min(250, opts.perPage ?? 250);
+    const startPage = opts.startPage ?? 1;
 
     const rows: CoinGeckoMarketRow[] = [];
-    for (let p = 1; p <= pages; p++) {
-      const page = await this.page(p, perPage);
+    for (let i = 0; i < pages; i++) {
+      // A short gap between sequential page fetches, not just the 429 retry
+      // above — spacing requests out is what actually avoids tripping the
+      // rate limit in the first place, rather than recovering after the fact
+      // on every single page.
+      if (i > 0) await new Promise((resolve) => setTimeout(resolve, 250));
+
+      let page: CoinGeckoMarketRow[];
+      try {
+        page = await this.pageWithRetry(startPage + i, perPage);
+      } catch (error) {
+        // The first page failing is a real failure — there is nothing to
+        // return. A later page failing (even after the retry above) keeps
+        // whatever earlier pages already found rather than discarding a
+        // partial result that may still cover most of the target range.
+        if (i === 0) throw error;
+        break;
+      }
+
       rows.push(...page);
       if (page.length < perPage) break; // ran out of ranked coins
+      if (opts.stopBelowMarketCapUsd !== undefined) {
+        const lowestCap = page[page.length - 1]?.market_cap;
+        if (lowestCap !== null && lowestCap !== undefined && lowestCap < opts.stopBelowMarketCapUsd) break;
+      }
     }
 
     // The same ticker can belong to more than one coin (rank determines

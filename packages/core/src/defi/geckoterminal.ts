@@ -104,6 +104,13 @@ function toPoolInfo(network: string, pool: JsonApiPool, included: (JsonApiToken 
 export class GeckoTerminalClient {
   private readonly fetchFn: typeof fetch;
   private readonly timeoutMs: number;
+  // If a retry itself still comes back 429, GeckoTerminal is not transiently
+  // busy, it is actively limiting this client — one client instance is
+  // reused across an entire scout sweep (up to 20 calls), so paying a 1.5s
+  // retry wait on every one of those would turn one outage into 30+ seconds.
+  // Once that's established, later calls in the same sweep skip the retry
+  // and fail fast for this cooldown instead.
+  private rateLimitedUntil = 0;
 
   constructor(opts: { fetchFn?: typeof fetch; timeoutMs?: number } = {}) {
     // Bound as a plain closure so a caller invoking `this.fetchFn(...)` never
@@ -113,13 +120,34 @@ export class GeckoTerminalClient {
     this.timeoutMs = opts.timeoutMs ?? 8_000;
   }
 
-  private async getJson<T>(path: string, params?: Record<string, string>): Promise<T> {
-    const url = new URL(`${BASE_URL}${path}`);
-    for (const [key, value] of Object.entries(params ?? {})) url.searchParams.set(key, value);
-    const response = await this.fetchFn(url.toString(), {
+  /**
+   * The expanded scout sweep (trending + new pools, 2 pages each, per chain)
+   * can burst up to 20 calls into GeckoTerminal in one discovery cycle — a
+   * live run surfaced 429s on 3 of 5 chains at once. One retry after a short
+   * wait is enough to ride out a transient limit without turning a rate-limit
+   * blip into a lost chain for the whole cycle (the caller already tolerates
+   * a page failing outright; this just makes that rarer).
+   */
+  private async fetchWithRetry(url: string): Promise<Response> {
+    const response = await this.fetchFn(url, {
       headers: { Accept: ACCEPT_HEADER },
       signal: AbortSignal.timeout(this.timeoutMs),
     });
+    if (response.status !== 429) return response;
+    if (Date.now() < this.rateLimitedUntil) return response; // already established broad limiting — fail fast
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const retried = await this.fetchFn(url, {
+      headers: { Accept: ACCEPT_HEADER },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (retried.status === 429) this.rateLimitedUntil = Date.now() + 10_000;
+    return retried;
+  }
+
+  private async getJson<T>(path: string, params?: Record<string, string>): Promise<T> {
+    const url = new URL(`${BASE_URL}${path}`);
+    for (const [key, value] of Object.entries(params ?? {})) url.searchParams.set(key, value);
+    const response = await this.fetchWithRetry(url.toString());
     if (!response.ok) throw new Error(`GeckoTerminal ${path} returned HTTP ${response.status}`);
     return response.json() as Promise<T>;
   }
@@ -137,10 +165,27 @@ export class GeckoTerminalClient {
   }
 
   /** The most actively traded pools on a network right now. */
-  async trendingPools(network: string): Promise<PoolInfo[]> {
+  async trendingPools(network: string, page = 1): Promise<PoolInfo[]> {
     const data = await this.getJson<{ data: JsonApiPool[]; included?: JsonApiToken[] }>(
       `/networks/${network}/trending_pools`,
-      { include: "base_token,quote_token,dex" },
+      { include: "base_token,quote_token,dex", page: String(page) },
+    );
+    return data.data
+      .map((pool) => toPoolInfo(network, pool, data.included ?? []))
+      .filter((p): p is PoolInfo => p !== null);
+  }
+
+  /**
+   * Recently created pools — a separate ranking from `trendingPools`, not a
+   * page of it. This is where a token actually sitting in a narrow, young
+   * market-cap band is most likely to be found: trending is a "what is
+   * active right now" view dominated by whatever already has the most
+   * volume, which skews toward pools that have been around longer.
+   */
+  async newPools(network: string, page = 1): Promise<PoolInfo[]> {
+    const data = await this.getJson<{ data: JsonApiPool[]; included?: JsonApiToken[] }>(
+      `/networks/${network}/new_pools`,
+      { include: "base_token,quote_token,dex", page: String(page) },
     );
     return data.data
       .map((pool) => toPoolInfo(network, pool, data.included ?? []))

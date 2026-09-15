@@ -115,4 +115,44 @@ describe("GeckoTerminalClient", () => {
     });
     await expect(client.searchPools("PEPE")).rejects.toThrow(/429/);
   });
+
+  it("retries once after a rate limit and succeeds if the retry clears", async () => {
+    let attempts = 0;
+    const client = new GeckoTerminalClient({
+      fetchFn: (async () => {
+        attempts++;
+        if (attempts === 1) return new Response("", { status: 429 });
+        return new Response(JSON.stringify(SEARCH_FIXTURE), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    const pools = await client.searchPools("PEPE");
+    expect(attempts).toBe(2);
+    expect(pools).toHaveLength(1);
+  });
+
+  it("requests the given page of trending pools, defaulting to page 1", async () => {
+    const requested: string[] = [];
+    const client = new GeckoTerminalClient({
+      fetchFn: (async (input: string | URL) => {
+        requested.push(new URL(String(input)).searchParams.get("page")!);
+        return new Response(JSON.stringify(SEARCH_FIXTURE), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    await client.trendingPools("eth");
+    await client.trendingPools("eth", 2);
+    expect(requested).toEqual(["1", "2"]);
+  });
+
+  it("fetches new pools from a separate endpoint than trending pools", async () => {
+    let requestedPath = "";
+    const client = new GeckoTerminalClient({
+      fetchFn: (async (input: string | URL) => {
+        requestedPath = new URL(String(input)).pathname;
+        return new Response(JSON.stringify(SEARCH_FIXTURE), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    const pools = await client.newPools("eth");
+    expect(requestedPath).toBe("/api/v2/networks/eth/new_pools");
+    expect(pools).toHaveLength(1);
+  });
 });

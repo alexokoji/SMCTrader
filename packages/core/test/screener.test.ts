@@ -24,11 +24,11 @@ function binanceRow(symbol: string, overrides: Partial<{ price: number; volume: 
 function geckoRow(symbol: string, overrides: Partial<{ marketCap: number; rank: number }> = {}) {
   return {
     symbol: symbol.replace(/USDT$/, "").toLowerCase(),
-    market_cap: overrides.marketCap ?? 500_000_000,
+    market_cap: overrides.marketCap ?? 5_000_000, // inside the default $2M-$10M range
     total_volume: 50_000_000,
     price_change_percentage_24h: 10,
     current_price: 1,
-    market_cap_rank: overrides.rank ?? 50,
+    market_cap_rank: overrides.rank ?? 1_500,
   };
 }
 
@@ -41,7 +41,7 @@ function stubFetch(binanceRows: ReturnType<typeof binanceRow>[], geckoRows: Retu
     if (url.includes("binance")) return new Response(JSON.stringify(binanceRows), { status: 200 });
     if (url.includes("coingecko")) {
       const page = new URL(url).searchParams.get("page");
-      return new Response(JSON.stringify(page === "1" ? geckoRows : []), { status: 200 });
+      return new Response(JSON.stringify(page === "4" ? geckoRows : []), { status: 200 });
     }
     return new Response(JSON.stringify({ result: { list: [] } }), { status: 200 });
   }) as unknown as typeof fetch;
@@ -89,6 +89,12 @@ describe("CexScreener.topMarkets — filters", () => {
     expect(await screener.topMarkets()).toEqual([]);
   });
 
+  it("rejects a coin above the market-cap ceiling, however much it moved — this is a range, not a floor", async () => {
+    const { binance, gecko } = passingSetup({ marketCap: DEFAULT_SCREENER_FILTERS.maxMarketCapUsd + 1 });
+    const screener = new CexScreener({ fetchFn: stubFetch(binance, gecko) });
+    expect(await screener.topMarkets()).toEqual([]);
+  });
+
   it("rejects a coin below the volume floor", async () => {
     const { binance, gecko } = passingSetup({ volume: DEFAULT_SCREENER_FILTERS.minQuoteVolume24hUsd - 1 });
     const screener = new CexScreener({ fetchFn: stubFetch(binance, gecko) });
@@ -131,14 +137,14 @@ describe("CexScreener.topMarkets — filters", () => {
 });
 
 describe("CexScreener.topMarkets — ranking", () => {
-  it("ranks a smaller, more volatile coin above a mega-cap that barely moved", async () => {
+  it("ranks a smaller, more volatile coin above a larger-but-barely-moving one, both still inside the range", async () => {
     const binance = [
-      binanceRow("BIGUSDT", { volume: 900_000_000, changePct: 4 }), // clears the movement floor, but only just
-      binanceRow("SMALLUSDT", { volume: 20_000_000, changePct: 25 }), // real move, real activity
+      binanceRow("BIGUSDT", { volume: 900_000, changePct: 4 }), // near the top of the range, clears the movement floor only just
+      binanceRow("SMALLUSDT", { volume: 800_000, changePct: 25 }), // near the bottom of the range, real move relative to its size
     ];
     const gecko = [
-      geckoRow("BIGUSDT", { marketCap: 1_000_000_000_000, rank: 1 }),
-      geckoRow("SMALLUSDT", { marketCap: 500_000_000, rank: 120 }),
+      geckoRow("BIGUSDT", { marketCap: 9_500_000, rank: 1_100 }),
+      geckoRow("SMALLUSDT", { marketCap: 2_200_000, rank: 2_200 }),
     ];
     const screener = new CexScreener({ fetchFn: stubFetch(binance, gecko) });
     const top = await screener.topMarkets();
@@ -149,20 +155,20 @@ describe("CexScreener.topMarkets — ranking", () => {
     // Same market cap; A has more absolute volume, but B moved more and has
     // higher volume relative to its own cap.
     const binance = [
-      binanceRow("AUSDT", { volume: 100_000_000, changePct: 5 }),
-      binanceRow("BUSDT", { volume: 60_000_000, changePct: 20 }),
+      binanceRow("AUSDT", { volume: 500_000, changePct: 5 }),
+      binanceRow("BUSDT", { volume: 300_000, changePct: 20 }),
     ];
-    const gecko = [geckoRow("AUSDT", { marketCap: 500_000_000 }), geckoRow("BUSDT", { marketCap: 500_000_000 })];
+    const gecko = [geckoRow("AUSDT", { marketCap: 5_000_000 }), geckoRow("BUSDT", { marketCap: 5_000_000 })];
     const screener = new CexScreener({ fetchFn: stubFetch(binance, gecko) });
     const top = await screener.topMarkets();
     expect(top.map((t) => t.symbol)).toEqual(["BUSDT", "AUSDT"]);
   });
 
   it("computes movementScore as |24h change| times volume-to-cap turnover", async () => {
-    const { binance, gecko } = passingSetup({ volume: 100_000_000, changePct: 10, marketCap: 500_000_000 });
+    const { binance, gecko } = passingSetup({ volume: 500_000, changePct: 10, marketCap: 5_000_000 });
     const screener = new CexScreener({ fetchFn: stubFetch(binance, gecko) });
     const [top] = await screener.topMarkets();
-    expect(top!.movementScore).toBeCloseTo(10 * (100_000_000 / 500_000_000), 6);
+    expect(top!.movementScore).toBeCloseTo(10 * (500_000 / 5_000_000), 6);
   });
 });
 
@@ -179,7 +185,7 @@ describe("CexScreener — exchange aggregation and resilience", () => {
       }
       if (url.includes("coingecko")) {
         const page = new URL(url).searchParams.get("page");
-        return new Response(JSON.stringify(page === "1" ? [geckoRow("ETHUSDT")] : []), { status: 200 });
+        return new Response(JSON.stringify(page === "4" ? [geckoRow("ETHUSDT")] : []), { status: 200 });
       }
       return new Response("{}", { status: 200 });
     }) as unknown as typeof fetch;
@@ -202,7 +208,7 @@ describe("CexScreener — exchange aggregation and resilience", () => {
       }
       if (url.includes("coingecko")) {
         const page = new URL(url).searchParams.get("page");
-        return new Response(JSON.stringify(page === "1" ? [geckoRow("BTCUSDT", { marketCap: 1_000_000_000_000 })] : []), { status: 200 });
+        return new Response(JSON.stringify(page === "4" ? [geckoRow("BTCUSDT", { marketCap: 5_000_000 })] : []), { status: 200 });
       }
       return new Response("{}", { status: 200 });
     }) as unknown as typeof fetch;
@@ -228,7 +234,7 @@ describe("CexScreener — exchange aggregation and resilience", () => {
       }
       if (url.includes("coingecko")) {
         const page = new URL(url).searchParams.get("page");
-        return new Response(JSON.stringify(page === "1" ? [geckoRow("BTCUSDT", { marketCap: 1_000_000_000_000 }), geckoRow("SOLUSDT")] : []), { status: 200 });
+        return new Response(JSON.stringify(page === "4" ? [geckoRow("BTCUSDT", { marketCap: 5_000_000 }), geckoRow("SOLUSDT")] : []), { status: 200 });
       }
       return new Response("{}", { status: 200 });
     }) as unknown as typeof fetch;
@@ -250,7 +256,7 @@ describe("CexScreener — exchange aggregation and resilience", () => {
       }
       if (url.includes("coingecko")) {
         const page = new URL(url).searchParams.get("page");
-        return new Response(JSON.stringify(page === "1" ? [geckoRow("BTCUSDT", { marketCap: 1_000_000_000_000 })] : []), { status: 200 });
+        return new Response(JSON.stringify(page === "4" ? [geckoRow("BTCUSDT", { marketCap: 5_000_000 })] : []), { status: 200 });
       }
       return new Response("{}", { status: 200 });
     }) as unknown as typeof fetch;
@@ -337,7 +343,7 @@ describe("news-driven symbol lookup", () => {
     let calls = 0;
     const fetchFn = (async (input: string | URL) => {
       calls++;
-      return stubFetch([binanceRow("BTCUSDT")], [geckoRow("BTCUSDT", { marketCap: 1_000_000_000_000 })])(input as never);
+      return stubFetch([binanceRow("BTCUSDT")], [geckoRow("BTCUSDT", { marketCap: 5_000_000 })])(input as never);
     }) as unknown as typeof fetch;
     const screener = new CexScreener({ fetchFn });
     const all = await screener.allStats();

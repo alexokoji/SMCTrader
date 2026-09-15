@@ -53,13 +53,26 @@ export interface ScoutFilters {
    * when the source reports an hourly figure (GeckoTerminal does; DexScreener
    * does not, so a DexScreener-sourced candidate is not filtered on this). */
   maxPriceChangePct1h: number;
+  /**
+   * The target range, on FDV — DeFi tokens are overwhelmingly reported by
+   * fully-diluted valuation rather than circulating-supply market cap, and
+   * FDV is the closer analogue anyway for a token that may still be mostly
+   * locked or unvested. A pool with no FDV reported is excluded rather than
+   * assumed to pass, for the same reason a CEX candidate with no market cap
+   * is (see `screener.ts`): the range is the legitimacy check, and a token
+   * this cannot be checked against has not cleared it.
+   */
+  minFdvUsd: number;
+  maxFdvUsd: number;
 }
 
 export const DEFAULT_SCOUT_FILTERS: ScoutFilters = {
-  minLiquidityUsd: 75_000,
-  minVolumeUsd24h: 50_000,
+  minLiquidityUsd: 25_000,
+  minVolumeUsd24h: 15_000,
   minAgeMs: 24 * 60 * 60 * 1000,
   maxPriceChangePct1h: 60,
+  minFdvUsd: 2_000_000,
+  maxFdvUsd: 10_000_000,
 };
 
 /** A stablecoin as the *base* side of a pool has no trend to trade — a live
@@ -162,6 +175,7 @@ function fromDexPair(pair: DexPair, network: ChainId): ScoutablePool {
 
 function passesFilters(pool: ScoutablePool, filters: ScoutFilters, now: number): boolean {
   if (isStablecoinBase(pool.baseToken.symbol)) return false;
+  if (pool.fdvUsd === null || pool.fdvUsd < filters.minFdvUsd || pool.fdvUsd > filters.maxFdvUsd) return false;
   if (pool.liquidityUsd < filters.minLiquidityUsd) return false;
   if (pool.volumeUsd24h < filters.minVolumeUsd24h) return false;
   if (pool.priceChangePct1h !== null && Math.abs(pool.priceChangePct1h) > filters.maxPriceChangePct1h) return false;
@@ -207,6 +221,16 @@ export class Scout {
     this.dexscreener = opts.dexscreener ?? new DexScreenerClient({ fetchFn: opts.fetchFn });
   }
 
+  /**
+   * Trending pools alone under-covers a narrow, low market-cap target range
+   * — it is a "what is most active right now" ranking, which skews toward
+   * pools that built up volume over time. `new_pools` is a separate
+   * ranking, not a page of trending, and is where a token still sitting in
+   * a young, narrow FDV band is far more likely to actually be found (a
+   * live check found four times as many qualifying candidates once this was
+   * added). Two pages of each, per chain — enough to matter without turning
+   * one discovery cycle into a rate-limit-risking burst against GeckoTerminal.
+   */
   private async discoverFromGeckoTerminal(
     chains: ChainId[],
     filters: ScoutFilters,
@@ -214,17 +238,35 @@ export class Scout {
   ): Promise<{ candidates: ScoutCandidate[]; chainErrors: { chain: ChainId; reason: string }[] }> {
     const candidates: ScoutCandidate[] = [];
     const chainErrors: { chain: ChainId; reason: string }[] = [];
+    const PAGES_PER_SOURCE = 2;
+
     for (const chain of chains) {
       const network = CHAINS[chain].geckoTerminalNetwork;
-      try {
-        const pools = await this.client.trendingPools(network);
-        for (const pool of pools) {
-          const tagged = fromGeckoPool(pool, chain);
-          if (passesFilters(tagged, filters, now)) candidates.push(toCandidate(tagged));
+      let sawAny = false;
+      const failures: string[] = [];
+
+      for (const source of ["trending", "new"] as const) {
+        for (let page = 1; page <= PAGES_PER_SOURCE; page++) {
+          try {
+            const pools =
+              source === "trending" ? await this.client.trendingPools(network, page) : await this.client.newPools(network, page);
+            sawAny = true;
+            for (const pool of pools) {
+              const tagged = fromGeckoPool(pool, chain);
+              if (passesFilters(tagged, filters, now)) candidates.push(toCandidate(tagged));
+            }
+            if (pools.length === 0) break; // ran out of pages for this source
+          } catch (error) {
+            failures.push(`${source} p${page}: ${error instanceof Error ? error.message : String(error)}`);
+            break; // this source is failing; the other source still gets a chance
+          }
         }
-      } catch (error) {
-        chainErrors.push({ chain, reason: error instanceof Error ? error.message : String(error) });
       }
+
+      // Only reported as a chain failure when nothing at all came through —
+      // one source or one page failing while the other succeeds is exactly
+      // the degradation this dual-source design exists to tolerate.
+      if (!sawAny && failures.length > 0) chainErrors.push({ chain, reason: failures.join("; ") });
     }
     return { candidates, chainErrors };
   }

@@ -89,4 +89,79 @@ describe("CoinGeckoClient", () => {
     });
     await expect(client.markets()).rejects.toThrow(/429/);
   });
+
+  it("starts pagination at startPage rather than page 1", async () => {
+    const requestedPages: number[] = [];
+    const client = new CoinGeckoClient({
+      fetchFn: (async (input: string | URL) => {
+        const page = Number(new URL(String(input)).searchParams.get("page"));
+        requestedPages.push(page);
+        return new Response(JSON.stringify([row({ rank: page })]), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    await client.markets({ startPage: 5, pages: 2, perPage: 1 });
+    expect(requestedPages).toEqual([5, 6]);
+  });
+
+  it("stops paginating once a page's lowest cap drops below stopBelowMarketCapUsd", async () => {
+    const requestedPages: number[] = [];
+    const client = new CoinGeckoClient({
+      fetchFn: (async (input: string | URL) => {
+        const page = Number(new URL(String(input)).searchParams.get("page"));
+        requestedPages.push(page);
+        // Cap falls by page: page 5 -> $10M, page 6 -> $5M, page 7 -> $1M (below floor)
+        const cap = page === 5 ? 10_000_000 : page === 6 ? 5_000_000 : 1_000_000;
+        return new Response(JSON.stringify([row({ symbol: `tok${page}`, marketCap: cap, rank: page })]), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    const markets = await client.markets({ startPage: 5, pages: 10, perPage: 1, stopBelowMarketCapUsd: 2_000_000 });
+    // Page 7 (below the floor) is still included — its data is real and
+    // useful, this only stops *further* pagination, not that page's rows.
+    expect(requestedPages).toEqual([5, 6, 7]);
+    expect(markets.map((m) => m.symbol)).toEqual(["TOK5", "TOK6", "TOK7"]);
+  });
+
+  describe("rate-limit resilience", () => {
+    // A live back-to-back multi-page fetch 429'd on the very next attempt
+    // within the same minute — CoinGecko's free tier is this tight in
+    // practice, not just in theory, so these are not a hypothetical edge case.
+
+    it("retries once after a short wait on a 429, then succeeds", async () => {
+      let attempts = 0;
+      const client = new CoinGeckoClient({
+        fetchFn: (async () => {
+          attempts++;
+          if (attempts === 1) return new Response("", { status: 429 });
+          return new Response(JSON.stringify([row()]), { status: 200 });
+        }) as unknown as typeof fetch,
+      });
+      const markets = await client.markets({ pages: 1 });
+      expect(attempts).toBe(2);
+      expect(markets).toHaveLength(1);
+    });
+
+    it("keeps earlier pages rather than discarding everything when a later page 429s twice", async () => {
+      let calls = 0;
+      const client = new CoinGeckoClient({
+        fetchFn: (async (input: string | URL) => {
+          const page = Number(new URL(String(input)).searchParams.get("page"));
+          calls++;
+          if (page === 1) return new Response(JSON.stringify([row({ symbol: "btc" })]), { status: 200 });
+          return new Response("", { status: 429 }); // page 2 fails even after the internal retry
+        }) as unknown as typeof fetch,
+      });
+      const markets = await client.markets({ pages: 3, perPage: 1 });
+      expect(markets.map((m) => m.symbol)).toEqual(["BTC"]);
+      // page 1 (1 call) + page 2 (1 call + 1 retry) = 3, then stops rather
+      // than attempting page 3 at all.
+      expect(calls).toBe(3);
+    });
+
+    it("still throws when the very first page fails — there is nothing to fall back to", async () => {
+      const client = new CoinGeckoClient({
+        fetchFn: (async () => new Response("", { status: 429 })) as unknown as typeof fetch,
+      });
+      await expect(client.markets({ pages: 3 })).rejects.toThrow(/429/);
+    });
+  });
 });
